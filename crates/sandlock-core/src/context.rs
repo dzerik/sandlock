@@ -175,6 +175,7 @@ pub fn syscall_name_to_nr(name: &str) -> Option<u32> {
         "connect" => libc::SYS_connect,
         "sendto" => libc::SYS_sendto,
         "sendmsg" => libc::SYS_sendmsg,
+        "sendmmsg" => libc::SYS_sendmmsg,
         "ioctl" => libc::SYS_ioctl,
         "socket" => libc::SYS_socket,
         "prctl" => libc::SYS_prctl,
@@ -286,6 +287,7 @@ pub fn notif_syscalls(policy: &Policy, sandbox_name: Option<&str>) -> Vec<u32> {
         nrs.push(libc::SYS_connect as u32);
         nrs.push(libc::SYS_sendto as u32);
         nrs.push(libc::SYS_sendmsg as u32);
+        nrs.push(libc::SYS_sendmmsg as u32);
         nrs.push(libc::SYS_bind as u32);
     }
 
@@ -1196,6 +1198,7 @@ mod tests {
         assert!(nrs.contains(&(libc::SYS_connect as u32)));
         assert!(nrs.contains(&(libc::SYS_sendto as u32)));
         assert!(nrs.contains(&(libc::SYS_sendmsg as u32)));
+        assert!(nrs.contains(&(libc::SYS_sendmmsg as u32)));
     }
 
     #[test]

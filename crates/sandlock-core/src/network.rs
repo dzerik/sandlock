@@ -10,7 +10,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
 
 use crate::seccomp::ctx::SupervisorCtx;
-use crate::seccomp::notif::{read_child_mem, NotifAction};
+use crate::seccomp::notif::{read_child_mem, write_child_mem, NotifAction};
 use crate::sys::structs::{SeccompNotif, AF_INET, AF_INET6, ECONNREFUSED};
 
 /// Maximum buffer size for sendto/sendmsg on-behalf operations (64 MiB).
@@ -472,49 +472,16 @@ async fn sendmsg_on_behalf(
     let msghdr_ptr = args[1];
     let flags = args[2] as i32;
 
-    // 1. Read full msghdr struct (56 bytes on x86_64):
-    //   msg_name(8) + msg_namelen(4) + pad(4) + msg_iov(8) + msg_iovlen(8)
-    //   + msg_control(8) + msg_controllen(8) + msg_flags(4) + pad(4)
-    //
-    // If we cannot read the msghdr, fail the syscall with EFAULT instead
-    // of falling through to Continue.  Continue would let the kernel
-    // re-read child memory and (for a racing thread that just remapped
-    // it back) potentially execute the sendmsg without the IP allowlist
-    // check this handler exists to enforce.  EFAULT matches what the
-    // kernel itself would return for an unreadable msghdr pointer.
-    let msghdr_bytes = match read_child_mem(notif_fd, notif.id, notif.pid, msghdr_ptr, 56) {
-        Ok(b) if b.len() >= 56 => b,
-        _ => return NotifAction::Errno(libc::EFAULT),
-    };
-
-    let msg_name_ptr = u64::from_ne_bytes(msghdr_bytes[0..8].try_into().unwrap());
-    let msg_namelen = u32::from_ne_bytes(msghdr_bytes[8..12].try_into().unwrap());
-    let msg_iov_ptr = u64::from_ne_bytes(msghdr_bytes[16..24].try_into().unwrap());
-    let msg_iovlen = u64::from_ne_bytes(msghdr_bytes[24..32].try_into().unwrap());
-    let msg_control_ptr = u64::from_ne_bytes(msghdr_bytes[32..40].try_into().unwrap());
-    let msg_controllen = u64::from_ne_bytes(msghdr_bytes[40..48].try_into().unwrap());
-
-    if msg_name_ptr == 0 {
-        return NotifAction::Continue; // no address — connected socket
+    // Pre-scan for Continue cases (connected socket / non-IP family).
+    // Same TOCTOU-aware semantics as before: EFAULT on unreadable
+    // msghdr (vs. Continue, which would let the kernel re-read child
+    // memory and bypass our check).
+    match prescan_msghdr(notif, notif_fd, msghdr_ptr) {
+        PrescanResult::ContinueWholeCall => return NotifAction::Continue,
+        PrescanResult::Errno(e) => return NotifAction::Errno(e),
+        PrescanResult::OnBehalf => {}
     }
 
-    // 2. Copy sockaddr from msg_name
-    let addr_bytes = match read_child_mem(
-        notif_fd, notif.id, notif.pid, msg_name_ptr, msg_namelen as usize,
-    ) {
-        Ok(b) => b,
-        Err(_) => return NotifAction::Errno(libc::EIO),
-    };
-
-    // 3. Check (ip, port) against the per-protocol endpoint allowlist.
-    let ip = match parse_ip_from_sockaddr(&addr_bytes) {
-        Some(ip) => ip,
-        None => return NotifAction::Continue, // Non-IP family — allow through
-    };
-    let dest_port = parse_port_from_sockaddr(&addr_bytes);
-
-    // One pidfd_getfd serves both the SO_PROTOCOL probe and the
-    // on-behalf sendmsg further down.
     let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
         Ok(fd) => fd,
         Err(_) => return NotifAction::Errno(libc::ENOSYS),
@@ -524,6 +491,105 @@ async fn sendmsg_on_behalf(
         None => return NotifAction::Errno(ECONNREFUSED),
     };
 
+    match send_msghdr_on_behalf(notif, ctx, notif_fd, &dup_fd, protocol, msghdr_ptr, flags).await {
+        Ok(n) => NotifAction::ReturnValue(n as i64),
+        Err(errno) => NotifAction::Errno(errno),
+    }
+}
+
+// ============================================================
+// prescan_msghdr / send_msghdr_on_behalf — shared per-message work
+// ============================================================
+
+#[derive(Clone, Copy)]
+enum PrescanResult {
+    /// All fields present, IP-family destination — caller can take the
+    /// on-behalf path with `send_msghdr_on_behalf`.
+    OnBehalf,
+    /// `msg_name == NULL` (connected socket) or non-IP family
+    /// (AF_UNIX etc.). Caller should return `NotifAction::Continue` so
+    /// the kernel handles the syscall in the child's namespace —
+    /// AF_UNIX path resolution is the canonical reason we don't take
+    /// these messages on behalf.
+    ContinueWholeCall,
+    /// Memory read failure. Caller maps to the appropriate errno
+    /// (EFAULT for unreadable msghdr, EIO for the sockaddr).
+    Errno(i32),
+}
+
+/// Probe one `struct msghdr` to decide whether the on-behalf path
+/// applies. Used by both `sendmsg_on_behalf` (one msghdr) and
+/// `sendmmsg_on_behalf` (one per `mmsghdr` entry, before doing any
+/// sends — Continue is a whole-syscall decision).
+fn prescan_msghdr(
+    notif: &SeccompNotif,
+    notif_fd: RawFd,
+    msghdr_ptr: u64,
+) -> PrescanResult {
+    let msghdr_bytes = match read_child_mem(notif_fd, notif.id, notif.pid, msghdr_ptr, 56) {
+        Ok(b) if b.len() >= 56 => b,
+        _ => return PrescanResult::Errno(libc::EFAULT),
+    };
+    let msg_name_ptr = u64::from_ne_bytes(msghdr_bytes[0..8].try_into().unwrap());
+    if msg_name_ptr == 0 {
+        return PrescanResult::ContinueWholeCall;
+    }
+    let msg_namelen = u32::from_ne_bytes(msghdr_bytes[8..12].try_into().unwrap());
+    let addr_bytes = match read_child_mem(notif_fd, notif.id, notif.pid, msg_name_ptr, msg_namelen as usize) {
+        Ok(b) => b,
+        Err(_) => return PrescanResult::Errno(libc::EIO),
+    };
+    if parse_ip_from_sockaddr(&addr_bytes).is_none() {
+        return PrescanResult::ContinueWholeCall;
+    }
+    PrescanResult::OnBehalf
+}
+
+/// Validate, materialize, and send one `struct msghdr` on behalf of
+/// the child. Caller is responsible for:
+///   - dup'ing the child fd (`dup_fd`),
+///   - resolving the socket protocol (`protocol`) via
+///     `query_socket_protocol` on that dup,
+///   - having confirmed via `prescan_msghdr` that `msghdr_ptr` points
+///     at an IP-family destination (non-NULL `msg_name`).
+///
+/// Returns the byte count returned by `sendmsg`, or an errno suitable
+/// for `NotifAction::Errno`. ECONNREFUSED is used both for "destination
+/// blocked by policy" and for "couldn't parse a port from the
+/// sockaddr"; EIO for sub-buffer read failures (iovec / control).
+async fn send_msghdr_on_behalf(
+    notif: &SeccompNotif,
+    ctx: &Arc<SupervisorCtx>,
+    notif_fd: RawFd,
+    dup_fd: &std::os::unix::io::OwnedFd,
+    protocol: crate::policy::Protocol,
+    msghdr_ptr: u64,
+    flags: i32,
+) -> Result<isize, i32> {
+    let msghdr_bytes = match read_child_mem(notif_fd, notif.id, notif.pid, msghdr_ptr, 56) {
+        Ok(b) if b.len() >= 56 => b,
+        _ => return Err(libc::EFAULT),
+    };
+    let msg_name_ptr = u64::from_ne_bytes(msghdr_bytes[0..8].try_into().unwrap());
+    let msg_namelen = u32::from_ne_bytes(msghdr_bytes[8..12].try_into().unwrap());
+    let msg_iov_ptr = u64::from_ne_bytes(msghdr_bytes[16..24].try_into().unwrap());
+    let msg_iovlen = u64::from_ne_bytes(msghdr_bytes[24..32].try_into().unwrap());
+    let msg_control_ptr = u64::from_ne_bytes(msghdr_bytes[32..40].try_into().unwrap());
+    let msg_controllen = u64::from_ne_bytes(msghdr_bytes[40..48].try_into().unwrap());
+
+    let addr_bytes = match read_child_mem(notif_fd, notif.id, notif.pid, msg_name_ptr, msg_namelen as usize) {
+        Ok(b) => b,
+        Err(_) => return Err(libc::EIO),
+    };
+    let ip = match parse_ip_from_sockaddr(&addr_bytes) {
+        Some(ip) => ip,
+        // Caller pre-checks via prescan_msghdr; reaching this branch
+        // means the sockaddr changed under us between the prescan and
+        // here. Fail closed.
+        None => return Err(libc::EAFNOSUPPORT),
+    };
+    let dest_port = parse_port_from_sockaddr(&addr_bytes);
+
     let ns = ctx.network.lock().await;
     let live_policy = {
         let pfs = ctx.policy_fn.lock().await;
@@ -532,50 +598,39 @@ async fn sendmsg_on_behalf(
     let effective = ns.effective_network_policy(notif.pid, protocol, live_policy.as_ref());
     if !matches!(effective, crate::seccomp::notif::NetworkPolicy::Unrestricted) {
         match dest_port {
-            Some(p) if !effective.allows(ip, p) => {
-                return NotifAction::Errno(ECONNREFUSED);
-            }
-            None => return NotifAction::Errno(ECONNREFUSED),
+            Some(p) if !effective.allows(ip, p) => return Err(ECONNREFUSED),
+            None => return Err(ECONNREFUSED),
             Some(_) => {}
         }
     }
     drop(ns);
 
-    // 4. Copy iovec entries and their data buffers from child memory
-    // Safety: cap iovlen to prevent excessive allocation
     let iovlen = (msg_iovlen as usize).min(1024);
-    let iov_size = iovlen * 16; // each iovec is 16 bytes (ptr + len)
+    let iov_size = iovlen * 16;
     let iov_bytes = match read_child_mem(notif_fd, notif.id, notif.pid, msg_iov_ptr, iov_size) {
         Ok(b) => b,
-        Err(_) => return NotifAction::Errno(libc::EIO),
+        Err(_) => return Err(libc::EIO),
     };
-
     let mut data_bufs: Vec<Vec<u8>> = Vec::with_capacity(iovlen);
     let mut local_iovs: Vec<libc::iovec> = Vec::with_capacity(iovlen);
-
     for i in 0..iovlen {
         let off = i * 16;
         if off + 16 > iov_bytes.len() { break; }
         let iov_base = u64::from_ne_bytes(iov_bytes[off..off + 8].try_into().unwrap());
         let iov_len = u64::from_ne_bytes(iov_bytes[off + 8..off + 16].try_into().unwrap()) as usize;
-
         if iov_len > MAX_SEND_BUF {
-            return NotifAction::Errno(libc::EMSGSIZE);
+            return Err(libc::EMSGSIZE);
         }
-
         if iov_base == 0 || iov_len == 0 {
             data_bufs.push(Vec::new());
             continue;
         }
-
         let buf = match read_child_mem(notif_fd, notif.id, notif.pid, iov_base, iov_len) {
             Ok(b) => b,
-            Err(_) => return NotifAction::Errno(libc::EIO),
+            Err(_) => return Err(libc::EIO),
         };
         data_bufs.push(buf);
     }
-
-    // Build local iovec array pointing to our copied data
     for buf in &data_bufs {
         local_iovs.push(libc::iovec {
             iov_base: buf.as_ptr() as *mut libc::c_void,
@@ -583,7 +638,6 @@ async fn sendmsg_on_behalf(
         });
     }
 
-    // 5. Copy control message buffer (ancillary data)
     let control_buf = if msg_control_ptr != 0 && msg_controllen > 0 {
         let len = (msg_controllen as usize).min(4096);
         read_child_mem(notif_fd, notif.id, notif.pid, msg_control_ptr, len).ok()
@@ -591,9 +645,6 @@ async fn sendmsg_on_behalf(
         None
     };
 
-    // 6. (dup_fd from step 3 is reused for the supervisor sendmsg.)
-
-    // 7. Build msghdr and perform sendmsg in supervisor
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_name = addr_bytes.as_ptr() as *mut libc::c_void;
     msg.msg_namelen = addr_bytes.len() as u32;
@@ -605,13 +656,107 @@ async fn sendmsg_on_behalf(
     }
 
     let ret = unsafe { libc::sendmsg(dup_fd.as_raw_fd(), &msg, flags) };
-
-    // 8. Return result
     if ret >= 0 {
-        NotifAction::ReturnValue(ret as i64)
+        Ok(ret)
     } else {
-        let errno = unsafe { *libc::__errno_location() };
-        NotifAction::Errno(errno)
+        Err(unsafe { *libc::__errno_location() })
+    }
+}
+
+// ============================================================
+// sendmmsg_on_behalf — multi-message variant
+// ============================================================
+
+/// `struct mmsghdr` size on Linux x86_64 / aarch64: 56-byte msghdr +
+/// 4-byte msg_len + 4-byte tail padding = 64 bytes. msg_len lives at
+/// offset 56.
+const MMSGHDR_SIZE: usize = 64;
+const MSG_LEN_OFFSET: usize = 56;
+/// Cap on the number of messages we'll process per sendmmsg call.
+/// Linux's UIO_MAXIOV is 1024; lower here to bound supervisor work
+/// per syscall (each entry costs at minimum a few read_child_mem
+/// hops + one sendmsg).
+const MAX_MMSGHDR_ENTRIES: usize = 256;
+
+/// Perform `sendmmsg()` on behalf of the child. Pre-scans every entry
+/// for Continue cases (NULL `msg_name` or non-IP family) — if any
+/// entry would Continue, we Continue the whole syscall to match
+/// `sendmsg_on_behalf`'s coarse-grained behavior. Otherwise dup the
+/// child fd once, query SO_PROTOCOL once, then loop:
+/// validate → send → write `msg_len` back to the child's mmsghdr.
+///
+/// On partial failure (entry K denied or send fails), returns
+/// `ReturnValue(K)` matching the kernel's "messages successfully
+/// transmitted" semantics. Returns the errno only when the very first
+/// entry fails — otherwise the child sees a positive count and reads
+/// per-entry `msg_len` to learn the per-message status.
+async fn sendmmsg_on_behalf(
+    notif: &SeccompNotif,
+    ctx: &Arc<SupervisorCtx>,
+    notif_fd: RawFd,
+) -> NotifAction {
+    let args = &notif.data.args;
+    let sockfd = args[0] as i32;
+    let msgvec_ptr = args[1];
+    let vlen = (args[2] as u32 as usize).min(MAX_MMSGHDR_ENTRIES);
+    let flags = args[3] as i32;
+
+    if vlen == 0 {
+        return NotifAction::ReturnValue(0);
+    }
+
+    // Pre-scan every entry. If any has a Continue-eligible shape
+    // (NULL msg_name or non-IP family), Continue the whole sendmmsg.
+    // Mixed-shape sendmmsg calls (some entries on-behalf, others not)
+    // aren't supported because Continue is binary at the syscall
+    // level.
+    for i in 0..vlen {
+        let entry_ptr = msgvec_ptr + (i * MMSGHDR_SIZE) as u64;
+        match prescan_msghdr(notif, notif_fd, entry_ptr) {
+            PrescanResult::OnBehalf => continue,
+            PrescanResult::ContinueWholeCall => return NotifAction::Continue,
+            PrescanResult::Errno(e) => return NotifAction::Errno(e),
+        }
+    }
+
+    let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
+        Ok(fd) => fd,
+        Err(_) => return NotifAction::Errno(libc::ENOSYS),
+    };
+    let protocol = match query_socket_protocol(dup_fd.as_raw_fd()) {
+        Some(p) => p,
+        None => return NotifAction::Errno(ECONNREFUSED),
+    };
+
+    let mut sent: usize = 0;
+    let mut first_errno: Option<i32> = None;
+
+    for i in 0..vlen {
+        let entry_ptr = msgvec_ptr + (i * MMSGHDR_SIZE) as u64;
+        match send_msghdr_on_behalf(notif, ctx, notif_fd, &dup_fd, protocol, entry_ptr, flags).await {
+            Ok(n) => {
+                let bytes = (n as u32).to_ne_bytes();
+                let _ = write_child_mem(
+                    notif_fd, notif.id, notif.pid,
+                    entry_ptr + MSG_LEN_OFFSET as u64,
+                    &bytes,
+                );
+                sent += 1;
+            }
+            Err(errno) => {
+                first_errno = Some(errno);
+                break;
+            }
+        }
+    }
+
+    if sent > 0 {
+        NotifAction::ReturnValue(sent as i64)
+    } else {
+        // Defensive: vlen > 0 + no successes means at least one attempt
+        // failed, so first_errno is set. Fall back to ECONNREFUSED
+        // rather than panicking on the unwrap if invariants ever drift.
+        NotifAction::Errno(first_errno.unwrap_or(ECONNREFUSED))
     }
 }
 
@@ -655,6 +800,8 @@ pub(crate) async fn handle_net(
         sendto_on_behalf(notif, ctx, notif_fd).await
     } else if nr == libc::SYS_sendmsg {
         sendmsg_on_behalf(notif, ctx, notif_fd).await
+    } else if nr == libc::SYS_sendmmsg {
+        sendmmsg_on_behalf(notif, ctx, notif_fd).await
     } else {
         NotifAction::Continue
     }

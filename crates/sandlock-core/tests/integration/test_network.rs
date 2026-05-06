@@ -136,6 +136,161 @@ async fn test_udp_rule_does_not_authorize_tcp() {
     );
 }
 
+/// `sendmmsg` is the most common UDP escape hatch — agents that want to
+/// bypass per-message destination filtering can batch sends with it.
+/// This test calls `libc.sendmmsg` directly via ctypes (Python's
+/// `socket` module doesn't expose it) with two messages: the first to
+/// an allowed host, the second to a disallowed one. The on-behalf
+/// handler must let the first through and stop at the second, returning
+/// 1 to match the kernel's "messages successfully transmitted" semantics
+/// on partial failure.
+#[tokio::test]
+async fn test_sendmmsg_partial_failure_on_blocked_destination() {
+    let out = temp_file("sendmmsg-partial");
+
+    let policy = base_policy()
+        .net_allow("udp://127.0.0.1:53")
+        .build()
+        .unwrap();
+
+    let script = format!(concat!(
+        "import ctypes, socket, struct\n",
+        "libc = ctypes.CDLL('libc.so.6', use_errno=True)\n",
+        "libc.sendmmsg.restype = ctypes.c_int\n",
+        "\n",
+        "class iovec(ctypes.Structure):\n",
+        "    _fields_ = [('iov_base', ctypes.c_void_p), ('iov_len', ctypes.c_size_t)]\n",
+        "\n",
+        "class msghdr(ctypes.Structure):\n",
+        "    _fields_ = [\n",
+        "        ('msg_name', ctypes.c_void_p),\n",
+        "        ('msg_namelen', ctypes.c_uint),\n",
+        "        ('_p1', ctypes.c_uint),\n",
+        "        ('msg_iov', ctypes.c_void_p),\n",
+        "        ('msg_iovlen', ctypes.c_size_t),\n",
+        "        ('msg_control', ctypes.c_void_p),\n",
+        "        ('msg_controllen', ctypes.c_size_t),\n",
+        "        ('msg_flags', ctypes.c_int),\n",
+        "        ('_p2', ctypes.c_uint),\n",
+        "    ]\n",
+        "\n",
+        "class mmsghdr(ctypes.Structure):\n",
+        "    _fields_ = [('msg_hdr', msghdr), ('msg_len', ctypes.c_uint), ('_p', ctypes.c_uint)]\n",
+        "\n",
+        "def sai(ip, port):\n",
+        "    return struct.pack('=HH4s8x', socket.AF_INET, socket.htons(port), socket.inet_aton(ip))\n",
+        "\n",
+        "s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n",
+        "\n",
+        "addr_ok = ctypes.create_string_buffer(sai('127.0.0.1', 53))\n",
+        "addr_blk = ctypes.create_string_buffer(sai('1.1.1.1', 53))\n",
+        "data = ctypes.create_string_buffer(b'x')\n",
+        "\n",
+        "iovs = (iovec * 2)()\n",
+        "iovs[0].iov_base = ctypes.cast(data, ctypes.c_void_p).value\n",
+        "iovs[0].iov_len = 1\n",
+        "iovs[1].iov_base = ctypes.cast(data, ctypes.c_void_p).value\n",
+        "iovs[1].iov_len = 1\n",
+        "\n",
+        "vec = (mmsghdr * 2)()\n",
+        "vec[0].msg_hdr.msg_name = ctypes.cast(addr_ok, ctypes.c_void_p).value\n",
+        "vec[0].msg_hdr.msg_namelen = 16\n",
+        "vec[0].msg_hdr.msg_iov = ctypes.cast(ctypes.pointer(iovs[0]), ctypes.c_void_p).value\n",
+        "vec[0].msg_hdr.msg_iovlen = 1\n",
+        "vec[1].msg_hdr.msg_name = ctypes.cast(addr_blk, ctypes.c_void_p).value\n",
+        "vec[1].msg_hdr.msg_namelen = 16\n",
+        "vec[1].msg_hdr.msg_iov = ctypes.cast(ctypes.pointer(iovs[1]), ctypes.c_void_p).value\n",
+        "vec[1].msg_hdr.msg_iovlen = 1\n",
+        "\n",
+        "ret = libc.sendmmsg(s.fileno(), vec, 2, 0)\n",
+        "errno = ctypes.get_errno()\n",
+        "msg0_len = vec[0].msg_len\n",
+        "open('{out}', 'w').write(f'ret={{ret}} errno={{errno}} msg0_len={{msg0_len}}')\n",
+        "s.close()\n",
+    ), out = out.display());
+
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
+        .await.unwrap();
+    assert!(result.success(), "exit={:?}", result.code());
+
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+
+    // ret=1 — first message sent, second blocked. msg0_len=1 — one byte
+    // delivered for the first message. errno is whatever the kernel left
+    // it as (sendmmsg sets errno only on full failure ret<0).
+    assert!(
+        content.starts_with("ret=1 ") && content.contains("msg0_len=1"),
+        "expected partial success ret=1 msg0_len=1, got: {}", content
+    );
+}
+
+/// Defense-in-depth check that `sendmmsg` doesn't silently bypass the
+/// per-protocol routing. With a UDP-only rule, a TCP socket using
+/// `sendmsg`/`sendto` already fails (Phase 2 covered that). We verify
+/// the same property holds when the agent uses `sendmmsg` to a UDP
+/// destination outside the allowlist with vlen=1: ret should be -1
+/// because no entries succeeded.
+#[tokio::test]
+async fn test_sendmmsg_single_blocked_returns_econnrefused() {
+    let out = temp_file("sendmmsg-blocked");
+
+    let policy = base_policy()
+        .net_allow("udp://127.0.0.1:53")
+        .build()
+        .unwrap();
+
+    let script = format!(concat!(
+        "import ctypes, socket, struct\n",
+        "libc = ctypes.CDLL('libc.so.6', use_errno=True)\n",
+        "libc.sendmmsg.restype = ctypes.c_int\n",
+        "\n",
+        "class iovec(ctypes.Structure):\n",
+        "    _fields_ = [('iov_base', ctypes.c_void_p), ('iov_len', ctypes.c_size_t)]\n",
+        "\n",
+        "class msghdr(ctypes.Structure):\n",
+        "    _fields_ = [\n",
+        "        ('msg_name', ctypes.c_void_p), ('msg_namelen', ctypes.c_uint), ('_p1', ctypes.c_uint),\n",
+        "        ('msg_iov', ctypes.c_void_p), ('msg_iovlen', ctypes.c_size_t),\n",
+        "        ('msg_control', ctypes.c_void_p), ('msg_controllen', ctypes.c_size_t),\n",
+        "        ('msg_flags', ctypes.c_int), ('_p2', ctypes.c_uint),\n",
+        "    ]\n",
+        "\n",
+        "class mmsghdr(ctypes.Structure):\n",
+        "    _fields_ = [('msg_hdr', msghdr), ('msg_len', ctypes.c_uint), ('_p', ctypes.c_uint)]\n",
+        "\n",
+        "s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n",
+        "addr = ctypes.create_string_buffer(\n",
+        "    struct.pack('=HH4s8x', socket.AF_INET, socket.htons(53), socket.inet_aton('1.1.1.1'))\n",
+        ")\n",
+        "data = ctypes.create_string_buffer(b'x')\n",
+        "iov = iovec()\n",
+        "iov.iov_base = ctypes.cast(data, ctypes.c_void_p).value\n",
+        "iov.iov_len = 1\n",
+        "vec = (mmsghdr * 1)()\n",
+        "vec[0].msg_hdr.msg_name = ctypes.cast(addr, ctypes.c_void_p).value\n",
+        "vec[0].msg_hdr.msg_namelen = 16\n",
+        "vec[0].msg_hdr.msg_iov = ctypes.cast(ctypes.pointer(iov), ctypes.c_void_p).value\n",
+        "vec[0].msg_hdr.msg_iovlen = 1\n",
+        "ret = libc.sendmmsg(s.fileno(), vec, 1, 0)\n",
+        "errno = ctypes.get_errno()\n",
+        "open('{out}', 'w').write(f'ret={{ret}} errno={{errno}}')\n",
+        "s.close()\n",
+    ), out = out.display());
+
+    let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
+        .await.unwrap();
+    assert!(result.success(), "exit={:?}", result.code());
+
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+
+    assert_eq!(
+        content, "ret=-1 errno=111",
+        "blocked sendmmsg should return -1 with ECONNREFUSED, got: {}", content
+    );
+}
+
 /// Test that --net-allow blocks connections to non-allowed hosts.
 #[tokio::test]
 async fn test_net_allow_blocks_disallowed_host() {
