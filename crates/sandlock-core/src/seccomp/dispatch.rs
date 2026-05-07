@@ -160,7 +160,7 @@ pub enum HandlerError {
 /// surface it to the end user.
 pub(crate) fn validate_handler_syscalls_against_policy(
     syscall_nrs: &[i64],
-    policy: &crate::policy::Policy,
+    policy: &crate::sandbox::Sandbox,
 ) -> Result<(), i64> {
     let blocklist: std::collections::HashSet<u32> =
         crate::context::blocklist_syscall_numbers(policy).into_iter().collect();
@@ -1182,7 +1182,7 @@ mod extra_handler_tests {
     /// hosts where seccomp integration tests are skipped.
     #[test]
     fn validate_extras_rejects_user_specified_blocklist() {
-        let policy = crate::policy::Policy::builder()
+        let policy = crate::sandbox::Sandbox::builder()
             .extra_deny_syscalls(vec!["mremap".into()])
             .build()
             .expect("policy builds");

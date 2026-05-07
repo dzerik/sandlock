@@ -12,13 +12,13 @@ from sandlock._profile import (
     profiles_dir,
 )
 from sandlock.exceptions import PolicyError
-from sandlock.policy import Policy, FsIsolation, BranchAction
+from sandlock.sandbox import Sandbox, FsIsolation, BranchAction
 
 
 class TestPolicyFromDict:
     def test_empty_dict(self):
         p = policy_from_dict({})
-        assert p == Policy()
+        assert p == Sandbox()
 
     def test_simple_fields(self):
         p = policy_from_dict({
@@ -139,19 +139,19 @@ class TestListProfiles:
 class TestMergeCliOverrides:
     def test_scalar_override(self):
         from sandlock._profile import merge_cli_overrides
-        base = Policy(max_memory="256M", uid=0)
+        base = Sandbox(max_memory="256M", uid=0)
         result = merge_cli_overrides(base, {"max_memory": "1G"})
         assert result.max_memory == "1G"
         assert result.uid == 0  # unchanged
 
     def test_list_append(self):
         from sandlock._profile import merge_cli_overrides
-        base = Policy(fs_readable=["/usr", "/lib"])
+        base = Sandbox(fs_readable=["/usr", "/lib"])
         result = merge_cli_overrides(base, {"fs_readable": ["/etc"]})
         assert result.fs_readable == ["/usr", "/lib", "/etc"]
 
     def test_bool_override(self):
         from sandlock._profile import merge_cli_overrides
-        base = Policy(clean_env=False)
+        base = Sandbox(clean_env=False)
         result = merge_cli_overrides(base, {"clean_env": True})
         assert result.clean_env is True

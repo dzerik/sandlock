@@ -1,8 +1,8 @@
-use sandlock_core::policy::{FsIsolation, Policy};
+use sandlock_core::sandbox::{FsIsolation, Sandbox};
 
 #[test]
 fn validate_overlayfs_without_workdir_fails() {
-    let p = Policy::builder()
+    let p = Sandbox::builder()
         .fs_isolation(FsIsolation::OverlayFs)
         .build_unchecked()
         .unwrap();
@@ -12,7 +12,7 @@ fn validate_overlayfs_without_workdir_fails() {
 
 #[test]
 fn validate_none_without_workdir_succeeds() {
-    let p = Policy::builder()
+    let p = Sandbox::builder()
         .fs_isolation(FsIsolation::None)
         .build_unchecked()
         .unwrap();

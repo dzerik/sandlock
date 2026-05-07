@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
-use sandlock_core::{Policy, Sandbox};
-use sandlock_core::policy::{ByteSize, PolicyBuilder};
+use sandlock_core::Sandbox;
+use sandlock_core::sandbox::{ByteSize, SandboxBuilder};
 use sandlock_core::profile;
 use anyhow::{Result, anyhow};
 use std::path::PathBuf;
@@ -37,16 +37,16 @@ enum Command {
 
 /// Arguments for the `run` subcommand.
 ///
-/// Policy-level flags come from `PolicyBuilder` via `#[clap(flatten)]`.
+/// Sandbox-level flags come from `SandboxBuilder` via `#[clap(flatten)]`.
 /// CLI-only flags (profile, timeout, image, etc.) and non-clap-friendly
-/// policy fields (max_memory, fs_mount, env, gpu, cpu-cores) remain here.
+/// sandbox fields (max_memory, fs_mount, env, gpu, cpu-cores) remain here.
 #[derive(clap::Args)]
 struct RunArgs {
-    // ── Policy flags (flattened from PolicyBuilder) ─────────────────────────
+    // ── Sandbox flags (flattened from SandboxBuilder) ───────────────────────
     #[clap(flatten)]
-    policy_builder: PolicyBuilder,
+    sandbox_builder: SandboxBuilder,
 
-    // ── Policy flags that need special parsing (not in PolicyBuilder clap) ──
+    // ── Sandbox-builder fields that need special parsing (not in SandboxBuilder's clap derive) ──
     #[arg(short = 'm', long = "max-memory")]
     max_memory: Option<String>,
 
@@ -245,7 +245,7 @@ async fn main() -> Result<()> {
 
 /// Implementation of `sandlock run`.
 async fn run_command(args: RunArgs) -> Result<()> {
-    let pb = &args.policy_builder;
+    let pb = &args.sandbox_builder;
 
     if args.no_supervisor {
         validate_no_supervisor(&args)?;
@@ -274,7 +274,7 @@ async fn run_command(args: RunArgs) -> Result<()> {
                     source
                 ));
             }
-            let mut b = Policy::builder();
+            let mut b = Sandbox::builder();
             for p in &base.fs_readable { b = b.fs_read(p); }
             for p in &base.fs_writable { b = b.fs_write(p); }
             if !base.extra_allow_syscalls.is_empty() {
@@ -282,7 +282,7 @@ async fn run_command(args: RunArgs) -> Result<()> {
             }
             b
         } else {
-            Policy::builder()
+            Sandbox::builder()
         };
 
         // Derive the effective command: profile's [program] section supplies the
@@ -349,22 +349,22 @@ async fn run_command(args: RunArgs) -> Result<()> {
     // Start from profile or default
     let mut builder = if let Some(base) = base_from_profile {
         // Rebuild builder from loaded profile as base
-        let mut b = Policy::builder();
+        let mut b = Sandbox::builder();
         for p in &base.fs_readable { b = b.fs_read(p); }
         for p in &base.fs_writable { b = b.fs_write(p); }
         for p in &base.fs_denied { b = b.fs_deny(p); }
         for rule in &base.net_allow {
             let host_part = rule.host.as_deref().unwrap_or("*");
             let spec = match rule.protocol {
-                sandlock_core::policy::Protocol::Tcp => {
+                sandlock_core::sandbox::Protocol::Tcp => {
                     let ports = format_ports(&rule.ports, rule.all_ports);
                     format!("tcp://{}:{}", host_part, ports)
                 }
-                sandlock_core::policy::Protocol::Udp => {
+                sandlock_core::sandbox::Protocol::Udp => {
                     let ports = format_ports(&rule.ports, rule.all_ports);
                     format!("udp://{}:{}", host_part, ports)
                 }
-                sandlock_core::policy::Protocol::Icmp => {
+                sandlock_core::sandbox::Protocol::Icmp => {
                     format!("icmp://{}", host_part)
                 }
             };
@@ -394,10 +394,10 @@ async fn run_command(args: RunArgs) -> Result<()> {
         if let Some(ref c) = base.cwd { b = b.cwd(c); }
         b
     } else {
-        Policy::builder()
+        Sandbox::builder()
     };
 
-    // CLI overrides — fields from flattened PolicyBuilder
+    // CLI overrides — fields from flattened SandboxBuilder
     for p in &pb.fs_readable { builder = builder.fs_read(p); }
     for p in &pb.fs_writable { builder = builder.fs_write(p); }
     if let Some(n) = pb.max_processes { builder = builder.max_processes(n); }
@@ -434,7 +434,7 @@ async fn run_command(args: RunArgs) -> Result<()> {
         builder = builder.time_start(t);
     }
     if let Some(ref mode) = args.fs_isolation {
-        use sandlock_core::policy::FsIsolation;
+        use sandlock_core::sandbox::FsIsolation;
         let iso = match mode.as_str() {
             "none" => FsIsolation::None,
             "overlayfs" => FsIsolation::OverlayFs,
@@ -517,6 +517,9 @@ async fn run_command(args: RunArgs) -> Result<()> {
         unreachable!("no command source available")
     };
 
+    // Bake the instance name into the sandbox so all lifecycle methods use it.
+    let mut policy = policy.with_name(sandbox_name.clone());
+
     let result = if args.dry_run {
         if policy.workdir.is_none() {
             return Err(anyhow!("--dry-run requires --workdir"));
@@ -524,13 +527,13 @@ async fn run_command(args: RunArgs) -> Result<()> {
         let dr = if let Some(secs) = args.timeout {
             tokio::time::timeout(
                 std::time::Duration::from_secs(secs),
-                Sandbox::dry_run_interactive(&policy, Some(sandbox_name.as_str()), &cmd_strs)
+                policy.dry_run_interactive(&cmd_strs)
             ).await.unwrap_or_else(|_| {
                 eprintln!("sandlock: timeout after {}s", secs);
                 std::process::exit(124);
             })?
         } else {
-            Sandbox::dry_run_interactive(&policy, Some(sandbox_name.as_str()), &cmd_strs).await?
+            policy.dry_run_interactive(&cmd_strs).await?
         };
 
         if dr.changes.is_empty() {
@@ -544,17 +547,16 @@ async fn run_command(args: RunArgs) -> Result<()> {
         dr.run_result
     } else if policy.port_remap {
         // Use spawn+wait so we can register/unregister network state.
-        let mut sb = Sandbox::new(&policy, Some(sandbox_name.as_str()))?;
 
         // Set up callback to update registry on each port bind.
         let reg_name = sandbox_name.clone();
-        sb.set_on_bind(move |ports| {
+        policy.set_on_bind(move |ports| {
             let _ = network_registry::update_ports(&reg_name, ports.clone());
         });
 
-        sb.spawn(&cmd_strs).await?;
+        policy.spawn(&cmd_strs).await?;
 
-        let pid = sb.pid().unwrap_or(0);
+        let pid = policy.pid().unwrap_or(0);
         let registered_hosts: Vec<String> = policy
             .net_allow
             .iter()
@@ -571,7 +573,7 @@ async fn run_command(args: RunArgs) -> Result<()> {
         let result = if let Some(secs) = args.timeout {
             match tokio::time::timeout(
                 std::time::Duration::from_secs(secs),
-                sb.wait()
+                policy.wait()
             ).await {
                 Ok(r) => r?,
                 Err(_) => {
@@ -581,20 +583,20 @@ async fn run_command(args: RunArgs) -> Result<()> {
                 }
             }
         } else {
-            sb.wait().await?
+            policy.wait().await?
         };
         let _ = network_registry::unregister(&sandbox_name);
         result
     } else if let Some(secs) = args.timeout {
         tokio::time::timeout(
             std::time::Duration::from_secs(secs),
-            Sandbox::run_interactive(&policy, Some(sandbox_name.as_str()), &cmd_strs)
+            policy.run_interactive(&cmd_strs)
         ).await.unwrap_or_else(|_| {
             eprintln!("sandlock: timeout after {}s", secs);
             std::process::exit(124);
         })?
     } else {
-        Sandbox::run_interactive(&policy, Some(sandbox_name.as_str()), &cmd_strs).await?
+        policy.run_interactive(&cmd_strs).await?
     };
 
     if let Some(fd) = args.status_fd {
@@ -620,7 +622,7 @@ async fn run_command(args: RunArgs) -> Result<()> {
 
 /// Validate that no flags incompatible with --no-supervisor are set.
 fn validate_no_supervisor(args: &RunArgs) -> Result<()> {
-    let pb = &args.policy_builder;
+    let pb = &args.sandbox_builder;
     let mut bad = Vec::new();
 
     if args.max_memory.is_some() { bad.push("--max-memory"); }
@@ -668,7 +670,7 @@ fn validate_no_supervisor(args: &RunArgs) -> Result<()> {
 
 /// Execute a command with no-supervisor confinement.
 /// Applies Landlock + deny-only seccomp filter, handles env, then execs.
-fn no_supervisor_exec(policy: &Policy, cmd: &[&str]) -> Result<()> {
+fn no_supervisor_exec(policy: &Sandbox, cmd: &[&str]) -> Result<()> {
     use std::ffi::CString;
 
     // 1. Apply Landlock confinement (sets NO_NEW_PRIVS + Landlock rules)

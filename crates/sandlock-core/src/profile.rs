@@ -1,11 +1,11 @@
-use crate::policy::{ByteSize, Policy};
+use crate::sandbox::{ByteSize, Sandbox};
 use crate::error::SandlockError;
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::collections::HashMap;
 
 /// Program identity supplied by a profile alongside the policy.
-/// Not a `Policy` field — passed separately to the sandbox runner.
+/// Not a `Sandbox` field — passed separately to the sandbox runner.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ProgramSpec {
     pub exec: Option<PathBuf>,
@@ -26,7 +26,7 @@ pub struct ProfileInput {
     pub limits: LimitsSection,
 }
 
-// Field names follow the schema vocabulary and match `Policy`'s field names 1:1.
+// Field names follow the schema vocabulary and match `Sandbox`'s field names 1:1.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct ConfigSection {
@@ -66,14 +66,14 @@ pub struct FilesystemSection {
     pub read: Vec<PathBuf>,
     pub write: Vec<PathBuf>,
     pub deny: Vec<PathBuf>,
-    /// One of `"none"`, `"overlayfs"`, `"branchfs"`. Maps to `Policy::fs_isolation`.
+    /// One of `"none"`, `"overlayfs"`, `"branchfs"`. Maps to `Sandbox::fs_isolation`.
     pub isolation: Option<String>,
     pub chroot: Option<PathBuf>,
     /// Each entry has the form `"VIRTUAL:HOST"`, matching `--fs-mount` syntax.
     pub mount: Vec<String>,
-    /// One of `"commit"`, `"abort"`, `"keep"`. Maps to `Policy::on_exit`.
+    /// One of `"commit"`, `"abort"`, `"keep"`. Maps to `Sandbox::on_exit`.
     pub on_exit: Option<String>,
-    /// One of `"commit"`, `"abort"`, `"keep"`. Maps to `Policy::on_error`.
+    /// One of `"commit"`, `"abort"`, `"keep"`. Maps to `Sandbox::on_error`.
     pub on_error: Option<String>,
 }
 
@@ -100,35 +100,35 @@ pub struct SyscallsSection {
     pub extra_deny: Vec<String>,
 }
 
-// Field names drop the `max_` prefix that `Policy` uses (`memory`, not
+// Field names drop the `max_` prefix that `Sandbox` uses (`memory`, not
 // `max_memory`) — the section name `[limits]` makes the prefix redundant.
-// `parse_input` maps each of these to the corresponding `Policy::max_*` field.
+// `parse_input` maps each of these to the corresponding `Sandbox::max_*` field.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct LimitsSection {
     /// `ByteSize` string, e.g. `"512M"` (suffixes K/M/G only; IEC `MiB`/`GiB`
-    /// not yet supported). Maps to `Policy::max_memory`.
+    /// not yet supported). Maps to `Sandbox::max_memory`.
     pub memory: Option<String>,
     pub processes: Option<u32>,
     pub open_files: Option<u32>,
-    /// CPU cap as a percentage (0–100). Maps to `Policy::max_cpu`.
+    /// CPU cap as a percentage (0–100). Maps to `Sandbox::max_cpu`.
     pub cpu: Option<u8>,
     /// `ByteSize` string, e.g. `"256M"` (suffixes K/M/G only; IEC `MiB`/`GiB`
-    /// not yet supported). Maps to `Policy::max_disk`.
+    /// not yet supported). Maps to `Sandbox::max_disk`.
     pub disk: Option<String>,
     pub gpu_devices: Option<Vec<u32>>,
     pub cpu_cores: Option<Vec<u32>>,
     pub num_cpus: Option<u32>,
 }
 
-/// Convert a parsed `ProfileInput` into a `(Policy, ProgramSpec)` pair.
+/// Convert a parsed `ProfileInput` into a `(Sandbox, ProgramSpec)` pair.
 ///
-/// Forwards each schema section's fields to the corresponding `PolicyBuilder`
+/// Forwards each schema section's fields to the corresponding `SandboxBuilder`
 /// method calls. The three private helpers (`parse_fs_isolation`,
 /// `parse_branch_action`, `parse_mount_spec`) handle string-to-typed-value
 /// conversions for fields that lack `FromStr` impls on their target types.
-pub fn parse_input(input: ProfileInput) -> Result<(Policy, ProgramSpec), SandlockError> {
-    let mut b = Policy::builder();
+pub fn parse_input(input: ProfileInput) -> Result<(Sandbox, ProgramSpec), SandlockError> {
+    let mut b = Sandbox::builder();
 
     // [config]
     if let Some(p) = input.config.http_ca       { b = b.http_ca(p); }
@@ -143,7 +143,7 @@ pub fn parse_input(input: ProfileInput) -> Result<(Policy, ProgramSpec), Sandloc
     if input.determinism.deterministic_dirs        { b = b.deterministic_dirs(true); }
     if input.determinism.no_randomize_memory       { b = b.no_randomize_memory(true); }
 
-    // [program] — process knobs go to Policy; exec/args go to ProgramSpec.
+    // [program] — process knobs go to Sandbox; exec/args go to ProgramSpec.
     for (k, v) in input.program.env.iter() { b = b.env_var(k, v); }
     if let Some(c) = input.program.cwd             { b = b.cwd(c); }
     if let Some(u) = input.program.uid             { b = b.uid(u); }
@@ -186,13 +186,13 @@ pub fn parse_input(input: ProfileInput) -> Result<(Policy, ProgramSpec), Sandloc
 
     // [limits]
     if let Some(s) = input.limits.memory.as_deref()    {
-        b = b.max_memory(ByteSize::parse(s).map_err(SandlockError::Policy)?);
+        b = b.max_memory(ByteSize::parse(s).map_err(SandlockError::Sandbox)?);
     }
     if let Some(n) = input.limits.processes            { b = b.max_processes(n); }
     if let Some(n) = input.limits.open_files           { b = b.max_open_files(n); }
     if let Some(p) = input.limits.cpu                  { b = b.max_cpu(p); }
     if let Some(s) = input.limits.disk.as_deref()      {
-        b = b.max_disk(ByteSize::parse(s).map_err(SandlockError::Policy)?);
+        b = b.max_disk(ByteSize::parse(s).map_err(SandlockError::Sandbox)?);
     }
     if let Some(g) = input.limits.gpu_devices  { b = b.gpu_devices(g); }
     if let Some(c) = input.limits.cpu_cores    { b = b.cpu_cores(c); }
@@ -204,28 +204,28 @@ pub fn parse_input(input: ProfileInput) -> Result<(Policy, ProgramSpec), Sandloc
 }
 
 /// Parses the `[filesystem].isolation` schema string into a `FsIsolation`.
-fn parse_fs_isolation(s: &str) -> Result<crate::policy::FsIsolation, SandlockError> {
-    use crate::error::PolicyError;
-    use crate::policy::FsIsolation;
+fn parse_fs_isolation(s: &str) -> Result<crate::sandbox::FsIsolation, SandlockError> {
+    use crate::error::SandboxError;
+    use crate::sandbox::FsIsolation;
     Ok(match s {
         "none"      => FsIsolation::None,
         "overlayfs" => FsIsolation::OverlayFs,
         "branchfs"  => FsIsolation::BranchFs,
-        other       => return Err(SandlockError::Policy(PolicyError::Invalid(
+        other       => return Err(SandlockError::Sandbox(SandboxError::Invalid(
             format!("invalid fs isolation {other:?}; expected \"none\" | \"overlayfs\" | \"branchfs\""),
         ))),
     })
 }
 
 /// Parses an `[filesystem].on_exit` / `on_error` string into a `BranchAction`.
-fn parse_branch_action(s: &str) -> Result<crate::policy::BranchAction, SandlockError> {
-    use crate::error::PolicyError;
-    use crate::policy::BranchAction;
+fn parse_branch_action(s: &str) -> Result<crate::sandbox::BranchAction, SandlockError> {
+    use crate::error::SandboxError;
+    use crate::sandbox::BranchAction;
     Ok(match s {
         "commit" => BranchAction::Commit,
         "abort"  => BranchAction::Abort,
         "keep"   => BranchAction::Keep,
-        other    => return Err(SandlockError::Policy(PolicyError::Invalid(
+        other    => return Err(SandlockError::Sandbox(SandboxError::Invalid(
             format!("invalid branch action {other:?}; expected \"commit\" | \"abort\" | \"keep\""),
         ))),
     })
@@ -233,12 +233,12 @@ fn parse_branch_action(s: &str) -> Result<crate::policy::BranchAction, SandlockE
 
 /// Parses a `"VIRTUAL:HOST"` mount spec string into a `(virtual, host)` pair.
 fn parse_mount_spec(s: &str) -> Result<(PathBuf, PathBuf), SandlockError> {
-    use crate::error::PolicyError;
-    let (virt, host) = s.split_once(':').ok_or_else(|| SandlockError::Policy(PolicyError::Invalid(
+    use crate::error::SandboxError;
+    let (virt, host) = s.split_once(':').ok_or_else(|| SandlockError::Sandbox(SandboxError::Invalid(
         format!("invalid mount spec {s:?}; expected \"VIRTUAL:HOST\""),
     )))?;
     if virt.is_empty() || host.is_empty() {
-        return Err(SandlockError::Policy(PolicyError::Invalid(
+        return Err(SandlockError::Sandbox(SandboxError::Invalid(
             format!("invalid mount spec {s:?}; both VIRTUAL and HOST must be non-empty"),
         )));
     }
@@ -260,20 +260,20 @@ fn dirs_or_fallback() -> PathBuf {
         .join("sandlock")
 }
 
-/// Parse a TOML profile string into a Policy + ProgramSpec.
-pub fn parse_profile(content: &str) -> Result<(Policy, ProgramSpec), SandlockError> {
+/// Parse a TOML profile string into a Sandbox + ProgramSpec.
+pub fn parse_profile(content: &str) -> Result<(Sandbox, ProgramSpec), SandlockError> {
     let input: ProfileInput = toml::from_str(content)
-        .map_err(|e| SandlockError::Policy(crate::error::PolicyError::Invalid(
+        .map_err(|e| SandlockError::Sandbox(crate::error::SandboxError::Invalid(
             format!("TOML parse error: {e}"),
         )))?;
     parse_input(input)
 }
 
 /// Load a profile by name.
-pub fn load_profile(name: &str) -> Result<(Policy, ProgramSpec), SandlockError> {
+pub fn load_profile(name: &str) -> Result<(Sandbox, ProgramSpec), SandlockError> {
     let path = profile_dir().join(format!("{}.toml", name));
     let content = std::fs::read_to_string(&path)
-        .map_err(|e| SandlockError::Policy(crate::error::PolicyError::Invalid(
+        .map_err(|e| SandlockError::Sandbox(crate::error::SandboxError::Invalid(
             format!("profile '{}': {}", name, e),
         )))?;
     parse_profile(&content)
@@ -285,7 +285,7 @@ pub fn list_profiles() -> Result<Vec<String>, SandlockError> {
     if !dir.exists() { return Ok(Vec::new()); }
     let mut names = Vec::new();
     for entry in std::fs::read_dir(&dir)
-        .map_err(|e| SandlockError::Policy(crate::error::PolicyError::Invalid(format!("read dir: {}", e))))? {
+        .map_err(|e| SandlockError::Sandbox(crate::error::SandboxError::Invalid(format!("read dir: {}", e))))? {
         if let Ok(entry) = entry {
             if let Some(name) = entry.path().file_stem() {
                 if entry.path().extension().map_or(false, |e| e == "toml") {

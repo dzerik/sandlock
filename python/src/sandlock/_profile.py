@@ -2,7 +2,7 @@
 """TOML profile loading for Sandlock.
 
 Profiles are stored as TOML files under ``~/.config/sandlock/profiles/``.
-Field names match ``Policy`` exactly — no translation layer.
+Field names match ``Sandbox`` exactly — no translation layer.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ else:
 from pathlib import Path
 
 from .exceptions import PolicyError
-from .policy import Policy, FsIsolation, BranchAction
+from .sandbox import Sandbox, FsIsolation, BranchAction
 
 
 _PROFILES_DIR = Path("~/.config/sandlock/profiles").expanduser()
@@ -80,8 +80,8 @@ def list_profiles() -> list[str]:
     )
 
 
-def load_profile(name: str) -> Policy:
-    """Load a named profile and return a Policy.
+def load_profile(name: str) -> Sandbox:
+    """Load a named profile and return a Sandbox.
 
     Args:
         name: Profile name (without .toml extension).
@@ -95,8 +95,8 @@ def load_profile(name: str) -> Policy:
     return load_profile_path(path)
 
 
-def load_profile_path(path: Path) -> Policy:
-    """Load a profile from a file path and return a Policy.
+def load_profile_path(path: Path) -> Sandbox:
+    """Load a profile from a file path and return a Sandbox.
 
     Raises:
         PolicyError: If the file can't be parsed or has invalid fields.
@@ -110,8 +110,8 @@ def load_profile_path(path: Path) -> Policy:
     return policy_from_dict(data, source=str(path))
 
 
-def policy_from_dict(data: dict, source: str = "<dict>") -> Policy:
-    """Construct a Policy from a parsed TOML dict.
+def policy_from_dict(data: dict, source: str = "<dict>") -> Sandbox:
+    """Construct a Sandbox from a parsed TOML dict.
 
     Raises:
         PolicyError: If unknown keys or type mismatches are found.
@@ -161,11 +161,11 @@ def policy_from_dict(data: dict, source: str = "<dict>") -> Policy:
 
         kwargs[key] = value
 
-    return Policy(**kwargs)
+    return Sandbox(**kwargs)
 
 
-def merge_cli_overrides(policy: Policy, overrides: dict) -> Policy:
-    """Return a new Policy with CLI overrides applied on top of a profile.
+def merge_cli_overrides(policy: Sandbox, overrides: dict) -> Sandbox:
+    """Return a new Sandbox with CLI overrides applied on top of a profile.
 
     List fields from CLI are appended to profile values.
     Scalar fields from CLI replace profile values.
