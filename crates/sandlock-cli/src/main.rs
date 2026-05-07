@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use sandlock_core::Sandbox;
-use sandlock_core::sandbox::{ByteSize, SandboxBuilder};
+use sandlock_core::sandbox::{BranchAction, ByteSize, FsIsolation, SandboxBuilder};
 use sandlock_core::profile;
 use anyhow::{Result, anyhow};
 use std::path::PathBuf;
@@ -265,15 +265,7 @@ async fn run_command(args: RunArgs) -> Result<()> {
 
         // Build a minimal policy with only fs rules
         let mut builder = if let Some(ref base) = ns_profile_base {
-            if !base.fs_denied.is_empty() {
-                let source = args.profile.as_deref()
-                    .map(|n| format!("profile {}", n))
-                    .unwrap_or_else(|| format!("profile file {}", args.profile_file.as_ref().unwrap().display()));
-                return Err(anyhow!(
-                    "--no-supervisor is incompatible with: --fs-deny (from {})",
-                    source
-                ));
-            }
+            validate_no_supervisor_profile(base, &profile_source(&args))?;
             let mut b = Sandbox::builder();
             for p in &base.fs_readable { b = b.fs_read(p); }
             for p in &base.fs_writable { b = b.fs_write(p); }
@@ -285,17 +277,6 @@ async fn run_command(args: RunArgs) -> Result<()> {
             }
             b = b.clean_env(base.clean_env);
             for (k, v) in &base.env { b = b.env_var(k, v); }
-            // Process / determinism knobs (no supervisor needed — pure prctl/personality).
-            b = b.no_coredump(base.no_coredump);
-            b = b.no_huge_pages(base.no_huge_pages);
-            b = b.no_randomize_memory(base.no_randomize_memory);
-            if let Some(uid) = base.uid { b = b.uid(uid); }
-            if let Some(ref c) = base.cwd { b = b.cwd(c); }
-            // Resource limits enforceable via rlimits in-process.
-            if let Some(mem) = base.max_memory { b = b.max_memory(mem); }
-            b = b.max_processes(base.max_processes);
-            if let Some(n) = base.max_open_files { b = b.max_open_files(n); }
-            if let Some(seed) = base.random_seed { b = b.random_seed(seed); }
             b
         } else {
             Sandbox::builder()
@@ -705,6 +686,70 @@ fn validate_no_supervisor(args: &RunArgs) -> Result<()> {
     if !bad.is_empty() {
         return Err(anyhow!(
             "--no-supervisor is incompatible with: {}",
+            bad.join(", ")
+        ));
+    }
+
+    Ok(())
+}
+
+fn profile_source(args: &RunArgs) -> String {
+    args.profile.as_deref()
+        .map(|n| format!("profile {n}"))
+        .unwrap_or_else(|| {
+            let path = args.profile_file
+                .as_ref()
+                .expect("profile_source called without a loaded profile");
+            format!("profile file {}", path.display())
+        })
+}
+
+/// Validate profile fields against the smaller no-supervisor execution model.
+///
+/// No-supervisor mode only applies Landlock filesystem allow rules, the
+/// deny-only seccomp blocklist, and environment changes before exec. Reject
+/// profile fields that require the supervisor or other setup paths so profile
+/// users do not get a silently weakened sandbox.
+fn validate_no_supervisor_profile(profile: &Sandbox, source: &str) -> Result<()> {
+    let mut bad = Vec::new();
+
+    if !profile.fs_denied.is_empty() { bad.push("[filesystem].deny"); }
+    if !profile.net_allow.is_empty() { bad.push("[network].allow"); }
+    if !profile.net_bind.is_empty() { bad.push("[network].bind"); }
+    if profile.port_remap { bad.push("[network].port_remap"); }
+    if !profile.http_allow.is_empty() { bad.push("[http].allow"); }
+    if !profile.http_deny.is_empty() { bad.push("[http].deny"); }
+    if !profile.http_ports.is_empty() { bad.push("[http].ports"); }
+    if profile.http_ca.is_some() { bad.push("[config].http_ca"); }
+    if profile.http_key.is_some() { bad.push("[config].http_key"); }
+    if profile.max_memory.is_some() { bad.push("[limits].memory"); }
+    if profile.max_processes != 64 { bad.push("[limits].processes"); }
+    if profile.max_open_files.is_some() { bad.push("[limits].open_files"); }
+    if profile.max_cpu.is_some() { bad.push("[limits].cpu"); }
+    if profile.max_disk.is_some() { bad.push("[limits].disk"); }
+    if profile.gpu_devices.is_some() { bad.push("[limits].gpu_devices"); }
+    if profile.cpu_cores.is_some() { bad.push("[limits].cpu_cores"); }
+    if profile.num_cpus.is_some() { bad.push("[limits].num_cpus"); }
+    if profile.random_seed.is_some() { bad.push("[determinism].random_seed"); }
+    if profile.time_start.is_some() { bad.push("[determinism].time_start"); }
+    if profile.deterministic_dirs { bad.push("[determinism].deterministic_dirs"); }
+    if profile.no_randomize_memory { bad.push("[determinism].no_randomize_memory"); }
+    if profile.no_huge_pages { bad.push("[program].no_huge_pages"); }
+    if profile.no_coredump { bad.push("[program].no_coredump"); }
+    if profile.fs_isolation != FsIsolation::None { bad.push("[filesystem].isolation"); }
+    if profile.workdir.is_some() { bad.push("[config].workdir"); }
+    if profile.fs_storage.is_some() { bad.push("[config].fs_storage"); }
+    if profile.cwd.is_some() { bad.push("[program].cwd"); }
+    if profile.uid.is_some() { bad.push("[program].uid"); }
+    if profile.chroot.is_some() { bad.push("[filesystem].chroot"); }
+    if !profile.fs_mount.is_empty() { bad.push("[filesystem].mount"); }
+    if profile.on_exit != BranchAction::Commit { bad.push("[filesystem].on_exit"); }
+    if profile.on_error != BranchAction::Abort { bad.push("[filesystem].on_error"); }
+
+    if !bad.is_empty() {
+        return Err(anyhow!(
+            "--no-supervisor is incompatible with {} field(s): {}",
+            source,
             bad.join(", ")
         ));
     }

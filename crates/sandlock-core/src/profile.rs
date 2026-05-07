@@ -3,6 +3,7 @@ use crate::error::SandlockError;
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::collections::HashMap;
+use std::time::SystemTime;
 
 /// Program identity supplied by a profile alongside the policy.
 /// Not a `Sandbox` field — passed separately to the sandbox runner.
@@ -40,8 +41,7 @@ pub struct ConfigSection {
 #[serde(deny_unknown_fields, default)]
 pub struct DeterminismSection {
     pub random_seed: Option<u64>,
-    /// RFC3339 string. Currently dropped during profile-to-policy conversion;
-    /// will be parsed to `SystemTime` once an RFC3339 dep is added to sandlock-core.
+    /// RFC3339 timestamp string. Maps to `Sandbox::time_start`.
     pub time_start: Option<String>,
     pub deterministic_dirs: bool,
     pub no_randomize_memory: bool,
@@ -138,8 +138,9 @@ pub fn parse_input(input: ProfileInput) -> Result<(Sandbox, ProgramSpec), Sandlo
 
     // [determinism]
     if let Some(s) = input.determinism.random_seed { b = b.random_seed(s); }
-    // time_start: requires an RFC3339 parser (e.g. `time` crate); skipped for now.
-    // When that dep lands: parse the string to SystemTime and call b.time_start(t).
+    if let Some(s) = input.determinism.time_start.as_deref() {
+        b = b.time_start(parse_time_start(s)?);
+    }
     if input.determinism.deterministic_dirs        { b = b.deterministic_dirs(true); }
     if input.determinism.no_randomize_memory       { b = b.no_randomize_memory(true); }
 
@@ -243,6 +244,17 @@ fn parse_mount_spec(s: &str) -> Result<(PathBuf, PathBuf), SandlockError> {
         )));
     }
     Ok((PathBuf::from(virt), PathBuf::from(host)))
+}
+
+/// Parses an RFC3339 timestamp string into `SystemTime`.
+fn parse_time_start(s: &str) -> Result<SystemTime, SandlockError> {
+    use crate::error::SandboxError;
+    let ts: jiff::Timestamp = s.parse().map_err(|e| {
+        SandlockError::Sandbox(SandboxError::Invalid(
+            format!("invalid [determinism].time_start {s:?}: {e}"),
+        ))
+    })?;
+    Ok(ts.into())
 }
 
 /// Default profile directory.
@@ -472,11 +484,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_profile_time_start_is_ignored_for_now() {
-        // Until an RFC3339 parser dep lands, [determinism].time_start is silently
-        // dropped during profile-to-policy conversion. This test pins that
-        // intentional behavior — when the dep lands, this test should assert
-        // policy.time_start is set instead.
+    fn parse_profile_time_start_sets_policy_field() {
         let toml = r#"
             [program]
             exec = "/bin/true"
@@ -484,7 +492,20 @@ mod tests {
             time_start = "2026-01-01T00:00:00Z"
         "#;
         let (policy, _spec) = parse_profile(toml).unwrap();
-        assert!(policy.time_start.is_none());
+        assert!(policy.time_start.is_some());
+    }
+
+    #[test]
+    fn parse_profile_invalid_time_start_is_error() {
+        let toml = r#"
+            [program]
+            exec = "/bin/true"
+            [determinism]
+            time_start = "not-a-time"
+        "#;
+        let err = parse_profile(toml).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("time_start"), "got: {msg}");
     }
 
     #[test]

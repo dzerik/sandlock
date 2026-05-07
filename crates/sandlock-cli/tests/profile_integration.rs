@@ -116,3 +116,32 @@ fn profile_by_name_loads_program_section() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[test]
+fn no_supervisor_rejects_supervisor_only_profile_fields() {
+    let tmp = tempfile::tempdir().unwrap();
+    let profile_path = tmp.path().join("p.toml");
+    std::fs::write(&profile_path, r#"
+        [program]
+        exec = "/bin/true"
+
+        [filesystem]
+        read = ["/usr", "/lib", "/lib64", "/bin", "/etc"]
+
+        [network]
+        allow = ["example.com:443"]
+    "#).unwrap();
+
+    let out = sandlock_bin()
+        .args(["run", "--no-supervisor", "--profile-file", profile_path.to_str().unwrap()])
+        .output()
+        .expect("spawn sandlock");
+
+    assert!(!out.status.success(), "--no-supervisor should reject network rules from profiles");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--no-supervisor") && stderr.contains("[network].allow"),
+        "stderr should explain incompatible profile field; stderr: {}",
+        stderr,
+    );
+}

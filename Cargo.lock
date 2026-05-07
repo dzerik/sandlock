@@ -1581,6 +1581,7 @@ dependencies = [
  "clap",
  "goblin",
  "hudsucker",
+ "jiff",
  "libc",
  "nix",
  "pathdiff",
