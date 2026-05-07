@@ -373,10 +373,16 @@ class Sandbox:
         return f"sandbox-{os.getpid()}"
 
     def _ensure_native(self):
-        """Lazily build the native policy from this dataclass."""
-        if self._native is None:
-            from ._sdk import _NativePolicy
-            self._native = _NativePolicy.from_dataclass(self, policy_fn=self.policy_fn)
+        """Build a fresh native policy from this dataclass.
+
+        Rebuilds on every call so that mutations to config fields
+        between lifecycle invocations (e.g. ``run()`` → mutate
+        ``fs_readable`` → ``run()`` again) take effect on the next
+        run. The Sandbox class is not frozen; a stale native cache
+        would silently apply outdated config.
+        """
+        from ._sdk import _NativePolicy
+        self._native = _NativePolicy.from_dataclass(self, policy_fn=self.policy_fn)
         return self._native
 
     # ------------------------------------------------------------------

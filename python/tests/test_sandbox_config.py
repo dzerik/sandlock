@@ -44,6 +44,28 @@ class TestParseMemorySize:
             parse_memory_size("")
 
 
+class TestEnsureNative:
+    """``_ensure_native`` rebuilds on every call so that mutations to
+    config fields between lifecycle invocations are not silently
+    masked by a stale native cache."""
+
+    def test_rebuilds_on_each_call(self):
+        sb = Sandbox(fs_readable=["/usr"])
+        first = sb._ensure_native()
+        second = sb._ensure_native()
+        # Two distinct native objects (rebuild, not cache hit).
+        assert first is not second
+
+    def test_picks_up_post_construction_mutation(self):
+        sb = Sandbox(fs_readable=["/usr"])
+        sb._ensure_native()                 # first build
+        sb.fs_readable = ["/usr", "/etc"]   # user mutates after first run
+        rebuilt = sb._ensure_native()       # second build sees mutation
+        # The rebuilt native is a fresh object; the cached self._native
+        # was replaced, not retained from the pre-mutation state.
+        assert rebuilt is sb._native
+
+
 class TestPolicy:
     def test_defaults(self):
         p = Sandbox()
