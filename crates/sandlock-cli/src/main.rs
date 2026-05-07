@@ -3,6 +3,7 @@ use sandlock_core::{Policy, Sandbox};
 use sandlock_core::policy::ByteSize;
 use sandlock_core::profile;
 use anyhow::{Result, anyhow};
+use std::path::PathBuf;
 use std::time::SystemTime;
 
 mod network_registry;
@@ -46,8 +47,11 @@ enum Command {
         clean_env: bool,
         #[arg(long)]
         num_cpus: Option<u32>,
-        #[arg(short = 'p', long)]
+        #[arg(short = 'p', long, conflicts_with = "profile_file")]
         profile: Option<String>,
+        /// Load a profile directly from a file path (TOML format)
+        #[arg(long = "profile-file", value_name = "PATH", conflicts_with = "profile")]
+        profile_file: Option<PathBuf>,
         #[arg(long = "status-fd", value_name = "FD")]
         status_fd: Option<i32>,
         #[arg(short = 'c', long = "cpu")]
@@ -172,7 +176,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Run { fs_read, fs_write, max_memory, max_processes, timeout,
             net_allow, net_bind, time_start, random_seed,
-            clean_env, num_cpus, profile: profile_name, status_fd,
+            clean_env, num_cpus, profile: profile_name, profile_file, status_fd,
             max_cpu, max_open_files, chroot, uid, workdir, cwd,
             fs_isolation, fs_storage, max_disk, allow_sysv_ipc,
             http_allow, http_deny, http_ports, https_ca, https_key,
@@ -191,13 +195,28 @@ async fn main() -> Result<()> {
                     &status_fd, &fs_deny, &fs_mount,
                 )?;
 
+                // Load profile once (if any) and split into policy base + program spec.
+                let (ns_profile_base, ns_profile_spec) = if let Some(ref name) = profile_name {
+                    let (base, spec) = sandlock_core::profile::load_profile(name)?;
+                    (Some(base), Some(spec))
+                } else if let Some(ref path) = profile_file {
+                    let content = std::fs::read_to_string(path)
+                        .map_err(|e| anyhow!("failed to read profile file {}: {}", path.display(), e))?;
+                    let (base, spec) = sandlock_core::profile::parse_profile(&content)?;
+                    (Some(base), Some(spec))
+                } else {
+                    (None, None)
+                };
+
                 // Build a minimal policy with only fs rules
-                let mut builder = if let Some(ref name) = profile_name {
-                    let base = sandlock_core::profile::load_profile(name)?;
+                let mut builder = if let Some(ref base) = ns_profile_base {
                     if !base.fs_denied.is_empty() {
+                        let source = profile_name.as_deref()
+                            .map(|n| format!("profile {}", n))
+                            .unwrap_or_else(|| format!("profile file {}", profile_file.as_ref().unwrap().display()));
                         return Err(anyhow!(
-                            "--no-supervisor is incompatible with: --fs-deny (from profile {})",
-                            name
+                            "--no-supervisor is incompatible with: --fs-deny (from {})",
+                            source
                         ));
                     }
                     let mut b = Policy::builder();
@@ -207,6 +226,27 @@ async fn main() -> Result<()> {
                     b
                 } else {
                     Policy::builder()
+                };
+
+                // Derive the effective command: profile's [program] section supplies the
+                // default; a trailing positional command on the CLI overrides it.
+                // effective_cmd is only consumed when exec_shell is None; in the shell
+                // path it's overwritten by cmd_strs below.
+                let effective_cmd: Vec<String> = if !cmd.is_empty() || exec_shell.is_some() {
+                    // CLI-provided command wins; pass through as-is.
+                    cmd.clone()
+                } else if let Some(spec) = ns_profile_spec {
+                    if let Some(exec) = spec.exec {
+                        let exec_str = exec.into_os_string().into_string()
+                            .map_err(|_| anyhow!("non-UTF-8 exec path in profile"))?;
+                        let mut v = vec![exec_str];
+                        v.extend(spec.args);
+                        v
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
                 };
 
                 for p in &fs_read { builder = builder.fs_read(p); }
@@ -224,22 +264,34 @@ async fn main() -> Result<()> {
 
                 let policy = builder.build()?;
 
-                if exec_shell.is_none() && cmd.is_empty() {
-                    return Err(anyhow!("no command specified"));
+                if exec_shell.is_none() && effective_cmd.is_empty() {
+                    return Err(anyhow!("no command specified (no trailing command and no [program].exec in profile)"));
                 }
 
                 let cmd_strs: Vec<&str> = if let Some(ref shell_cmd) = exec_shell {
                     vec!["/bin/sh", "-c", shell_cmd.as_str()]
                 } else {
-                    cmd.iter().map(|s| s.as_str()).collect()
+                    effective_cmd.iter().map(|s| s.as_str()).collect()
                 };
 
                 return no_supervisor_exec(&policy, &cmd_strs);
             }
 
+            // Hoist the profile load so we don't read+parse twice.
+            let (base_from_profile, profile_program_spec) = if let Some(ref name) = profile_name {
+                let (base, spec) = profile::load_profile(name)?;
+                (Some(base), Some(spec))
+            } else if let Some(ref path) = profile_file {
+                let content = std::fs::read_to_string(path)
+                    .map_err(|e| anyhow!("failed to read profile file {}: {}", path.display(), e))?;
+                let (base, spec) = profile::parse_profile(&content)?;
+                (Some(base), Some(spec))
+            } else {
+                (None, None)
+            };
+
             // Start from profile or default
-            let mut builder = if let Some(ref name) = profile_name {
-                let base = profile::load_profile(name)?;
+            let mut builder = if let Some(base) = base_from_profile {
                 // Rebuild builder from loaded profile as base
                 let mut b = Policy::builder();
                 for p in &base.fs_readable { b = b.fs_read(p); }
@@ -370,8 +422,28 @@ async fn main() -> Result<()> {
                 image_cmd = None;
             }
 
-            if exec_shell.is_none() && cmd.is_empty() && image_cmd.is_none() {
-                return Err(anyhow!("no command specified"));
+            // Derive the effective command: profile's [program] section supplies a
+            // default; a trailing positional command on the CLI overrides it.
+            let profile_cmd: Option<Vec<String>> = if cmd.is_empty() && exec_shell.is_none() && image_cmd.is_none() {
+                if let Some(spec) = profile_program_spec {
+                    if let Some(exec) = spec.exec {
+                        let exec_str = exec.into_os_string().into_string()
+                            .map_err(|_| anyhow!("non-UTF-8 exec path in profile"))?;
+                        let mut v = vec![exec_str];
+                        v.extend(spec.args);
+                        Some(v)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            if exec_shell.is_none() && cmd.is_empty() && image_cmd.is_none() && profile_cmd.is_none() {
+                return Err(anyhow!("no command specified (no trailing command and no [program].exec in profile)"));
             }
 
             let policy = builder.build()?;
@@ -379,8 +451,13 @@ async fn main() -> Result<()> {
                 vec!["/bin/sh", "-c", shell_cmd.as_str()]
             } else if let Some(ref ic) = image_cmd {
                 ic.iter().map(|s| s.as_str()).collect()
-            } else {
+            } else if !cmd.is_empty() {
                 cmd.iter().map(|s| s.as_str()).collect()
+            } else if let Some(ref pc) = profile_cmd {
+                pc.iter().map(|s| s.as_str()).collect()
+            } else {
+                // Unreachable: the check above would have returned an error.
+                unreachable!("no command source available")
             };
 
             let result = if dry_run {

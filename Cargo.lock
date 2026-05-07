@@ -1569,6 +1569,7 @@ dependencies = [
  "sandlock-core",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 

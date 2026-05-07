@@ -34,6 +34,9 @@ pub use result::{RunResult, ExitStatus};
 pub use sandbox::Sandbox;
 pub use pipeline::{Stage, Pipeline, Gather};
 pub use dry_run::{Change, ChangeKind, DryRunResult};
+// Sectioned-profile parsing types: ProfileInput is the top-level deserialization
+// target; ProgramSpec carries [program].exec/args (not a Policy field).
+pub use crate::profile::{ProfileInput, ProgramSpec};
 
 // Public extension API — see docs/extension-handlers.md.
 pub use seccomp::dispatch::{Handler, HandlerCtx, HandlerError};
