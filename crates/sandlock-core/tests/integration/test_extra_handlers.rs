@@ -420,7 +420,7 @@ async fn extra_handler_on_default_blocklist_syscall_is_rejected() {
     );
 }
 
-/// User-supplied `block_syscalls` entries must be honoured by the same guard
+/// User-supplied `extra_deny_syscalls` entries must be honoured by the same guard
 /// that protects DEFAULT_BLOCKLIST: an extra registered on a syscall the caller
 /// explicitly asked to block would otherwise let a `Continue` from the
 /// handler reach the deny-JEQ via the notif path and bypass the kernel
@@ -430,12 +430,12 @@ async fn extra_handler_on_default_blocklist_syscall_is_rejected() {
 /// driving the user-list branch of `blocklist_syscall_numbers` (see
 /// `crates/sandlock-core/src/context.rs`).  Uses `SYS_mremap` because it is
 /// in `syscall_name_to_nr` but **not** in DEFAULT_BLOCKLIST — putting it into
-/// `block_syscalls` is the only way it lands on the blocklist, isolating the
+/// `extra_deny_syscalls` is the only way it lands on the blocklist, isolating the
 /// user-supplied branch under test from the default-blocklist branch.
 #[tokio::test]
 async fn extra_handler_on_user_specified_blocklist_is_rejected() {
     let policy = base_policy()
-        .block_syscalls(vec!["mremap".into()])
+        .extra_deny_syscalls(vec!["mremap".into()])
         .build()
         .unwrap();
     let handler = |_cx: &HandlerCtx| async { NotifAction::Continue };

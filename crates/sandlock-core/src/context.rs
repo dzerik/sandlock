@@ -223,7 +223,7 @@ pub fn syscall_name_to_nr(name: &str) -> Option<u32> {
         "readlink" => arch::SYS_READLINK?,
         "futimesat" => arch::SYS_FUTIMESAT?,
         "fork" => arch::SYS_FORK?,
-        // SysV IPC (gated by --allow-sysv-ipc; denied by default)
+        // SysV IPC (gated by extra_allow_syscalls=["sysv_ipc"]; denied by default)
         "shmget" => libc::SYS_shmget,
         "shmat" => libc::SYS_shmat,
         "shmdt" => libc::SYS_shmdt,
@@ -272,9 +272,9 @@ pub fn notif_syscalls(policy: &Policy, sandbox_name: Option<&str>) -> Vec<u32> {
         // shmget is in notif only when SysV IPC is allowed. The BPF
         // layout puts notif JEQs before deny JEQs, so a syscall on
         // both lists would notify (RET_USER_NOTIF) and silently
-        // bypass the kernel-level deny. When --allow-sysv-ipc is
-        // unset, shmget belongs only on the blocklist.
-        if policy.allow_sysv_ipc {
+        // bypass the kernel-level deny. When extra_allow_syscalls does not contain "sysv_ipc",
+        // shmget belongs only on the blocklist.
+        if policy.allows_sysv_ipc() {
             nrs.push(libc::SYS_shmget as u32);
         }
     }
@@ -445,16 +445,16 @@ pub fn notif_syscalls(policy: &Policy, sandbox_name: Option<&str>) -> Vec<u32> {
 }
 
 /// Resolve `NO_SUPERVISOR_BLOCKLIST_SYSCALLS` names to numbers, plus
-/// SysV IPC syscalls when `policy.allow_sysv_ipc` is false.
+/// SysV IPC syscalls when `policy.allows_sysv_ipc()` is false.
 pub fn no_supervisor_blocklist_syscall_numbers(policy: &Policy) -> Vec<u32> {
     use crate::sys::structs::NO_SUPERVISOR_BLOCKLIST_SYSCALLS;
     let mut nrs: Vec<u32> = NO_SUPERVISOR_BLOCKLIST_SYSCALLS
         .iter()
         .copied()
-        .chain(policy.block_syscalls.iter().map(String::as_str))
+        .chain(policy.extra_deny_syscalls.iter().map(String::as_str))
         .filter_map(|n| syscall_name_to_nr(n))
         .collect();
-    if !policy.allow_sysv_ipc {
+    if !policy.allows_sysv_ipc() {
         for name in SYSV_IPC_BLOCKLIST_SYSCALLS {
             if let Some(nr) = syscall_name_to_nr(name) {
                 if !nrs.contains(&nr) {
@@ -471,15 +471,15 @@ pub fn no_supervisor_blocklist_syscall_numbers(policy: &Policy) -> Vec<u32> {
 /// Resolve the default syscall blocklist plus policy extras to numbers.
 ///
 /// SysV IPC syscalls are appended to the resolved blocklist when
-/// `policy.allow_sysv_ipc` is false.
+/// `policy.allows_sysv_ipc()` is false.
 pub fn blocklist_syscall_numbers(policy: &Policy) -> Vec<u32> {
     let mut nrs: Vec<u32> = DEFAULT_BLOCKLIST_SYSCALLS
         .iter()
         .copied()
-        .chain(policy.block_syscalls.iter().map(String::as_str))
+        .chain(policy.extra_deny_syscalls.iter().map(String::as_str))
         .filter_map(|n| syscall_name_to_nr(n))
         .collect();
-    if !policy.allow_sysv_ipc {
+    if !policy.allows_sysv_ipc() {
         for name in SYSV_IPC_BLOCKLIST_SYSCALLS {
             if let Some(nr) = syscall_name_to_nr(name) {
                 if !nrs.contains(&nr) {
@@ -1160,7 +1160,7 @@ mod tests {
         // layout).
         let policy = Policy::builder()
             .max_memory(crate::policy::ByteSize::mib(256))
-            .allow_sysv_ipc(true)
+            .extra_allow_syscalls(vec!["sysv_ipc".into()])
             .build()
             .unwrap();
         let nrs = notif_syscalls(&policy, None);
@@ -1173,7 +1173,7 @@ mod tests {
 
     #[test]
     fn test_notif_syscalls_memory_excludes_shmget_when_sysv_ipc_denied() {
-        // With max_memory but allow_sysv_ipc=false (the default),
+        // With max_memory but allows_sysv_ipc()=false (the default),
         // shmget must NOT be in notif: if it were, the BPF filter
         // would route it to RET_USER_NOTIF before reaching the deny
         // JEQ, silently bypassing the kernel-level deny.
@@ -1256,12 +1256,12 @@ mod tests {
     #[test]
     fn test_blocklist_syscall_numbers_custom() {
         let policy = Policy::builder()
-            .block_syscalls(vec!["mount".into(), "ptrace".into()])
+            .extra_deny_syscalls(vec!["mount".into(), "ptrace".into()])
             .build()
             .unwrap();
         let nrs = blocklist_syscall_numbers(&policy);
         // User-supplied blocklist still gets SysV IPC appended
-        // (allow_sysv_ipc defaults to false).
+        // (allows_sysv_ipc() defaults to false).
         assert!(nrs.contains(&(libc::SYS_mount as u32)));
         assert!(nrs.contains(&(libc::SYS_ptrace as u32)));
         assert!(nrs.contains(&(libc::SYS_shmget as u32)));
@@ -1270,8 +1270,8 @@ mod tests {
     #[test]
     fn test_blocklist_syscall_numbers_custom_with_sysv_ipc_allowed() {
         let policy = Policy::builder()
-            .block_syscalls(vec!["mount".into(), "ptrace".into()])
-            .allow_sysv_ipc(true)
+            .extra_deny_syscalls(vec!["mount".into(), "ptrace".into()])
+            .extra_allow_syscalls(vec!["sysv_ipc".into()])
             .build()
             .unwrap();
         let nrs = blocklist_syscall_numbers(&policy);
@@ -1285,7 +1285,7 @@ mod tests {
     #[test]
     fn test_blocklist_syscall_numbers_default_with_sysv_ipc_allowed() {
         let policy = Policy::builder()
-            .allow_sysv_ipc(true)
+            .extra_allow_syscalls(vec!["sysv_ipc".into()])
             .build()
             .unwrap();
         let nrs = blocklist_syscall_numbers(&policy);
@@ -1308,7 +1308,7 @@ mod tests {
     #[test]
     fn test_no_supervisor_blocklist_excludes_sysv_ipc_when_allowed() {
         let policy = Policy::builder()
-            .allow_sysv_ipc(true)
+            .extra_allow_syscalls(vec!["sysv_ipc".into()])
             .build()
             .unwrap();
         let nrs = no_supervisor_blocklist_syscall_numbers(&policy);

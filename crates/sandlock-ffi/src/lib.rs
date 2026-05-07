@@ -406,27 +406,27 @@ pub unsafe extern "C" fn sandlock_policy_builder_http_port(
 /// # Safety
 /// `b` and `path` must be valid pointers.
 #[no_mangle]
-pub unsafe extern "C" fn sandlock_policy_builder_https_ca(
+pub unsafe extern "C" fn sandlock_policy_builder_http_ca(
     b: *mut PolicyBuilder,
     path: *const c_char,
 ) -> *mut PolicyBuilder {
     if b.is_null() || path.is_null() { return b; }
     let path = CStr::from_ptr(path).to_str().unwrap_or("");
     let builder = *Box::from_raw(b);
-    Box::into_raw(Box::new(builder.https_ca(path)))
+    Box::into_raw(Box::new(builder.http_ca(path)))
 }
 
 /// # Safety
 /// `b` and `path` must be valid pointers.
 #[no_mangle]
-pub unsafe extern "C" fn sandlock_policy_builder_https_key(
+pub unsafe extern "C" fn sandlock_policy_builder_http_key(
     b: *mut PolicyBuilder,
     path: *const c_char,
 ) -> *mut PolicyBuilder {
     if b.is_null() || path.is_null() { return b; }
     let path = CStr::from_ptr(path).to_str().unwrap_or("");
     let builder = *Box::from_raw(b);
-    Box::into_raw(Box::new(builder.https_key(path)))
+    Box::into_raw(Box::new(builder.http_key(path)))
 }
 
 // ----------------------------------------------------------------
@@ -483,14 +483,27 @@ pub unsafe extern "C" fn sandlock_policy_builder_time_start(
 /// # Safety
 /// `b` must be a valid builder pointer. `names` is a comma-separated NUL-terminated string.
 #[no_mangle]
-pub unsafe extern "C" fn sandlock_policy_builder_block_syscalls(
+pub unsafe extern "C" fn sandlock_policy_builder_extra_deny_syscalls(
     b: *mut PolicyBuilder, names: *const c_char,
 ) -> *mut PolicyBuilder {
     if b.is_null() || names.is_null() { return b; }
     let builder = *Box::from_raw(b);
     let s = CStr::from_ptr(names).to_str().unwrap_or("");
     let calls: Vec<String> = s.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-    Box::into_raw(Box::new(builder.block_syscalls(calls)))
+    Box::into_raw(Box::new(builder.extra_deny_syscalls(calls)))
+}
+
+/// # Safety
+/// `b` must be a valid builder pointer. `names` is a comma-separated NUL-terminated string.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_policy_builder_extra_allow_syscalls(
+    b: *mut PolicyBuilder, names: *const c_char,
+) -> *mut PolicyBuilder {
+    if b.is_null() || names.is_null() { return b; }
+    let builder = *Box::from_raw(b);
+    let s = CStr::from_ptr(names).to_str().unwrap_or("");
+    let names: Vec<String> = s.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    Box::into_raw(Box::new(builder.extra_allow_syscalls(names)))
 }
 
 /// # Safety

@@ -26,10 +26,7 @@ pub struct ProfileInput {
     pub limits: LimitsSection,
 }
 
-// Field names follow the schema vocabulary, which mostly matches `Policy`'s
-// field names already; the few that don't (e.g. `http_ca` vs `Policy::https_ca`)
-// are bridged by `parse_input` in Phase 1 and become a 1:1 match in Phase 2
-// once Policy is renamed.
+// Field names follow the schema vocabulary and match `Policy`'s field names 1:1.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct ConfigSection {
@@ -43,7 +40,8 @@ pub struct ConfigSection {
 #[serde(deny_unknown_fields, default)]
 pub struct DeterminismSection {
     pub random_seed: Option<u64>,
-    /// RFC3339 string; converted to `SystemTime` during profile-to-policy conversion.
+    /// RFC3339 string. Currently dropped during profile-to-policy conversion;
+    /// will be parsed to `SystemTime` once an RFC3339 dep is added to sandlock-core.
     pub time_start: Option<String>,
     pub deterministic_dirs: bool,
     pub no_randomize_memory: bool,
@@ -125,16 +123,16 @@ pub struct LimitsSection {
 
 /// Convert a parsed `ProfileInput` into a `(Policy, ProgramSpec)` pair.
 ///
-/// Performs the schema-vocabulary → Policy-field-name translation that
-/// will go away in Phase 2 once Policy is renamed.
+/// Forwards each schema section's fields to the corresponding `PolicyBuilder`
+/// method calls. The three private helpers (`parse_fs_isolation`,
+/// `parse_branch_action`, `parse_mount_spec`) handle string-to-typed-value
+/// conversions for fields that lack `FromStr` impls on their target types.
 pub fn parse_input(input: ProfileInput) -> Result<(Policy, ProgramSpec), SandlockError> {
-    use crate::error::PolicyError;
-
     let mut b = Policy::builder();
 
     // [config]
-    if let Some(p) = input.config.http_ca       { b = b.https_ca(p); }
-    if let Some(p) = input.config.http_key      { b = b.https_key(p); }
+    if let Some(p) = input.config.http_ca       { b = b.http_ca(p); }
+    if let Some(p) = input.config.http_key      { b = b.http_key(p); }
     if let Some(p) = input.config.fs_storage    { b = b.fs_storage(p); }
     if let Some(p) = input.config.workdir       { b = b.workdir(p); }
 
@@ -179,21 +177,11 @@ pub fn parse_input(input: ProfileInput) -> Result<(Policy, ProgramSpec), Sandloc
     for r in input.http.deny.iter()  { b = b.http_deny(r); }
 
     // [syscalls]
-    // Phase 2: replace this match with `b.extra_allow_syscalls(input.syscalls.extra_allow)`
-    // once `Policy::extra_allow_syscalls` exists; the hard-coded `"sysv_ipc"` group
-    // disappears at that point.
-    for name in input.syscalls.extra_allow.iter() {
-        match name.as_str() {
-            "sysv_ipc" => { b = b.allow_sysv_ipc(true); }
-            other => {
-                return Err(SandlockError::Policy(PolicyError::Invalid(
-                    format!("unknown syscall group in extra_allow: {other:?}"),
-                )));
-            }
-        }
+    if !input.syscalls.extra_allow.is_empty() {
+        b = b.extra_allow_syscalls(input.syscalls.extra_allow);
     }
     if !input.syscalls.extra_deny.is_empty() {
-        b = b.block_syscalls(input.syscalls.extra_deny);
+        b = b.extra_deny_syscalls(input.syscalls.extra_deny);
     }
 
     // [limits]
@@ -337,7 +325,7 @@ mod tests {
     }
 
     #[test]
-    fn config_section_maps_to_policy_https_fields() {
+    fn config_section_maps_to_policy_http_fields() {
         let toml = r#"
             [config]
             http_ca  = "/tmp/ca.pem"
@@ -347,12 +335,12 @@ mod tests {
         "#;
         let input: ProfileInput = toml::from_str(toml).unwrap();
         let (policy, _spec) = parse_input(input).unwrap();
-        assert_eq!(policy.https_ca.as_deref(), Some(std::path::Path::new("/tmp/ca.pem")));
-        assert_eq!(policy.https_key.as_deref(), Some(std::path::Path::new("/tmp/ca.key")));
+        assert_eq!(policy.http_ca.as_deref(), Some(std::path::Path::new("/tmp/ca.pem")));
+        assert_eq!(policy.http_key.as_deref(), Some(std::path::Path::new("/tmp/ca.key")));
     }
 
     #[test]
-    fn syscalls_extra_allow_sysv_ipc_sets_bool() {
+    fn syscalls_extra_allow_sysv_ipc_sets_vec() {
         let toml = r#"
             [program]
             exec = "/bin/true"
@@ -362,22 +350,8 @@ mod tests {
         "#;
         let input: ProfileInput = toml::from_str(toml).unwrap();
         let (policy, _spec) = parse_input(input).unwrap();
-        assert!(policy.allow_sysv_ipc);
-        assert_eq!(policy.block_syscalls, vec!["ptrace".to_string()]);
-    }
-
-    #[test]
-    fn syscalls_extra_allow_unknown_group_is_error() {
-        let toml = r#"
-            [program]
-            exec = "/bin/true"
-            [syscalls]
-            extra_allow = ["not_a_real_group"]
-        "#;
-        let input: ProfileInput = toml::from_str(toml).unwrap();
-        let err = parse_input(input).unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("unknown syscall group"), "got: {msg}");
+        assert!(policy.allows_sysv_ipc());
+        assert_eq!(policy.extra_deny_syscalls, vec!["ptrace".to_string()]);
     }
 
     #[test]
@@ -463,8 +437,8 @@ mod tests {
         let (policy, spec) = parse_profile(toml).unwrap();
         assert_eq!(spec.exec.as_deref(), Some(std::path::Path::new("/usr/bin/redis-cli")));
         assert_eq!(spec.args.len(), 4);
-        assert!(policy.allow_sysv_ipc);
-        assert_eq!(policy.block_syscalls.len(), 2);
+        assert!(policy.allows_sysv_ipc());
+        assert_eq!(policy.extra_deny_syscalls.len(), 2);
         assert_eq!(policy.fs_readable.len(), 2);
         // 1 user rule (tcp://cache.internal:6379) + at least 1 http-port-derived
         // rule that the builder auto-merges (api.internal on http.ports). The

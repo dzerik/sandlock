@@ -136,7 +136,7 @@ sandlock run \
 # (e.g. /etc/ssl/certs/), then pass both files here.
 sandlock run \
   --http-allow "POST api.openai.com/v1/*" \
-  --https-ca ca.pem --https-key ca-key.pem \
+  --http-ca ca.pem --http-key ca-key.pem \
   -r /usr -r /lib -r /etc -- python3 agent.py
 
 # Server listening on a port (Landlock --net-bind, separate from --net-allow)
@@ -398,7 +398,7 @@ fs_readable = ["/usr", "/lib", "/lib64", "/bin", "/etc"]
 clean_env = true
 max_memory = "512M"
 max_processes = 50
-block_syscalls = []
+extra_deny_syscalls = []
 
 [env]
 CC = "gcc"
@@ -588,12 +588,12 @@ allow-all.
 **HTTP / HTTPS interception.** `--http-allow` / `--http-deny` route
 matching ports through a transparent proxy. Each rule with a concrete
 host auto-extends `--net-allow` with `host:80` (and `host:443` when
-`--https-ca` is set) so the proxy's intercept ports are reachable;
+`--http-ca` is set) so the proxy's intercept ports are reachable;
 wildcard hosts auto-add `:80` / `:443` (any IP). All auto-added
-entries are TCP. HTTPS MITM is opt-in: pass `--https-ca <cert>` and
-`--https-key <key>` for a CA *you generate* and trust inside the
+entries are TCP. HTTPS MITM is opt-in: pass `--http-ca <cert>` and
+`--http-key <key>` for a CA *you generate* and trust inside the
 sandbox (typically install the cert into the workload's
-`/etc/ssl/certs/`). Without `--https-ca`, port 443 is not intercepted
+`/etc/ssl/certs/`). Without `--http-ca`, port 443 is not intercepted
 — `--net-allow host:443` permits raw TLS to the host with no content
 inspection.
 
@@ -661,7 +661,7 @@ Policy(
     fs_denied=["/proc/kcore"],     # Explicitly denied
 
     # Syscall filtering (seccomp)
-    block_syscalls=[],              # Extra syscalls to block in addition to Sandlock defaults
+    extra_deny_syscalls=[],         # Extra syscalls to block in addition to Sandlock defaults
 
     # Network — see "Network Model" above. Each entry is one of:
     #   bare host:port[,port,...]  — TCP (default scheme)
@@ -683,8 +683,8 @@ Policy(
     http_allow=["POST api.openai.com/v1/*"],  # Allow rules (METHOD host/path)
     http_deny=["* */admin/*"],     # Block rules (checked first)
     http_ports=[80],               # Ports to intercept (default: [80])
-    https_ca="ca.pem",             # CA cert for HTTPS MITM (adds port 443)
-    https_key="ca-key.pem",        # CA key for HTTPS MITM
+    http_ca="ca.pem",              # CA cert for HTTPS MITM (adds port 443)
+    http_key="ca-key.pem",         # CA key for HTTPS MITM
 
     # Resources
     max_memory="512M",             # Memory limit

@@ -838,8 +838,8 @@ impl Sandbox {
             let handle = crate::http_acl::spawn_http_acl_proxy(
                 self.policy.http_allow.clone(),
                 self.policy.http_deny.clone(),
-                self.policy.https_ca.as_deref(),
-                self.policy.https_key.as_deref(),
+                self.policy.http_ca.as_deref(),
+                self.policy.http_key.as_deref(),
             ).await.map_err(SandboxError::Io)?;
             self.http_acl_handle = Some(handle);
         }

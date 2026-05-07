@@ -94,14 +94,15 @@ _b_port_remap = _builder_fn("sandlock_policy_builder_port_remap", ctypes.c_bool)
 _b_http_allow = _builder_fn("sandlock_policy_builder_http_allow", ctypes.c_char_p)
 _b_http_deny = _builder_fn("sandlock_policy_builder_http_deny", ctypes.c_char_p)
 _b_http_port = _builder_fn("sandlock_policy_builder_http_port", ctypes.c_uint16)
-_b_https_ca = _builder_fn("sandlock_policy_builder_https_ca", ctypes.c_char_p)
-_b_https_key = _builder_fn("sandlock_policy_builder_https_key", ctypes.c_char_p)
+_b_http_ca = _builder_fn("sandlock_policy_builder_http_ca", ctypes.c_char_p)
+_b_http_key = _builder_fn("sandlock_policy_builder_http_key", ctypes.c_char_p)
 _b_uid = _builder_fn("sandlock_policy_builder_uid", ctypes.c_uint32)
 _b_random_seed = _builder_fn("sandlock_policy_builder_random_seed", ctypes.c_uint64)
 _b_clean_env = _builder_fn("sandlock_policy_builder_clean_env", ctypes.c_bool)
 _b_env_var = _builder_fn("sandlock_policy_builder_env_var", ctypes.c_char_p, ctypes.c_char_p)
 _b_time_start = _builder_fn("sandlock_policy_builder_time_start", ctypes.c_uint64)
-_b_block_syscalls = _builder_fn("sandlock_policy_builder_block_syscalls", ctypes.c_char_p)
+_b_extra_deny_syscalls = _builder_fn("sandlock_policy_builder_extra_deny_syscalls", ctypes.c_char_p)
+_b_extra_allow_syscalls = _builder_fn("sandlock_policy_builder_extra_allow_syscalls", ctypes.c_char_p)
 _b_max_open_files = _builder_fn("sandlock_policy_builder_max_open_files", ctypes.c_uint32)
 _b_no_randomize_memory = _builder_fn("sandlock_policy_builder_no_randomize_memory", ctypes.c_bool)
 _b_no_huge_pages = _builder_fn("sandlock_policy_builder_no_huge_pages", ctypes.c_bool)
@@ -745,10 +746,10 @@ class _NativePolicy:
         "cpu_cores", "gpu_devices",
         "net_allow", "net_bind",
         "port_remap",
-        "http_allow", "http_deny", "http_ports", "https_ca", "https_key",
+        "http_allow", "http_deny", "http_ports", "http_ca", "http_key",
         "uid",
         "random_seed", "time_start", "clean_env", "env",
-        "block_syscalls", "max_open_files",
+        "extra_deny_syscalls", "extra_allow_syscalls", "max_open_files",
         "no_randomize_memory", "no_huge_pages", "no_coredump", "deterministic_dirs",
         # Managed outside _build_from_policy:
         "notif_policy",
@@ -841,10 +842,10 @@ class _NativePolicy:
             b = _b_http_deny(b, _encode(str(rule)))
         for port in (policy.http_ports or []):
             b = _b_http_port(b, int(port))
-        if policy.https_ca:
-            b = _b_https_ca(b, _encode(str(policy.https_ca)))
-        if policy.https_key:
-            b = _b_https_key(b, _encode(str(policy.https_key)))
+        if policy.http_ca:
+            b = _b_http_ca(b, _encode(str(policy.http_ca)))
+        if policy.http_key:
+            b = _b_http_key(b, _encode(str(policy.http_key)))
 
         if policy.port_remap:
             b = _b_port_remap(b, True)
@@ -862,8 +863,10 @@ class _NativePolicy:
         for k, v in (policy.env or {}).items():
             b = _b_env_var(b, _encode(k), _encode(v))
 
-        if policy.block_syscalls:
-            b = _b_block_syscalls(b, _encode(",".join(policy.block_syscalls or [])))
+        if policy.extra_deny_syscalls:
+            b = _b_extra_deny_syscalls(b, _encode(",".join(policy.extra_deny_syscalls or [])))
+        if policy.extra_allow_syscalls:
+            b = _b_extra_allow_syscalls(b, _encode(",".join(policy.extra_allow_syscalls or [])))
         if policy.max_open_files is not None:
             b = _b_max_open_files(b, policy.max_open_files)
 

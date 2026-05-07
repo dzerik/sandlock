@@ -27,8 +27,9 @@ _SIMPLE_FIELDS: dict[str, type] = {
     "fs_writable": list,
     "fs_readable": list,
     "fs_denied": list,
-    # Extra syscall blocklist entries
-    "block_syscalls": list,
+    # Extra syscall filter entries
+    "extra_deny_syscalls": list,
+    "extra_allow_syscalls": list,
     # Network
     "net_allow": list,
     "net_bind": list,

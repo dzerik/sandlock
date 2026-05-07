@@ -343,7 +343,7 @@ async fn test_sysv_shmget_denied_by_default() {
 }
 
 // ------------------------------------------------------------------
-// 7b. allow_sysv_ipc(true) restores SysV shm.
+// 7b. extra_allow_syscalls(["sysv_ipc"]) restores SysV shm.
 // ------------------------------------------------------------------
 #[tokio::test]
 async fn test_sysv_shmget_allowed_when_opted_in() {
@@ -361,7 +361,7 @@ async fn test_sysv_shmget_allowed_when_opted_in() {
     ), out = out.display());
 
     let policy = base_policy()
-        .allow_sysv_ipc(true)
+        .extra_allow_syscalls(vec!["sysv_ipc".into()])
         .build()
         .unwrap();
     let result = Sandbox::run_interactive(&policy, Some("test"), &["python3", "-c", &script])
@@ -373,7 +373,7 @@ async fn test_sysv_shmget_allowed_when_opted_in() {
     assert_eq!(
         contents.trim(),
         "ALLOWED",
-        "shmget should be permitted under --allow-sysv-ipc; got: {}",
+        "shmget should be permitted under extra_allow_syscalls=[\"sysv_ipc\"]; got: {}",
         contents.trim()
     );
     assert!(result.success());

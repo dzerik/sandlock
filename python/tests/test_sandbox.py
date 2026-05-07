@@ -403,8 +403,8 @@ class TestNewPolicyFields:
         assert result.success
         assert result.stdout.strip() == b"2000"
 
-    def test_block_syscalls(self):
-        p = _policy(block_syscalls=["mount"])
+    def test_extra_deny_syscalls(self):
+        p = _policy(extra_deny_syscalls=["mount"])
         result = Sandbox(p).run(["echo", "ok"])
         assert result.success
         assert result.stdout.strip() == b"ok"

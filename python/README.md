@@ -76,9 +76,9 @@ denied by default. Block rules are checked first and take precedence.
 |-----------|------|---------|-------------|
 | `http_allow` | `list[str]` | `[]` | Allow rules in `"METHOD host/path"` format |
 | `http_deny` | `list[str]` | `[]` | Block rules in `"METHOD host/path"` format |
-| `http_ports` | `list[int]` | `[80]` | TCP ports to intercept (443 added when `https_ca` is set) |
-| `https_ca` | `str \| None` | `None` | CA certificate for HTTPS MITM |
-| `https_key` | `str \| None` | `None` | CA private key for HTTPS MITM |
+| `http_ports` | `list[int]` | `[80]` | TCP ports to intercept (443 added when `http_ca` is set) |
+| `http_ca` | `str \| None` | `None` | CA certificate for HTTPS MITM |
+| `http_key` | `str \| None` | `None` | CA private key for HTTPS MITM |
 
 Rule format: `"METHOD host/path"` where method and host can be `*` for
 wildcard, and path supports trailing `*` for prefix matching. Paths are
@@ -142,7 +142,8 @@ policy = Policy(
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `block_syscalls` | `list[str]` | `[]` | Extra syscalls to block in addition to Sandlock defaults |
+| `extra_deny_syscalls` | `list[str]` | `[]` | Extra syscall names to block in addition to Sandlock defaults |
+| `extra_allow_syscalls` | `list[str]` | `[]` | Syscall groups to allow that are blocked by default (e.g. `"sysv_ipc"` to enable SysV shared memory, semaphores, and message queues) |
 
 Sandlock always applies its default syscall blocklist.
 

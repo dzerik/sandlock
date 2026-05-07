@@ -134,8 +134,11 @@ class Policy:
     fs_denied: Sequence[str] = field(default_factory=list)
     """Paths explicitly denied (neither read nor write)."""
 
-    block_syscalls: Sequence[str] = field(default_factory=list)
+    extra_deny_syscalls: Sequence[str] = field(default_factory=list)
     """Additional syscall names to block on top of Sandlock's default blocklist."""
+
+    extra_allow_syscalls: Sequence[str] = field(default_factory=list)
+    """Syscall group names to allow (e.g. ``'sysv_ipc'``)."""
 
     # Network — endpoint allowlist (protocol × IP × port via seccomp on-behalf path)
     net_allow: Sequence[str] = field(default_factory=list)
@@ -184,14 +187,14 @@ class Policy:
 
     http_ports: Sequence[int] = field(default_factory=list)
     """TCP ports to intercept for HTTP ACL. Defaults to [80] (plus 443 with
-    https_ca). Override to intercept custom ports like 8080."""
+    http_ca). Override to intercept custom ports like 8080."""
 
-    https_ca: str | None = None
+    http_ca: str | None = None
     """PEM CA certificate path for HTTPS MITM. When set, port 443 is also
     intercepted by the HTTP ACL proxy."""
 
-    https_key: str | None = None
-    """PEM CA private key path for HTTPS MITM. Required with https_ca."""
+    http_key: str | None = None
+    """PEM CA private key path for HTTPS MITM. Required with http_ca."""
 
     # Resource limits
     max_memory: str | int | None = None

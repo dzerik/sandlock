@@ -4,7 +4,7 @@ use sandlock_core::policy::{ByteSize, FsIsolation, BranchAction, Policy};
 fn test_default_policy() {
     let policy = Policy::builder().build().unwrap();
     assert_eq!(policy.max_processes, 64);
-    assert!(policy.block_syscalls.is_empty());
+    assert!(policy.extra_deny_syscalls.is_empty());
     // UDP, ICMP, and raw ICMP are denied by default — there are no rules
     // for those protocols in `net_allow`, which is what the BPF filter
     // gates on now (no separate booleans).
@@ -69,7 +69,7 @@ fn test_builder_resource_limits() {
 #[test]
 fn test_unknown_syscall_is_rejected() {
     let result = Policy::builder()
-        .block_syscalls(vec!["definitely_not_a_syscall".into()])
+        .extra_deny_syscalls(vec!["definitely_not_a_syscall".into()])
         .build();
     assert!(result.is_err());
 }

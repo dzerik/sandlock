@@ -100,15 +100,15 @@ impl TryFrom<&Policy> for ConfinePolicy {
     fn try_from(policy: &Policy) -> Result<Self, Self::Error> {
         let mut unsupported = Vec::new();
         if !policy.fs_denied.is_empty() { unsupported.push("fs_denied"); }
-        if !policy.block_syscalls.is_empty() { unsupported.push("block_syscalls"); }
+        if !policy.extra_deny_syscalls.is_empty() { unsupported.push("extra_deny_syscalls"); }
         if !policy.net_allow.is_empty() { unsupported.push("net_allow"); }
         if !policy.net_bind.is_empty() { unsupported.push("net_bind"); }
-        if policy.allow_sysv_ipc { unsupported.push("allow_sysv_ipc"); }
+        if policy.allows_sysv_ipc() { unsupported.push("extra_allow_syscalls=[\"sysv_ipc\"]"); }
         if !policy.http_allow.is_empty() { unsupported.push("http_allow"); }
         if !policy.http_deny.is_empty() { unsupported.push("http_deny"); }
         if !policy.http_ports.is_empty() { unsupported.push("http_ports"); }
-        if policy.https_ca.is_some() { unsupported.push("https_ca"); }
-        if policy.https_key.is_some() { unsupported.push("https_key"); }
+        if policy.http_ca.is_some() { unsupported.push("http_ca"); }
+        if policy.http_key.is_some() { unsupported.push("http_key"); }
         if policy.max_memory.is_some() { unsupported.push("max_memory"); }
         if policy.max_processes != 64 { unsupported.push("max_processes"); }
         if policy.max_open_files.is_some() { unsupported.push("max_open_files"); }
@@ -514,7 +514,8 @@ pub struct Policy {
     pub fs_denied: Vec<PathBuf>,
 
     // Extra syscall filtering on top of Sandlock's default blocklist.
-    pub block_syscalls: Vec<String>,
+    pub extra_deny_syscalls: Vec<String>,
+    pub extra_allow_syscalls: Vec<String>,
 
     // Network
     /// Outbound endpoint allowlist as a list of `(protocol, host?, ports)`
@@ -535,31 +536,22 @@ pub struct Policy {
     /// IP), and destination port (N/A for ICMP).
     ///
     /// HTTP rules with concrete hosts auto-add a matching
-    /// `(Tcp, host, [80])` (and `(Tcp, host, [443])` when `--https-ca`
+    /// `(Tcp, host, [80])` (and `(Tcp, host, [443])` when `--http-ca`
     /// is set) entry at build time so the proxy's intercept ports
     /// remain reachable. HTTP rules with wildcard hosts auto-add
     /// `(Tcp, None, [80])` instead.
     pub net_allow: Vec<NetAllow>,
     pub net_bind: Vec<u16>,
-    /// Permit SysV IPC syscalls: shared memory (`shmget`/`shmat`/
-    /// `shmdt`/`shmctl`), message queues (`msgget`/`msgsnd`/`msgrcv`/
-    /// `msgctl`), and semaphores (`semget`/`semop`/`semctl`/
-    /// `semtimedop`). Denied by default because sandlock does not use
-    /// IPC namespaces; without this denial, two sandboxes on the same
-    /// host share a SysV IPC keyspace and can rendezvous via a
-    /// well-known key.
-    pub allow_sysv_ipc: bool,
-
     // HTTP ACL
     pub http_allow: Vec<HttpRule>,
     pub http_deny: Vec<HttpRule>,
     /// TCP ports to intercept for HTTP ACL. Defaults to [80] (plus 443 when
-    /// https_ca is set). Override with `http_ports` to intercept custom ports.
+    /// http_ca is set). Override with `http_ports` to intercept custom ports.
     pub http_ports: Vec<u16>,
     /// PEM CA cert for HTTPS MITM. When set, port 443 is also intercepted.
-    pub https_ca: Option<PathBuf>,
-    /// PEM CA key for HTTPS MITM. Required when https_ca is set.
-    pub https_key: Option<PathBuf>,
+    pub http_ca: Option<PathBuf>,
+    /// PEM CA key for HTTPS MITM. Required when http_ca is set.
+    pub http_key: Option<PathBuf>,
 
     // Namespace isolation — always enabled, not user-configurable.
 
@@ -625,6 +617,24 @@ impl Policy {
     pub fn builder() -> PolicyBuilder {
         PolicyBuilder::default()
     }
+
+    /// Returns true iff the policy grants the `sysv_ipc` syscall group.
+    pub fn allows_sysv_ipc(&self) -> bool {
+        self.extra_allow_syscalls.iter().any(|s| s == "sysv_ipc")
+    }
+
+    /// Validate cross-section invariants — checks that span multiple fields.
+    ///
+    /// Currently:
+    /// - `fs_isolation != "none"` requires `workdir` to be set.
+    ///
+    /// Idempotent: calling repeatedly is safe.
+    pub fn validate(&self) -> Result<(), PolicyError> {
+        if self.fs_isolation != FsIsolation::None && self.workdir.is_none() {
+            return Err(PolicyError::FsIsolationRequiresWorkdir);
+        }
+        Ok(())
+    }
 }
 
 fn validate_syscall_names(names: &[String]) -> Result<(), PolicyError> {
@@ -644,58 +654,160 @@ fn validate_syscall_names(names: &[String]) -> Result<(), PolicyError> {
 }
 
 /// Fluent builder for `Policy`.
-#[derive(Default)]
+///
+/// When the `cli` feature is enabled this struct also derives `clap::Args` so
+/// that the CLI can expose all per-field flags via `#[clap(flatten)]` without
+/// duplicating the flag declarations.
+#[derive(Default, Clone)]
+#[cfg_attr(feature = "cli", derive(clap::Args))]
 pub struct PolicyBuilder {
-    fs_writable: Vec<PathBuf>,
-    fs_readable: Vec<PathBuf>,
-    fs_denied: Vec<PathBuf>,
+    #[cfg_attr(feature = "cli", arg(short = 'r', long = "fs-read", value_name = "PATH"))]
+    pub fs_readable: Vec<PathBuf>,
 
-    block_syscalls: Vec<String>,
+    #[cfg_attr(feature = "cli", arg(short = 'w', long = "fs-write", value_name = "PATH"))]
+    pub fs_writable: Vec<PathBuf>,
 
-    /// Raw `--net-allow` specs; parsed in `build()` to surface errors.
-    net_allow: Vec<String>,
-    net_bind: Vec<u16>,
-    allow_sysv_ipc: bool,
+    #[cfg_attr(feature = "cli", arg(long = "fs-deny", value_name = "PATH"))]
+    pub fs_denied: Vec<PathBuf>,
 
-    http_allow: Vec<String>,
-    http_deny: Vec<String>,
-    http_ports: Vec<u16>,
-    https_ca: Option<PathBuf>,
-    https_key: Option<PathBuf>,
+    /// Extra syscall names to deny (in addition to Sandlock's default blocklist)
+    #[cfg_attr(feature = "cli", arg(long = "extra-deny-syscall", value_name = "NAME"))]
+    pub extra_deny_syscalls: Vec<String>,
 
-    max_memory: Option<ByteSize>,
-    max_processes: Option<u32>,
-    max_open_files: Option<u32>,
-    max_cpu: Option<u8>,
+    /// Extra syscall group names to allow (e.g. sysv_ipc)
+    #[cfg_attr(feature = "cli", arg(long = "extra-allow-syscall", value_name = "NAME"))]
+    pub extra_allow_syscalls: Vec<String>,
 
-    random_seed: Option<u64>,
-    time_start: Option<SystemTime>,
-    no_randomize_memory: bool,
-    no_huge_pages: bool,
-    no_coredump: bool,
-    deterministic_dirs: bool,
+    /// Outbound endpoint allow rule. Repeatable. Each value is
+    /// `host:port[,port,...]` (IP-restricted), `:port` or `*:port`
+    /// (any IP), or `udp://...` / `icmp://...` for UDP/ICMP.
+    /// Examples: `api.openai.com:443`, `github.com:22,443`, `:8080`.
+    #[cfg_attr(feature = "cli", arg(long = "net-allow", value_name = "SPEC"))]
+    pub net_allow: Vec<String>,
 
-    fs_isolation: Option<FsIsolation>,
-    workdir: Option<PathBuf>,
-    cwd: Option<PathBuf>,
-    fs_storage: Option<PathBuf>,
-    max_disk: Option<ByteSize>,
-    on_exit: Option<BranchAction>,
-    on_error: Option<BranchAction>,
+    #[cfg_attr(feature = "cli", arg(long = "net-bind"))]
+    pub net_bind: Vec<u16>,
 
-    fs_mount: Vec<(PathBuf, PathBuf)>,
-    chroot: Option<PathBuf>,
-    clean_env: bool,
-    env: HashMap<String, String>,
+    #[cfg_attr(feature = "cli", arg(long = "http-allow", value_name = "RULE"))]
+    pub http_allow: Vec<String>,
 
-    gpu_devices: Option<Vec<u32>>,
+    #[cfg_attr(feature = "cli", arg(long = "http-deny", value_name = "RULE"))]
+    pub http_deny: Vec<String>,
 
-    cpu_cores: Option<Vec<u32>>,
-    num_cpus: Option<u32>,
-    port_remap: bool,
+    /// TCP ports to intercept for HTTP ACL (default: 80, plus 443 with --http-ca)
+    #[cfg_attr(feature = "cli", arg(long = "http-port", value_name = "PORT"))]
+    pub http_ports: Vec<u16>,
 
-    uid: Option<u32>,
-    policy_fn: Option<crate::policy_fn::PolicyCallback>,
+    /// PEM CA certificate for HTTPS MITM (enables port 443 interception)
+    #[cfg_attr(feature = "cli", arg(long = "http-ca", value_name = "PATH"))]
+    pub http_ca: Option<PathBuf>,
+
+    /// PEM CA private key for HTTPS MITM (required with --http-ca)
+    #[cfg_attr(feature = "cli", arg(long = "http-key", value_name = "PATH"))]
+    pub http_key: Option<PathBuf>,
+
+    // max_memory uses a string in the CLI (e.g. "512M"); not directly clap-friendly as ByteSize.
+    #[cfg_attr(feature = "cli", clap(skip))]
+    pub max_memory: Option<ByteSize>,
+
+    #[cfg_attr(feature = "cli", arg(short = 'P', long = "max-processes"))]
+    pub max_processes: Option<u32>,
+
+    #[cfg_attr(feature = "cli", arg(long = "max-open-files"))]
+    pub max_open_files: Option<u32>,
+
+    #[cfg_attr(feature = "cli", arg(short = 'c', long = "cpu"))]
+    pub max_cpu: Option<u8>,
+
+    #[cfg_attr(feature = "cli", arg(long = "random-seed"))]
+    pub random_seed: Option<u64>,
+
+    // time_start requires ISO 8601 string parsing; not directly clap-friendly as SystemTime.
+    #[cfg_attr(feature = "cli", clap(skip))]
+    pub time_start: Option<SystemTime>,
+
+    #[cfg_attr(feature = "cli", arg(long = "no-randomize-memory"))]
+    pub no_randomize_memory: bool,
+
+    #[cfg_attr(feature = "cli", arg(long = "no-huge-pages"))]
+    pub no_huge_pages: bool,
+
+    #[cfg_attr(feature = "cli", arg(long = "no-coredump"))]
+    pub no_coredump: bool,
+
+    #[cfg_attr(feature = "cli", arg(long = "deterministic-dirs"))]
+    pub deterministic_dirs: bool,
+
+    // fs_isolation requires string-to-enum parsing; not directly clap-friendly as FsIsolation.
+    #[cfg_attr(feature = "cli", clap(skip))]
+    pub fs_isolation: Option<FsIsolation>,
+
+    #[cfg_attr(feature = "cli", arg(long = "workdir"))]
+    pub workdir: Option<PathBuf>,
+
+    #[cfg_attr(feature = "cli", arg(long = "cwd"))]
+    pub cwd: Option<PathBuf>,
+
+    #[cfg_attr(feature = "cli", arg(long = "fs-storage", value_name = "PATH"))]
+    pub fs_storage: Option<PathBuf>,
+
+    // max_disk uses a string in the CLI (e.g. "10G"); not directly clap-friendly as ByteSize.
+    #[cfg_attr(feature = "cli", clap(skip))]
+    pub max_disk: Option<ByteSize>,
+
+    // on_exit/on_error are not exposed as CLI flags.
+    #[cfg_attr(feature = "cli", clap(skip))]
+    pub on_exit: Option<BranchAction>,
+
+    #[cfg_attr(feature = "cli", clap(skip))]
+    pub on_error: Option<BranchAction>,
+
+    // fs_mount requires VIRTUAL:HOST string splitting; not directly clap-friendly as Vec<(PathBuf,PathBuf)>.
+    #[cfg_attr(feature = "cli", clap(skip))]
+    pub fs_mount: Vec<(PathBuf, PathBuf)>,
+
+    #[cfg_attr(feature = "cli", arg(long = "chroot"))]
+    pub chroot: Option<PathBuf>,
+
+    #[cfg_attr(feature = "cli", arg(long = "clean-env"))]
+    pub clean_env: bool,
+
+    // env requires KEY=VALUE string splitting; not directly clap-friendly as HashMap.
+    #[cfg_attr(feature = "cli", clap(skip))]
+    pub env: HashMap<String, String>,
+
+    // gpu_devices in CLI uses Vec<u32> with value_delimiter; PolicyBuilder stores Option<Vec<u32>>.
+    #[cfg_attr(feature = "cli", clap(skip))]
+    pub gpu_devices: Option<Vec<u32>>,
+
+    // cpu_cores in CLI uses Vec<u32> with value_delimiter; PolicyBuilder stores Option<Vec<u32>>.
+    #[cfg_attr(feature = "cli", clap(skip))]
+    pub cpu_cores: Option<Vec<u32>>,
+
+    #[cfg_attr(feature = "cli", arg(long = "num-cpus"))]
+    pub num_cpus: Option<u32>,
+
+    #[cfg_attr(feature = "cli", arg(long = "port-remap"))]
+    pub port_remap: bool,
+
+    #[cfg_attr(feature = "cli", arg(long = "uid"))]
+    pub uid: Option<u32>,
+
+    // Internal callback — never a CLI flag.
+    #[cfg_attr(feature = "cli", clap(skip))]
+    pub policy_fn: Option<crate::policy_fn::PolicyCallback>,
+}
+
+impl std::fmt::Debug for PolicyBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PolicyBuilder")
+            .field("fs_readable", &self.fs_readable)
+            .field("fs_writable", &self.fs_writable)
+            .field("max_memory", &self.max_memory)
+            .field("max_processes", &self.max_processes)
+            .field("policy_fn", &self.policy_fn.as_ref().map(|_| "<callback>"))
+            .finish_non_exhaustive()
+    }
 }
 
 impl PolicyBuilder {
@@ -723,8 +835,13 @@ impl PolicyBuilder {
         self
     }
 
-    pub fn block_syscalls(mut self, calls: Vec<String>) -> Self {
-        self.block_syscalls.extend(calls);
+    pub fn extra_deny_syscalls(mut self, calls: Vec<String>) -> Self {
+        self.extra_deny_syscalls.extend(calls);
+        self
+    }
+
+    pub fn extra_allow_syscalls(mut self, names: Vec<String>) -> Self {
+        self.extra_allow_syscalls.extend(names);
         self
     }
 
@@ -746,14 +863,6 @@ impl PolicyBuilder {
         self
     }
 
-    /// Permit SysV IPC syscalls (shm/msg/sem). Denied by default
-    /// because sandlock does not use IPC namespaces — without this
-    /// denial, sandboxes on the same host share a SysV keyspace.
-    pub fn allow_sysv_ipc(mut self, v: bool) -> Self {
-        self.allow_sysv_ipc = v;
-        self
-    }
-
     pub fn http_allow(mut self, rule: &str) -> Self {
         self.http_allow.push(rule.to_string());
         self
@@ -769,13 +878,13 @@ impl PolicyBuilder {
         self
     }
 
-    pub fn https_ca(mut self, path: impl Into<PathBuf>) -> Self {
-        self.https_ca = Some(path.into());
+    pub fn http_ca(mut self, path: impl Into<PathBuf>) -> Self {
+        self.http_ca = Some(path.into());
         self
     }
 
-    pub fn https_key(mut self, path: impl Into<PathBuf>) -> Self {
-        self.https_key = Some(path.into());
+    pub fn http_key(mut self, path: impl Into<PathBuf>) -> Self {
+        self.http_key = Some(path.into());
         self
     }
 
@@ -918,8 +1027,12 @@ impl PolicyBuilder {
         self
     }
 
-    pub fn build(self) -> Result<Policy, PolicyError> {
-        validate_syscall_names(&self.block_syscalls)?;
+    /// Build a `Policy`, parsing all string fields and running per-field
+    /// validation, but **without** the cross-section checks that
+    /// `Policy::validate` performs. Use this in tests that deliberately
+    /// construct policies violating cross-section invariants.
+    pub fn build_unchecked(self) -> Result<Policy, PolicyError> {
+        validate_syscall_names(&self.extra_deny_syscalls)?;
 
         // Validate: max_cpu must be 1-100
         if let Some(cpu) = self.max_cpu {
@@ -928,29 +1041,29 @@ impl PolicyBuilder {
             }
         }
 
-        // Validate: https_ca and https_key must both be set or both unset
-        if self.https_ca.is_some() != self.https_key.is_some() {
+        // Validate: http_ca and http_key must both be set or both unset
+        if self.http_ca.is_some() != self.http_key.is_some() {
             return Err(PolicyError::Invalid(
-                "--https-ca and --https-key must both be provided together".into(),
+                "--http-ca and --http-key must both be provided together".into(),
             ));
         }
 
         // Parse HTTP rules (deferred from builder methods to propagate errors)
         let http_allow: Vec<HttpRule> = self
             .http_allow
-            .iter()
-            .map(|s| HttpRule::parse(s))
+            .into_iter()
+            .map(|s| HttpRule::parse(&s))
             .collect::<Result<_, _>>()?;
         let http_deny: Vec<HttpRule> = self
             .http_deny
-            .iter()
-            .map(|s| HttpRule::parse(s))
+            .into_iter()
+            .map(|s| HttpRule::parse(&s))
             .collect::<Result<_, _>>()?;
 
         // Default HTTP intercept ports: 80 always, 443 when HTTPS CA is configured.
         let http_ports = if self.http_ports.is_empty() && (!http_allow.is_empty() || !http_deny.is_empty()) {
             let mut ports = vec![80];
-            if self.https_ca.is_some() {
+            if self.http_ca.is_some() {
                 ports.push(443);
             }
             ports
@@ -961,8 +1074,8 @@ impl PolicyBuilder {
         // Parse user-supplied --net-allow specs.
         let mut net_allow: Vec<NetAllow> = self
             .net_allow
-            .iter()
-            .map(|s| NetAllow::parse(s))
+            .into_iter()
+            .map(|s| NetAllow::parse(&s))
             .collect::<Result<_, _>>()?;
 
         // Auto-merge HTTP rules into the network allowlist so the proxy's
@@ -1000,25 +1113,20 @@ impl PolicyBuilder {
             }
         }
 
-        // Validate: fs_isolation != None requires workdir
         let fs_isolation = self.fs_isolation.unwrap_or_default();
-        if fs_isolation != FsIsolation::None && self.workdir.is_none() {
-            return Err(PolicyError::FsIsolationRequiresWorkdir);
-        }
-
         Ok(Policy {
             fs_writable: self.fs_writable,
             fs_readable: self.fs_readable,
             fs_denied: self.fs_denied,
-            block_syscalls: self.block_syscalls,
+            extra_deny_syscalls: self.extra_deny_syscalls,
+            extra_allow_syscalls: self.extra_allow_syscalls,
             net_allow,
             net_bind: self.net_bind,
-            allow_sysv_ipc: self.allow_sysv_ipc,
             http_allow,
             http_deny,
             http_ports,
-            https_ca: self.https_ca,
-            https_key: self.https_key,
+            http_ca: self.http_ca,
+            http_key: self.http_key,
             max_memory: self.max_memory,
             max_processes: self.max_processes.unwrap_or(64),
             max_open_files: self.max_open_files,
@@ -1047,6 +1155,14 @@ impl PolicyBuilder {
             uid: self.uid,
             policy_fn: self.policy_fn,
         })
+    }
+
+    /// Build a `Policy`, parsing all string fields, running per-field validation,
+    /// and verifying cross-section invariants via `Policy::validate`.
+    pub fn build(self) -> Result<Policy, PolicyError> {
+        let p = self.build_unchecked()?;
+        p.validate()?;
+        Ok(p)
     }
 }
 
@@ -1234,30 +1350,48 @@ mod http_rule_tests {
     }
 
     #[test]
-    fn builder_https_ca_without_key_returns_error() {
+    fn builder_http_ca_without_key_returns_error() {
         let result = Policy::builder()
-            .https_ca("/tmp/ca.pem")
+            .http_ca("/tmp/ca.pem")
             .build();
         assert!(result.is_err());
     }
 
     #[test]
-    fn builder_https_key_without_ca_returns_error() {
+    fn builder_http_key_without_ca_returns_error() {
         let result = Policy::builder()
-            .https_key("/tmp/key.pem")
+            .http_key("/tmp/key.pem")
             .build();
         assert!(result.is_err());
     }
 
     #[test]
-    fn builder_https_ca_and_key_together_ok() {
+    fn builder_http_ca_and_key_together_ok() {
         let policy = Policy::builder()
-            .https_ca("/tmp/ca.pem")
-            .https_key("/tmp/key.pem")
+            .http_ca("/tmp/ca.pem")
+            .http_key("/tmp/key.pem")
             .build()
             .unwrap();
-        assert!(policy.https_ca.is_some());
-        assert!(policy.https_key.is_some());
+        assert!(policy.http_ca.is_some());
+        assert!(policy.http_key.is_some());
+    }
+
+    #[test]
+    fn allows_sysv_ipc_reads_extra_allow_syscalls() {
+        let p = Policy::builder()
+            .extra_allow_syscalls(vec!["sysv_ipc".into()])
+            .build()
+            .unwrap();
+        assert!(p.allows_sysv_ipc());
+
+        let p2 = Policy::builder().build().unwrap();
+        assert!(!p2.allows_sysv_ipc());
+
+        let p3 = Policy::builder()
+            .extra_allow_syscalls(vec!["other_group".into()])
+            .build()
+            .unwrap();
+        assert!(!p3.allows_sysv_ipc());
     }
 
     // --- normalize_path tests ---

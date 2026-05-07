@@ -24,6 +24,11 @@ walkdir = "2"
 toml = "0.8"
 pathdiff = "0.2"
 hudsucker = "0.22"
+clap = { version = "4", features = ["derive"], optional = true }
+
+[features]
+default = []
+cli = ["dep:clap"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

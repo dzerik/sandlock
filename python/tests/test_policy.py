@@ -50,7 +50,8 @@ class TestPolicy:
         assert p.fs_writable == []
         assert p.fs_readable == []
         assert p.fs_denied == []
-        assert p.block_syscalls == []
+        assert p.extra_deny_syscalls == []
+        assert p.extra_allow_syscalls == []
         assert p.net_bind == []
         assert p.net_allow == []
         assert p.max_memory is None

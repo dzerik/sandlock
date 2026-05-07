@@ -1578,6 +1578,7 @@ name = "sandlock-core"
 version = "0.7.0"
 dependencies = [
  "bincode",
+ "clap",
  "goblin",
  "hudsucker",
  "libc",
