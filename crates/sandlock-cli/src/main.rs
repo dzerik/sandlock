@@ -280,6 +280,22 @@ async fn run_command(args: RunArgs) -> Result<()> {
             if !base.extra_allow_syscalls.is_empty() {
                 b = b.extra_allow_syscalls(base.extra_allow_syscalls.clone());
             }
+            if !base.extra_deny_syscalls.is_empty() {
+                b = b.extra_deny_syscalls(base.extra_deny_syscalls.clone());
+            }
+            b = b.clean_env(base.clean_env);
+            for (k, v) in &base.env { b = b.env_var(k, v); }
+            // Process / determinism knobs (no supervisor needed — pure prctl/personality).
+            b = b.no_coredump(base.no_coredump);
+            b = b.no_huge_pages(base.no_huge_pages);
+            b = b.no_randomize_memory(base.no_randomize_memory);
+            if let Some(uid) = base.uid { b = b.uid(uid); }
+            if let Some(ref c) = base.cwd { b = b.cwd(c); }
+            // Resource limits enforceable via rlimits in-process.
+            if let Some(mem) = base.max_memory { b = b.max_memory(mem); }
+            b = b.max_processes(base.max_processes);
+            if let Some(n) = base.max_open_files { b = b.max_open_files(n); }
+            if let Some(seed) = base.random_seed { b = b.random_seed(seed); }
             b
         } else {
             Sandbox::builder()
@@ -387,11 +403,39 @@ async fn run_command(args: RunArgs) -> Result<()> {
         if let Some(cpu) = base.max_cpu { b = b.max_cpu(cpu); }
         if let Some(seed) = base.random_seed { b = b.random_seed(seed); }
         if let Some(n) = base.num_cpus { b = b.num_cpus(n); }
+        if let Some(n) = base.max_open_files { b = b.max_open_files(n); }
+        if let Some(disk) = base.max_disk { b = b.max_disk(disk); }
         if !base.extra_deny_syscalls.is_empty() { b = b.extra_deny_syscalls(base.extra_deny_syscalls.clone()); }
         if !base.extra_allow_syscalls.is_empty() { b = b.extra_allow_syscalls(base.extra_allow_syscalls.clone()); }
         b = b.clean_env(base.clean_env);
+        for (k, v) in &base.env { b = b.env_var(k, v); }
         if let Some(ref w) = base.workdir { b = b.workdir(w); }
         if let Some(ref c) = base.cwd { b = b.cwd(c); }
+        // HTTP MITM material
+        if let Some(ref ca) = base.http_ca { b = b.http_ca(ca); }
+        if let Some(ref key) = base.http_key { b = b.http_key(key); }
+        // Filesystem extras
+        if let Some(ref path) = base.chroot { b = b.chroot(path); }
+        if let Some(ref path) = base.fs_storage { b = b.fs_storage(path); }
+        if base.fs_isolation != sandlock_core::sandbox::FsIsolation::None {
+            b = b.fs_isolation(base.fs_isolation.clone());
+        }
+        for (virt, host) in &base.fs_mount { b = b.fs_mount(virt, host); }
+        b = b.on_exit(base.on_exit.clone());
+        b = b.on_error(base.on_error.clone());
+        b = b.deterministic_dirs(base.deterministic_dirs);
+        // Determinism / process knobs
+        b = b.no_randomize_memory(base.no_randomize_memory);
+        b = b.no_huge_pages(base.no_huge_pages);
+        b = b.no_coredump(base.no_coredump);
+        if let Some(t) = base.time_start { b = b.time_start(t); }
+        // Network virtualization
+        b = b.port_remap(base.port_remap);
+        // Process identity
+        if let Some(uid) = base.uid { b = b.uid(uid); }
+        // Hardware constraints
+        if let Some(ref devs) = base.gpu_devices { b = b.gpu_devices(devs.clone()); }
+        if let Some(ref cores) = base.cpu_cores { b = b.cpu_cores(cores.clone()); }
         b
     } else {
         Sandbox::builder()

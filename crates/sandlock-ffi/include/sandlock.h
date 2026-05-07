@@ -72,11 +72,15 @@ void sandlock_sandbox_free(sandlock_sandbox_t *p);
  * ---------------------------------------------------------------- */
 
 /** Run with captured stdout/stderr. Returns result handle (NULL on failure). */
+/* name may be NULL to auto-generate as "sandbox-{pid}". */
 sandlock_result_t *sandlock_run(const sandlock_sandbox_t *policy,
+                                const char *name,
                                 const char *const *argv, unsigned int argc);
 
 /** Run with inherited stdio. Returns exit code (-1 on failure). */
+/* name may be NULL to auto-generate as "sandbox-{pid}". */
 int sandlock_run_interactive(const sandlock_sandbox_t *policy,
+                             const char *name,
                              const char *const *argv, unsigned int argc);
 
 /* ----------------------------------------------------------------
