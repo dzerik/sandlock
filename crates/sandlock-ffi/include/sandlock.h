@@ -252,16 +252,41 @@ typedef struct sandlock_handler_registration_t {
     sandlock_handler_t *handler; /* ownership transferred on a successful run */
 } sandlock_handler_registration_t;
 
-/** Run the policy with extra C handlers. Ownership of each
- *  `registrations[i].handler` transfers into the call: do not free
- *  those pointers afterwards. Returns NULL on failure. */
+/** Run the policy with extra C handlers. Returns NULL on failure.
+ *
+ * Ownership of `registrations[i].handler` is transferred into the call
+ * after the function has validated and accepted the registration array.
+ * On success (non-NULL return) all handler pointers are owned by the
+ * supervisor and must not be freed by the caller.
+ *
+ * On NULL return the transfer status of handler pointers is not
+ * defined: depending on which internal validation step failed, the
+ * supervisor may or may not have taken ownership of some handlers.
+ * The conservative and safe approach is to ABANDON all handler
+ * pointers after a NULL return — do not call `sandlock_handler_free`
+ * on them. The cost of the resulting leak is bounded (one allocation
+ * per handler) and the alternative risks double-free. */
 sandlock_result_t *sandlock_run_with_handlers(
     const sandlock_sandbox_t *policy,
     const char *const *argv, unsigned int argc,
     const sandlock_handler_registration_t *registrations,
     size_t nregistrations);
 
-/** Interactive-stdio variant of `sandlock_run_with_handlers`. */
+/** Interactive-stdio variant of `sandlock_run_with_handlers`. Returns
+ * NULL on failure.
+ *
+ * Ownership of `registrations[i].handler` is transferred into the call
+ * after the function has validated and accepted the registration array.
+ * On success (non-NULL return) all handler pointers are owned by the
+ * supervisor and must not be freed by the caller.
+ *
+ * On NULL return the transfer status of handler pointers is not
+ * defined: depending on which internal validation step failed, the
+ * supervisor may or may not have taken ownership of some handlers.
+ * The conservative and safe approach is to ABANDON all handler
+ * pointers after a NULL return — do not call `sandlock_handler_free`
+ * on them. The cost of the resulting leak is bounded (one allocation
+ * per handler) and the alternative risks double-free. */
 sandlock_result_t *sandlock_run_interactive_with_handlers(
     const sandlock_sandbox_t *policy,
     const char *const *argv, unsigned int argc,
