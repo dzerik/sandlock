@@ -12,6 +12,9 @@ use sandlock_core::pipeline::Stage;
 use sandlock_core::sandbox::{BranchAction, ByteSize, FsIsolation, SandboxBuilder};
 use sandlock_core::{Sandbox, RunResult};
 
+pub mod handler;
+pub mod notif_repr;
+
 // ----------------------------------------------------------------
 // Opaque wrapper types
 // ----------------------------------------------------------------

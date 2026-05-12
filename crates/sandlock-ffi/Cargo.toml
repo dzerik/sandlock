@@ -9,7 +9,7 @@ readme = "../../README.md"
 description = "C ABI for sandlock process sandbox"
 
 [lib]
-crate-type = ["cdylib", "staticlib"]
+crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
 sandlock-core = { version = "0.7.0", path = "../sandlock-core" }
