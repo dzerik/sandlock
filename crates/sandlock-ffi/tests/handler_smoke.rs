@@ -42,3 +42,33 @@ fn notif_data_from_seccomp_notif_copies_all_fields() {
     assert_eq!(snap.instruction_pointer, 0x7FFF_FFFF_AAAA);
     assert_eq!(snap.args, [1, 2, 3, 4, 5, 6]);
 }
+
+use sandlock_ffi::handler::{
+    sandlock_mem_read, sandlock_mem_read_cstr, sandlock_mem_write,
+};
+
+#[test]
+fn mem_accessors_reject_null_arguments() {
+    // Verifies the null-pointer guards in each accessor. Happy-path
+    // coverage comes in Task 7 with a live notif_fd.
+    let mut buf = [0u8; 4];
+    let mut out_len: usize = 0;
+    let p = std::ptr::null();
+    unsafe {
+        assert_eq!(
+            sandlock_mem_read_cstr(p, 0, buf.as_mut_ptr(), buf.len(), &mut out_len),
+            -1,
+            "read_cstr should reject null handle",
+        );
+        assert_eq!(
+            sandlock_mem_read(p, 0, buf.as_mut_ptr(), buf.len(), &mut out_len),
+            -1,
+            "read should reject null handle",
+        );
+        assert_eq!(
+            sandlock_mem_write(p, 0, buf.as_ptr(), buf.len()),
+            -1,
+            "write should reject null handle",
+        );
+    }
+}

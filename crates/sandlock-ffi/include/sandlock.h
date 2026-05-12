@@ -134,6 +134,29 @@ typedef struct sandlock_notif_data_t {
     uint64_t args[6];
 } sandlock_notif_data_t;
 
+/** Opaque child-memory accessor (lifetime: single callback invocation). */
+typedef struct sandlock_mem_handle_t sandlock_mem_handle_t;
+
+/** Read a NUL-terminated string. Returns 0 on success, -1 on failure.
+ *  On success the buffer is NUL-terminated and `*out_len` holds the byte
+ *  count copied (excluding NUL); `max_len` must be at least 1 to fit the
+ *  NUL. */
+int sandlock_mem_read_cstr(const sandlock_mem_handle_t *handle,
+                           uint64_t addr,
+                           uint8_t *buf, size_t max_len,
+                           size_t *out_len);
+
+/** Raw memory read. Returns 0/-1; `*out_len` holds actual bytes copied. */
+int sandlock_mem_read(const sandlock_mem_handle_t *handle,
+                      uint64_t addr,
+                      uint8_t *buf, size_t len,
+                      size_t *out_len);
+
+/** Raw memory write. Returns 0/-1. */
+int sandlock_mem_write(const sandlock_mem_handle_t *handle,
+                       uint64_t addr,
+                       const uint8_t *buf, size_t len);
+
 #ifdef __cplusplus
 }
 #endif
