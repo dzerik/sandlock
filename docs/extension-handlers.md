@@ -604,3 +604,32 @@ For a single concrete handler type the bare struct works without the `Box::new` 
 
 The crate links against `sandlock-core` as an ordinary dependency — no fork, no
 `[patch.crates-io]`, no duplication of `notif::supervisor`.
+
+## C ABI
+
+The same handler model is available to non-Rust callers via the
+`sandlock-ffi` cdylib (header: `crates/sandlock-ffi/include/sandlock.h`).
+
+### Lifetimes
+
+| Object                         | Allocated by                           | Freed by                                    |
+|--------------------------------|----------------------------------------|---------------------------------------------|
+| `sandlock_handler_t*`          | `sandlock_handler_new`                 | `sandlock_handler_free` (if never registered) <br>or the supervisor (after a successful `sandlock_run_with_handlers`) |
+| `sandlock_action_out_t`        | Rust adapter (stack), pointer to C     | Adapter (stack-scoped to one callback)      |
+| `sandlock_mem_handle_t*`       | Rust adapter (stack)                   | Adapter (do not retain past callback return) |
+| `sandlock_notif_data_t`        | Rust adapter (stack), pointer to C     | Adapter (do not retain past callback return) |
+
+### Callback contract
+
+A C handler must:
+
+1. Return `0` exactly when it has called one — and only one — of the
+   `sandlock_action_set_*` setters on `out`.
+2. Return non-zero on any internal error. The supervisor then applies
+   the handler's `on_exception` policy (default: `SANDLOCK_EXCEPTION_KILL`).
+3. Not retain `notif`, `mem`, or `out` past the return statement.
+
+### Minimal example
+
+See `crates/sandlock-ffi/tests/c/handler_smoke.c` for the canonical
+end-to-end example.
