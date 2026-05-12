@@ -247,6 +247,27 @@ sandlock_handler_t *sandlock_handler_new(sandlock_handler_fn_t handler_fn,
 /** Free a handler container that has not been handed to the supervisor. */
 void sandlock_handler_free(sandlock_handler_t *h);
 
+typedef struct sandlock_handler_registration_t {
+    int64_t syscall_nr;
+    sandlock_handler_t *handler; /* ownership transferred on a successful run */
+} sandlock_handler_registration_t;
+
+/** Run the policy with extra C handlers. Ownership of each
+ *  `registrations[i].handler` transfers into the call: do not free
+ *  those pointers afterwards. Returns NULL on failure. */
+sandlock_result_t *sandlock_run_with_handlers(
+    const sandlock_sandbox_t *policy,
+    const char *const *argv, unsigned int argc,
+    const sandlock_handler_registration_t *registrations,
+    size_t nregistrations);
+
+/** Interactive-stdio variant of `sandlock_run_with_handlers`. */
+sandlock_result_t *sandlock_run_interactive_with_handlers(
+    const sandlock_sandbox_t *policy,
+    const char *const *argv, unsigned int argc,
+    const sandlock_handler_registration_t *registrations,
+    size_t nregistrations);
+
 #ifdef __cplusplus
 }
 #endif

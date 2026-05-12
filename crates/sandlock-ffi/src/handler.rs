@@ -466,15 +466,15 @@ impl FfiHandler {
     }
 }
 
-/// `Send`/`Sync` wrapper around the C user-data pointer so it can travel
-/// into `spawn_blocking`. The same `Send`/`Sync` reasoning that
-/// justifies `unsafe impl Send/Sync for sandlock_handler_t` applies here
-/// — the C caller is responsible for the pointer's thread-safety.
+/// `Send`-only wrapper around the C user-data pointer so it can travel
+/// into `spawn_blocking`. Only the move (not sharing across threads) is
+/// required; the deeper Send/Sync rationale for the underlying handler
+/// container lives on `sandlock_handler_t`.
 struct UdPtr(*mut std::ffi::c_void);
-// Safety: see `sandlock_handler_t` Send/Sync rationale above.
+// Safety: ud is opaque to Rust; the spawn_blocking pipeline only moves
+// (not shares) the wrapper. See `sandlock_handler_t` for the deeper
+// Send/Sync rationale that justifies the underlying handler container.
 unsafe impl Send for UdPtr {}
-// Safety: see `sandlock_handler_t` Send/Sync rationale above.
-unsafe impl Sync for UdPtr {}
 
 impl Handler for FfiHandler {
     fn handle<'a>(
@@ -584,4 +584,173 @@ fn translate_action(out: sandlock_action_out_t, child_pgid: i32) -> Option<Notif
         }
     };
     Some(action)
+}
+
+// ----------------------------------------------------------------
+// Run entry points (Task 7)
+// ----------------------------------------------------------------
+
+use sandlock_core::{Sandbox, RunResult, SandlockError};
+use std::ffi::CStr;
+
+/// C-side pair of `(syscall_nr, handler*)` consumed by
+/// `sandlock_run_with_handlers`. Ownership of `handler` transfers into
+/// the run on success; the supervisor frees the container.
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[allow(non_camel_case_types)]
+pub struct sandlock_handler_registration_t {
+    pub syscall_nr: i64,
+    pub handler: *mut sandlock_handler_t,
+}
+
+// Safety: the raw pointer field is opaque to Rust. The supervisor moves
+// the registration array into a worker thread once it has been turned
+// into `(i64, FfiHandler)` pairs; the registration struct itself never
+// crosses thread boundaries while holding the raw pointer. We mark
+// `Send` to allow the input array to be borrowed inside `unsafe`
+// contexts without per-call wrapper structs.
+unsafe impl Send for sandlock_handler_registration_t {}
+
+fn argv_from_c(
+    argv: *const *const std::os::raw::c_char,
+    argc: u32,
+) -> Option<Vec<String>> {
+    if argv.is_null() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(argc as usize);
+    for i in 0..(argc as isize) {
+        let p = unsafe { *argv.offset(i) };
+        if p.is_null() {
+            return None;
+        }
+        let s = unsafe { CStr::from_ptr(p) }.to_str().ok()?.to_owned();
+        out.push(s);
+    }
+    Some(out)
+}
+
+fn collect_registrations(
+    regs: *const sandlock_handler_registration_t,
+    nregs: usize,
+) -> Option<Vec<(i64, FfiHandler)>> {
+    if regs.is_null() && nregs > 0 {
+        return None;
+    }
+    if nregs == 0 {
+        return Some(Vec::new());
+    }
+    let slice = unsafe { slice::from_raw_parts(regs, nregs) };
+    // First pass: validate all entries before taking ownership of any.
+    // Without this, a null pointer at index k+1 would leave us having
+    // already consumed handlers [0..k] via `Box::from_raw`; dropping the
+    // partial `out` would free them while the C caller still believes it
+    // owns the originals — a latent double-free via
+    // `sandlock_handler_free`.
+    for r in slice {
+        if r.handler.is_null() {
+            return None;
+        }
+    }
+    // Second pass: ownership transfer. Every pointer is non-null per the
+    // pass above.
+    let mut out = Vec::with_capacity(nregs);
+    for r in slice {
+        // SAFETY: validated non-null above; caller provided pointer from
+        // `sandlock_handler_new` and must not reuse after this call (the
+        // public C ABI doc states ownership transfers in).
+        let h = unsafe { FfiHandler::from_raw(r.handler) };
+        out.push((r.syscall_nr, h));
+    }
+    Some(out)
+}
+
+fn block_on_run(
+    sandbox: &Sandbox,
+    cmd: Vec<String>,
+    handlers: Vec<(i64, FfiHandler)>,
+    interactive: bool,
+) -> Option<Result<RunResult, SandlockError>> {
+    // Use a fresh runtime — sandlock-core already pulls in tokio with
+    // rt-multi-thread; this matches the pattern used by the existing
+    // `sandlock_run` path. A panic in an `extern "C"`-reachable path is
+    // UB, so we report runtime-build failure to the caller via `None`
+    // instead of unwrapping.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    let cmd_refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
+    let mut sb = sandbox.clone();
+    Some(rt.block_on(async move {
+        if interactive {
+            sb.run_interactive_with_extra_handlers(&cmd_refs, handlers).await
+        } else {
+            sb.run_with_extra_handlers(&cmd_refs, handlers).await
+        }
+    }))
+}
+
+/// Run the policy with extra C handlers. Returns NULL on failure.
+///
+/// # Safety
+/// All pointer arguments must be valid for their documented lifetimes:
+/// `policy` must come from `sandlock_sandbox_build`, `argv` must be a
+/// readable array of `argc` NUL-terminated strings, and each handler
+/// pointer must come from `sandlock_handler_new` and must not be reused
+/// after this call (ownership transfers in).
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_run_with_handlers(
+    policy: *const crate::sandlock_sandbox_t,
+    argv: *const *const std::os::raw::c_char,
+    argc: u32,
+    registrations: *const sandlock_handler_registration_t,
+    nregistrations: usize,
+) -> *mut crate::sandlock_result_t {
+    run_with_handlers_inner(policy, argv, argc, registrations, nregistrations, false)
+}
+
+/// Interactive-stdio variant of `sandlock_run_with_handlers`.
+///
+/// # Safety
+/// Same constraints as `sandlock_run_with_handlers`.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_run_interactive_with_handlers(
+    policy: *const crate::sandlock_sandbox_t,
+    argv: *const *const std::os::raw::c_char,
+    argc: u32,
+    registrations: *const sandlock_handler_registration_t,
+    nregistrations: usize,
+) -> *mut crate::sandlock_result_t {
+    run_with_handlers_inner(policy, argv, argc, registrations, nregistrations, true)
+}
+
+unsafe fn run_with_handlers_inner(
+    policy: *const crate::sandlock_sandbox_t,
+    argv: *const *const std::os::raw::c_char,
+    argc: u32,
+    registrations: *const sandlock_handler_registration_t,
+    nregistrations: usize,
+    interactive: bool,
+) -> *mut crate::sandlock_result_t {
+    if policy.is_null() {
+        return std::ptr::null_mut();
+    }
+    let cmd = match argv_from_c(argv, argc) {
+        Some(v) => v,
+        None => return std::ptr::null_mut(),
+    };
+    let handlers = match collect_registrations(registrations, nregistrations) {
+        Some(v) => v,
+        None => return std::ptr::null_mut(),
+    };
+    let sandbox_ref: &Sandbox = (*policy).inner();
+    match block_on_run(sandbox_ref, cmd, handlers, interactive) {
+        Some(Ok(rr)) => {
+            let boxed = Box::new(crate::sandlock_result_t::from_run_result(rr));
+            Box::into_raw(boxed)
+        }
+        _ => std::ptr::null_mut(),
+    }
 }

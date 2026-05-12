@@ -228,3 +228,117 @@ async fn ffi_handler_applies_exception_policy_on_failure() {
     let action = h.handle(&cx).await;
     assert!(matches!(action, NotifAction::Errno(e) if e == libc::EPERM));
 }
+
+use std::ffi::CString;
+use sandlock_ffi::handler::{
+    sandlock_handler_registration_t, sandlock_run_with_handlers,
+};
+
+extern "C" fn force_getpid_to_777(
+    _ud: *mut std::ffi::c_void,
+    _notif: *const sandlock_ffi::notif_repr::sandlock_notif_data_t,
+    _mem: *mut sandlock_ffi::handler::sandlock_mem_handle_t,
+    out: *mut sandlock_ffi::handler::sandlock_action_out_t,
+) -> i32 {
+    unsafe { sandlock_ffi::handler::sandlock_action_set_return_value(out, 777) };
+    0
+}
+
+#[test]
+fn run_with_handlers_intercepts_getpid() {
+    use sandlock_ffi::*; // bring in builder + result symbols
+
+    let builder = sandlock_sandbox_builder_new();
+    // Allow the runtime bits the child needs. The exact mounts mirror
+    // sandlock's own integration tests — read-only access to the system
+    // libraries and the python interpreter, plus a writable /tmp.
+    let builder = unsafe {
+        let p = CString::new("/usr").unwrap();
+        sandlock_sandbox_builder_fs_read(builder, p.as_ptr())
+    };
+    let builder = unsafe {
+        let p = CString::new("/bin").unwrap();
+        sandlock_sandbox_builder_fs_read(builder, p.as_ptr())
+    };
+    let builder = unsafe {
+        let p = CString::new("/lib").unwrap();
+        sandlock_sandbox_builder_fs_read(builder, p.as_ptr())
+    };
+    let builder = unsafe {
+        let p = CString::new("/lib64").unwrap();
+        sandlock_sandbox_builder_fs_read(builder, p.as_ptr())
+    };
+    let builder = unsafe {
+        let p = CString::new("/etc").unwrap();
+        sandlock_sandbox_builder_fs_read(builder, p.as_ptr())
+    };
+    let builder = unsafe {
+        let p = CString::new("/tmp").unwrap();
+        sandlock_sandbox_builder_fs_write(builder, p.as_ptr())
+    };
+
+    let policy = {
+        let mut err: i32 = 0;
+        unsafe { sandlock_sandbox_build(builder, &mut err, std::ptr::null_mut()) }
+    };
+    assert!(!policy.is_null(), "policy build failed");
+
+    let handler = unsafe {
+        handler::sandlock_handler_new(
+            Some(force_getpid_to_777),
+            std::ptr::null_mut(),
+            None,
+            handler::sandlock_exception_policy_t::Kill as u32,
+        )
+    };
+    assert!(!handler.is_null(), "handler_new returned null");
+    let registrations = [sandlock_handler_registration_t {
+        syscall_nr: libc::SYS_getpid,
+        handler,
+    }];
+
+    let script = CString::new(
+        "import os, sys; sys.stdout.write(str(os.getpid()))",
+    ).unwrap();
+    // Use the system python3 directly. Running through `/usr/bin/env
+    // python3` would pick up any venv shim in $PATH whose pyvenv.cfg
+    // sits outside the sandbox's read allowlist and fail before our
+    // handler ever gets a chance to fire.
+    let arg0 = CString::new("/usr/bin/python3").unwrap();
+    let arg1 = CString::new("-c").unwrap();
+    let argv = [
+        arg0.as_ptr(),
+        arg1.as_ptr(),
+        script.as_ptr(),
+    ];
+
+    let rr = unsafe {
+        sandlock_run_with_handlers(
+            policy,
+            argv.as_ptr(),
+            argv.len() as u32,
+            registrations.as_ptr(),
+            registrations.len(),
+        )
+    };
+    assert!(!rr.is_null(), "sandlock_run_with_handlers returned null");
+    let stdout = unsafe {
+        let mut len: usize = 0;
+        let p = sandlock_result_stdout_bytes(rr, &mut len);
+        if p.is_null() { Vec::new() } else { std::slice::from_raw_parts(p, len).to_vec() }
+    };
+    let stderr = unsafe {
+        let mut len: usize = 0;
+        let p = sandlock_result_stderr_bytes(rr, &mut len);
+        if p.is_null() { Vec::new() } else { std::slice::from_raw_parts(p, len).to_vec() }
+    };
+    let stdout_str = String::from_utf8_lossy(&stdout);
+    let stderr_str = String::from_utf8_lossy(&stderr);
+    let exit_code = unsafe { sandlock_result_exit_code(rr) };
+    assert!(stdout_str.contains("777"),
+            "expected getpid to be intercepted; exit={} stdout={:?} stderr={:?}",
+            exit_code, stdout_str, stderr_str);
+
+    unsafe { sandlock_result_free(rr); }
+    unsafe { sandlock_sandbox_free(policy); }
+}
