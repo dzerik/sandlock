@@ -72,3 +72,41 @@ fn mem_accessors_reject_null_arguments() {
         );
     }
 }
+
+use sandlock_ffi::handler::{
+    sandlock_action_kind_t, sandlock_action_out_t, sandlock_action_set_continue,
+    sandlock_action_set_errno, sandlock_action_set_hold, sandlock_action_set_kill,
+    sandlock_action_set_return_value,
+};
+
+#[test]
+fn action_setters_record_kind_and_payload() {
+    let mut a = sandlock_action_out_t::zeroed();
+    unsafe { sandlock_action_set_continue(&mut a) };
+    assert_eq!(a.kind, sandlock_action_kind_t::Continue as u32);
+
+    unsafe { sandlock_action_set_errno(&mut a, 13) };
+    assert_eq!(a.kind, sandlock_action_kind_t::Errno as u32);
+    assert_eq!(unsafe { a.payload.errno }, 13);
+
+    unsafe { sandlock_action_set_return_value(&mut a, -1) };
+    assert_eq!(a.kind, sandlock_action_kind_t::ReturnValue as u32);
+    assert_eq!(unsafe { a.payload.return_value }, -1);
+
+    unsafe { sandlock_action_set_hold(&mut a) };
+    assert_eq!(a.kind, sandlock_action_kind_t::Hold as u32);
+
+    unsafe { sandlock_action_set_kill(&mut a, libc::SIGKILL, 4321) };
+    assert_eq!(a.kind, sandlock_action_kind_t::Kill as u32);
+    assert_eq!(unsafe { a.payload.kill.sig }, libc::SIGKILL);
+    assert_eq!(unsafe { a.payload.kill.pgid }, 4321);
+}
+
+#[test]
+fn action_out_layout_is_stable() {
+    // kind(4) + pad(4) + payload(16) = 24 bytes; alignment driven by the
+    // u64 inside the union. Layout drift between Rust and the C header
+    // would corrupt caller-allocated buffers.
+    assert_eq!(std::mem::size_of::<sandlock_action_out_t>(), 24);
+    assert_eq!(std::mem::align_of::<sandlock_action_out_t>(), 8);
+}

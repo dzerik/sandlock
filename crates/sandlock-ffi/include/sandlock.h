@@ -157,6 +157,59 @@ int sandlock_mem_write(const sandlock_mem_handle_t *handle,
                        uint64_t addr,
                        const uint8_t *buf, size_t len);
 
+typedef enum sandlock_action_kind {
+    SANDLOCK_ACTION_UNSET                  = 0,
+    SANDLOCK_ACTION_CONTINUE               = 1,
+    SANDLOCK_ACTION_ERRNO                  = 2,
+    SANDLOCK_ACTION_RETURN_VALUE           = 3,
+    SANDLOCK_ACTION_INJECT_FD_SEND         = 4,
+    SANDLOCK_ACTION_INJECT_FD_SEND_TRACKED = 5,
+    SANDLOCK_ACTION_HOLD                   = 6,
+    SANDLOCK_ACTION_KILL                   = 7,
+} sandlock_action_kind_t;
+
+typedef struct { int32_t sig; int32_t pgid; } sandlock_action_kill_t;
+
+typedef struct {
+    int32_t  srcfd;
+    uint32_t newfd_flags;
+} sandlock_action_inject_t;
+
+typedef uint64_t sandlock_inject_tracker_t;
+
+typedef struct {
+    int32_t  srcfd;
+    uint32_t newfd_flags;
+    sandlock_inject_tracker_t tracker;
+} sandlock_action_inject_tracked_t;
+
+typedef union {
+    uint64_t none;
+    int32_t  errno_value;
+    int64_t  return_value;
+    sandlock_action_inject_t         inject_send;
+    sandlock_action_inject_tracked_t inject_send_tracked;
+    sandlock_action_kill_t           kill;
+} sandlock_action_payload_t;
+
+typedef struct sandlock_action_out_t {
+    uint32_t kind;                       /* sandlock_action_kind_t */
+    sandlock_action_payload_t payload;
+} sandlock_action_out_t;
+
+/* Setters — exactly one tag is written; the payload is filled in
+ * accordingly. Calling a setter overwrites any prior setting. */
+void sandlock_action_set_continue(sandlock_action_out_t *out);
+void sandlock_action_set_errno(sandlock_action_out_t *out, int32_t errno_value);
+void sandlock_action_set_return_value(sandlock_action_out_t *out, int64_t value);
+void sandlock_action_set_inject_fd_send(sandlock_action_out_t *out,
+                                        int32_t srcfd, uint32_t newfd_flags);
+void sandlock_action_set_inject_fd_send_tracked(sandlock_action_out_t *out,
+                                                int32_t srcfd, uint32_t newfd_flags,
+                                                sandlock_inject_tracker_t tracker);
+void sandlock_action_set_hold(sandlock_action_out_t *out);
+void sandlock_action_set_kill(sandlock_action_out_t *out, int32_t sig, int32_t pgid);
+
 #ifdef __cplusplus
 }
 #endif
