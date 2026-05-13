@@ -491,18 +491,44 @@ impl Handler for FfiHandler {
         let notif_fd = cx.notif_fd;
         let notif_id = cx.notif.id;
         let pid = cx.notif.pid;
-        // Query the kernel for the child's real process-group id. The supervisor
-        // catches the notification synchronously, so the child is still alive at
-        // this point. `getpgid` returns -1 on ESRCH (child exited between notif
-        // and our query) — fall back to the child's pid in that case so a
-        // downstream Kill action has at least one valid target even if the
-        // process is already a zombie.
+        // Resolve the trapped child's process group id for use as a fallback
+        // pgid in Kill actions where the caller passed pgid == 0. Three guard
+        // rails:
+        //
+        //   1. `notif.pid == 0` can occur in nested PID namespaces (e.g.,
+        //      Kubernetes pod-in-pod, KubeVirt, DinD). `getpgid(0)` returns
+        //      the supervisor's own pgid — substituting that into a Kill
+        //      action would be a supervisor-suicide vector.
+        //
+        //   2. `getpgid(pid) <= 0` indicates ESRCH (child exited between
+        //      notif and our query) or another kernel-side failure.
+        //
+        //   3. Even on success, the resolved pgid must differ from the
+        //      supervisor's own pgid. If sandlock-core does not call
+        //      `setpgid(0, 0)` after fork, the child inherits the parent's
+        //      pgid — sending `killpg(supervisor_pgid)` would kill the
+        //      supervisor along with the child.
+        //
+        // In all three failure cases, fall back to the bare pid. A `killpg(pid)`
+        // when `pid` does not name a valid process group will fail with ESRCH
+        // inside the supervisor's response path — safer than killing the
+        // supervisor.
         let child_pgid = {
             let pid = cx.notif.pid as i32;
-            // SAFETY: `getpgid` is signal-safe and async-safe; no preconditions
-            // beyond passing a valid pid.
-            let pgid = unsafe { libc::getpgid(pid) };
-            if pgid < 0 { pid } else { pgid }
+            // SAFETY: `getpgid(0)` is signal-safe and has no preconditions.
+            let supervisor_pgid = unsafe { libc::getpgid(0) };
+            if pid <= 0 {
+                pid
+            } else {
+                // SAFETY: `getpgid` is signal-safe; positive pid is the only
+                // documented precondition.
+                let pgid = unsafe { libc::getpgid(pid) };
+                if pgid <= 0 || pgid == supervisor_pgid {
+                    pid
+                } else {
+                    pgid
+                }
+            }
         };
         let handler_fn = self.inner.handler_fn;
         let ud = UdPtr(self.inner.ud);

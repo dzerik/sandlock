@@ -599,34 +599,54 @@ async fn ffi_handler_translates_kill_with_explicit_pgid() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ffi_handler_translates_kill_zero_pgid_substitutes_child_pgid() {
-    // Spawn a real child so that getpgid(child.pid) is the test runner's
-    // pgid — distinct from child.pid (a fresh pid). This makes the test a
-    // genuine regression hook for the substitution: buggy production code
-    // that returns notif.pid would yield child.pid, but the production
-    // formula (getpgid(notif.pid)) yields the test runner's pgid. The
-    // mismatch causes the assertion to fail under the bug.
-    let mut child = std::process::Command::new("sleep")
-        .arg("30")
-        .spawn()
-        .expect("spawn sleep child");
+    // Spawn a child that places itself into a fresh process group via
+    // `setpgid(0, 0)` in pre_exec. The child therefore becomes its own
+    // pgid leader: `getpgid(child_pid) == child_pid`, and crucially
+    // `getpgid(child_pid) != getpgid(0)` (the supervisor's pgid).
+    //
+    // The supervisor_pgid guard added in the defense-in-depth pass would
+    // otherwise refuse the substitution and fall back to the bare pid.
+    // By breaking the child away into its own group we keep this test
+    // exercising the happy path: zero pgid in a Kill action is replaced
+    // with the resolved pgid (here `== child_pid`, but reached through
+    // the substitution branch — not the supervisor-guard fallback).
+    use std::os::unix::process::CommandExt;
+    let mut cmd = std::process::Command::new("sleep");
+    cmd.arg("30");
+    unsafe {
+        cmd.pre_exec(|| {
+            // SAFETY: `setpgid` is async-signal-safe; pid=0 acts on the
+            // calling process; pgid=0 creates a new group whose leader
+            // is the calling process.
+            if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().expect("spawn sleep child");
     let child_pid = child.id() as i32;
-    // Compute the expected pgid the same way production does. If `sleep`
-    // exited or was reaped between spawn and this call, fall back to the
-    // pid to mirror production's ESRCH branch.
-    let expected_pgid = {
-        // SAFETY: same as the production call — no preconditions.
-        let q = unsafe { libc::getpgid(child_pid) };
-        if q < 0 { child_pid } else { q }
-    };
-    // Sanity-check that this host actually exposes a meaningful pgid !=
-    // pid for the spawned child. Otherwise the assertion below is
-    // satisfied by both the buggy and fixed implementations, making the
-    // test useless on this host.
-    assert_ne!(
-        expected_pgid, child_pid,
-        "test precondition: getpgid(child_pid) must differ from child_pid for this test to catch regressions; \
-         got pgid={expected_pgid}, pid={child_pid}",
+    let supervisor_pgid = unsafe { libc::getpgid(0) };
+    // Poll briefly because pre_exec runs after fork but the parent may
+    // observe the pgid change asynchronously.
+    let mut resolved_pgid = unsafe { libc::getpgid(child_pid) };
+    for _ in 0..50 {
+        if resolved_pgid == child_pid {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        resolved_pgid = unsafe { libc::getpgid(child_pid) };
+    }
+    // The child is its own pgid leader; supervisor's pgid is distinct.
+    assert_eq!(
+        resolved_pgid, child_pid,
+        "precondition: pre_exec setpgid(0,0) should leave child as its own pgid leader",
     );
+    assert_ne!(
+        resolved_pgid, supervisor_pgid,
+        "precondition: child's pgid must differ from supervisor's pgid for the substitution branch to fire",
+    );
+    let expected_pgid = child_pid;
 
     let raw = unsafe {
         sandlock_ffi::handler::sandlock_handler_new(
@@ -665,6 +685,141 @@ async fn ffi_handler_translates_kill_zero_pgid_substitutes_child_pgid() {
                 if sig == libc::SIGKILL && pgid == expected_pgid
         ),
         "expected Kill {{ sig: SIGKILL, pgid: {expected_pgid} }}, got {action:?}",
+    );
+}
+
+// ---- Group K: defense-in-depth guards for child pgid resolution ----------
+//
+// These tests verify the three guard rails in `FfiHandler::handle` that
+// protect against the supervisor-suicide vector when resolving the
+// fallback pgid for `Kill { pgid: 0 }` actions.
+
+fn fake_ctx_with_pid(pid: u32) -> HandlerCtx {
+    HandlerCtx {
+        notif: SeccompNotif {
+            id: 1,
+            pid,
+            flags: 0,
+            data: SeccompData {
+                nr: 39,
+                arch: 0xC000_003E,
+                instruction_pointer: 0,
+                args: [0; 6],
+            },
+        },
+        notif_fd: -1,
+    }
+}
+
+extern "C-unwind" fn k_handler_set_kill_sigkill_zero_pgid(
+    _ud: *mut std::ffi::c_void,
+    _notif: *const sandlock_ffi::notif_repr::sandlock_notif_data_t,
+    _mem: *mut sandlock_ffi::handler::sandlock_mem_handle_t,
+    out: *mut sandlock_ffi::handler::sandlock_action_out_t,
+) -> i32 {
+    unsafe { sandlock_ffi::handler::sandlock_action_set_kill(out, libc::SIGKILL, 0) };
+    0
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k1_pgid_resolution_rejects_pid_zero() {
+    // notif.pid == 0 can occur in nested PID namespaces (Kubernetes
+    // pod-in-pod). Without the `pid <= 0` guard, `getpgid(0)` would
+    // return the supervisor's own pgid, and a Kill { pgid: 0 } action
+    // would be substituted with `pgid == supervisor_pgid`, turning a
+    // killpg into supervisor suicide.
+    //
+    // With the guard: we fall back to the bare pid (here `0`). The
+    // kernel will reject `killpg(0)` inside the response path, but the
+    // supervisor survives.
+    let raw = unsafe {
+        sandlock_ffi::handler::sandlock_handler_new(
+            Some(k_handler_set_kill_sigkill_zero_pgid),
+            std::ptr::null_mut(),
+            None,
+            sandlock_exception_policy_t::Continue as u32,
+        )
+    };
+    let handler = unsafe { FfiHandler::from_raw(raw) };
+    let cx = fake_ctx_with_pid(0);
+    let action = handler.handle(&cx).await;
+    assert!(
+        matches!(action, NotifAction::Kill { pgid: 0, .. }),
+        "expected Kill {{ pgid: 0 }} (guard refused getpgid(0) substitution), got {action:?}",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k2_pgid_resolution_rejects_supervisor_pgid_match() {
+    // Spawn a child WITHOUT pre_exec setpgid, so it inherits the
+    // supervisor's process group. `getpgid(child_pid) == getpgid(0) ==
+    // supervisor_pgid`. Without the `pgid == supervisor_pgid` guard,
+    // the substitution would yield Kill { pgid: supervisor_pgid }, the
+    // supervisor-suicide vector. With the guard, we fall back to the
+    // bare child pid.
+    let supervisor_pgid = unsafe { libc::getpgid(0) };
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleep child");
+    let child_pid = child.id() as i32;
+
+    // The child inherits the supervisor's pgid by default. Confirm the
+    // precondition holds; otherwise this test cannot discriminate.
+    let resolved_pgid = unsafe { libc::getpgid(child_pid) };
+    assert_eq!(
+        resolved_pgid, supervisor_pgid,
+        "precondition: child should inherit supervisor's pgid; got {resolved_pgid}, supervisor={supervisor_pgid}",
+    );
+    assert_ne!(
+        child_pid, supervisor_pgid,
+        "precondition: child_pid must differ from supervisor_pgid; otherwise the assertion cannot discriminate substitution vs fallback",
+    );
+
+    let raw = unsafe {
+        sandlock_ffi::handler::sandlock_handler_new(
+            Some(k_handler_set_kill_sigkill_zero_pgid),
+            std::ptr::null_mut(),
+            None,
+            sandlock_exception_policy_t::Continue as u32,
+        )
+    };
+    let handler = unsafe { FfiHandler::from_raw(raw) };
+    let cx = fake_ctx_with_pid(child_pid as u32);
+    let action = handler.handle(&cx).await;
+
+    // Reap the child regardless of assertion outcome.
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(
+        matches!(action, NotifAction::Kill { pgid, .. } if pgid == child_pid),
+        "expected Kill {{ pgid: child_pid={child_pid} }} (guard refused supervisor_pgid={supervisor_pgid} substitution), got {action:?}",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k3_pgid_resolution_falls_back_on_esrch() {
+    // Use a clearly-dead pid that will never exist on this host.
+    // `getpgid(i32::MAX)` returns -1 with ESRCH on Linux. Without the
+    // `pgid <= 0` guard, the action would be Kill { pgid: -1 }; with
+    // the guard, we fall back to the bare pid.
+    let dead_pid: u32 = i32::MAX as u32;
+
+    let raw = unsafe {
+        sandlock_ffi::handler::sandlock_handler_new(
+            Some(k_handler_set_kill_sigkill_zero_pgid),
+            std::ptr::null_mut(),
+            None,
+            sandlock_exception_policy_t::Continue as u32,
+        )
+    };
+    let handler = unsafe { FfiHandler::from_raw(raw) };
+    let cx = fake_ctx_with_pid(dead_pid);
+    let action = handler.handle(&cx).await;
+    assert!(
+        matches!(action, NotifAction::Kill { pgid, .. } if pgid == dead_pid as i32),
+        "expected Kill {{ pgid: dead_pid={dead_pid} }} (ESRCH fallback to bare pid), got {action:?}",
     );
 }
 
