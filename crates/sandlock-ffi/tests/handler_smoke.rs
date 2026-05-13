@@ -97,11 +97,74 @@ fn action_setters_record_kind_and_payload() {
 
 #[test]
 fn action_out_layout_is_stable() {
-    // kind(4) + pad(4) + payload(16) = 24 bytes; alignment driven by the
-    // u64 inside the union. Layout drift between Rust and the C header
-    // would corrupt caller-allocated buffers.
-    assert_eq!(std::mem::size_of::<sandlock_action_out_t>(), 24);
-    assert_eq!(std::mem::align_of::<sandlock_action_out_t>(), 8);
+    // Size + align are gross guards; pin down field offsets so a
+    // field reorder that preserves size still gets caught.
+    use std::mem::{align_of, size_of, MaybeUninit};
+    use sandlock_ffi::handler::sandlock_action_out_t;
+
+    assert_eq!(size_of::<sandlock_action_out_t>(), 24,
+               "size drift breaks the C ABI layout");
+    assert_eq!(align_of::<sandlock_action_out_t>(), 8,
+               "align drift breaks the C ABI layout");
+
+    // Hand-roll offset_of through MaybeUninit — works on stable Rust
+    // without an extra crate. The C header has kind at offset 0 and
+    // payload at offset 8 (4 bytes implicit padding after kind).
+    let mut probe = MaybeUninit::<sandlock_action_out_t>::uninit();
+    let base = probe.as_mut_ptr() as usize;
+    let kind_offset = unsafe { std::ptr::addr_of_mut!((*probe.as_mut_ptr()).kind) as usize - base };
+    let payload_offset = unsafe { std::ptr::addr_of_mut!((*probe.as_mut_ptr()).payload) as usize - base };
+    assert_eq!(kind_offset, 0, "kind must be at offset 0");
+    assert_eq!(payload_offset, 8, "payload must be at offset 8 (kind+4 bytes padding)");
+}
+
+#[test]
+fn notif_data_field_offsets_are_stable() {
+    use std::mem::MaybeUninit;
+    use sandlock_ffi::notif_repr::sandlock_notif_data_t;
+
+    let probe = MaybeUninit::<sandlock_notif_data_t>::uninit();
+    let base = probe.as_ptr() as usize;
+
+    // C header order: id(u64), pid(u32), flags(u32), syscall_nr(i32),
+    // arch(u32), instruction_pointer(u64), args([u64;6]). Each
+    // `addr_of!` is cast to `*const u8` so the closure-free subtraction
+    // works uniformly across the heterogeneous field types.
+    assert_eq!(
+        unsafe { std::ptr::addr_of!((*probe.as_ptr()).id) as *const u8 as usize - base },
+        0,
+        "id must be at offset 0",
+    );
+    assert_eq!(
+        unsafe { std::ptr::addr_of!((*probe.as_ptr()).pid) as *const u8 as usize - base },
+        8,
+        "pid must be at offset 8",
+    );
+    assert_eq!(
+        unsafe { std::ptr::addr_of!((*probe.as_ptr()).flags) as *const u8 as usize - base },
+        12,
+        "flags must be at offset 12",
+    );
+    assert_eq!(
+        unsafe { std::ptr::addr_of!((*probe.as_ptr()).syscall_nr) as *const u8 as usize - base },
+        16,
+        "syscall_nr must be at offset 16",
+    );
+    assert_eq!(
+        unsafe { std::ptr::addr_of!((*probe.as_ptr()).arch) as *const u8 as usize - base },
+        20,
+        "arch must be at offset 20",
+    );
+    assert_eq!(
+        unsafe { std::ptr::addr_of!((*probe.as_ptr()).instruction_pointer) as *const u8 as usize - base },
+        24,
+        "instruction_pointer must be at offset 24",
+    );
+    assert_eq!(
+        unsafe { std::ptr::addr_of!((*probe.as_ptr()).args) as *const u8 as usize - base },
+        32,
+        "args must be at offset 32",
+    );
 }
 
 use sandlock_ffi::handler::{
@@ -161,15 +224,20 @@ fn handler_new_and_free_round_trip() {
 
 #[test]
 fn handler_new_rejects_invalid_exception_policy() {
-    let h = unsafe {
-        sandlock_handler_new(
-            Some(test_handler as sandlock_handler_fn_t),
-            std::ptr::null_mut(),
-            None,
-            99u32, // out of range
-        )
-    };
-    assert!(h.is_null(), "expected null handle on invalid on_exception");
+    // Cover the boundary (one past the highest valid Continue=2),
+    // a mid-range value, and the extreme u32::MAX. A mutation that
+    // rejects only specific values would fail at least one of these.
+    for bad in [3u32, 4u32, 99u32, u32::MAX] {
+        let h = unsafe {
+            sandlock_handler_new(
+                Some(test_handler as sandlock_handler_fn_t),
+                std::ptr::null_mut(),
+                None,
+                bad,
+            )
+        };
+        assert!(h.is_null(), "expected null for on_exception={bad}");
+    }
 }
 
 use sandlock_core::seccomp::dispatch::{Handler, HandlerCtx};
