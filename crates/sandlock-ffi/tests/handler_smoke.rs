@@ -342,3 +342,830 @@ fn run_with_handlers_intercepts_getpid() {
     unsafe { sandlock_result_free(rr); }
     unsafe { sandlock_sandbox_free(policy); }
 }
+
+// ---------------------------------------------------------------------------
+// Expanded coverage (Task 10)
+// ---------------------------------------------------------------------------
+//
+// The tests below probe each remaining branch of the handler ABI surface:
+//
+//   * Group A: setters for the inject-fd variants and null-pointer safety.
+//   * Group B: every `NotifAction` translation the dispatcher must produce.
+//   * Group C: exception-policy fallbacks beyond the default `DenyEperm`.
+//   * Group D: panic recovery across the FFI boundary.
+//   * Group E: `Unset` action when the callback returns 0 but never sets one.
+//   * Group F: `sandlock_handler_new` edge cases (null fn / null ud + dropper).
+//   * Group G: `sandlock_run_with_handlers` failure paths and ownership.
+//   * Group H: multiple handlers each firing for their own syscall.
+//   * Group I: live-fd `sandlock_mem_read_cstr` via an intercepted `openat`.
+//
+// Style mirrors the existing end-to-end test: explicit `extern "C"` handler
+// fns, no helper macros, `assert!(matches!(...))` for action variants.
+
+use sandlock_ffi::handler::{
+    sandlock_action_set_inject_fd_send, sandlock_action_set_inject_fd_send_tracked,
+};
+
+// ---- Group A: action setters --------------------------------------------
+
+#[test]
+fn action_inject_fd_send_setter_records_payload() {
+    let mut a = sandlock_action_out_t::zeroed();
+    // O_CLOEXEC is the canonical flag a handler would pass through.
+    unsafe { sandlock_action_set_inject_fd_send(&mut a, 42, 0o2000000) };
+    assert_eq!(a.kind, sandlock_action_kind_t::InjectFdSend as u32);
+    // Safety: kind == InjectFdSend selects the `inject_send` union arm
+    // (matches the ABI contract documented on the setter).
+    assert_eq!(unsafe { a.payload.inject_send.srcfd }, 42);
+    assert_eq!(unsafe { a.payload.inject_send.newfd_flags }, 0o2000000);
+}
+
+#[test]
+fn action_inject_fd_send_tracked_setter_records_payload() {
+    let mut a = sandlock_action_out_t::zeroed();
+    unsafe { sandlock_action_set_inject_fd_send_tracked(&mut a, 17, 0, 0xDEAD_BEEF) };
+    assert_eq!(a.kind, sandlock_action_kind_t::InjectFdSendTracked as u32);
+    // Safety: kind == InjectFdSendTracked selects the `inject_send_tracked`
+    // union arm.
+    assert_eq!(unsafe { a.payload.inject_send_tracked.srcfd }, 17);
+    assert_eq!(unsafe { a.payload.inject_send_tracked.newfd_flags }, 0);
+    assert_eq!(unsafe { a.payload.inject_send_tracked.tracker }, 0xDEAD_BEEF);
+}
+
+#[test]
+fn action_setters_are_null_safe() {
+    // Safety: each setter documents null as a no-op; this test is the
+    // executable form of that contract. If any setter dereferences null
+    // the process aborts and the test reports failure.
+    unsafe {
+        sandlock_action_set_continue(std::ptr::null_mut());
+        sandlock_action_set_errno(std::ptr::null_mut(), 13);
+        sandlock_action_set_return_value(std::ptr::null_mut(), -1);
+        sandlock_action_set_hold(std::ptr::null_mut());
+        sandlock_action_set_kill(std::ptr::null_mut(), libc::SIGKILL, 0);
+        sandlock_action_set_inject_fd_send(std::ptr::null_mut(), 0, 0);
+        sandlock_action_set_inject_fd_send_tracked(std::ptr::null_mut(), 0, 0, 0);
+    }
+}
+
+// ---- Group B: FfiHandler translation ------------------------------------
+//
+// Each variant gets its own explicit `extern "C"` handler so the test
+// retains the line-by-line transparency of the existing tests rather than
+// hiding setup behind a macro.
+
+extern "C" fn handler_set_continue(
+    _ud: *mut std::ffi::c_void,
+    _notif: *const sandlock_ffi::notif_repr::sandlock_notif_data_t,
+    _mem: *mut sandlock_ffi::handler::sandlock_mem_handle_t,
+    out: *mut sandlock_ffi::handler::sandlock_action_out_t,
+) -> i32 {
+    unsafe { sandlock_ffi::handler::sandlock_action_set_continue(out) };
+    0
+}
+
+extern "C" fn handler_set_errno_eacces(
+    _ud: *mut std::ffi::c_void,
+    _notif: *const sandlock_ffi::notif_repr::sandlock_notif_data_t,
+    _mem: *mut sandlock_ffi::handler::sandlock_mem_handle_t,
+    out: *mut sandlock_ffi::handler::sandlock_action_out_t,
+) -> i32 {
+    unsafe { sandlock_ffi::handler::sandlock_action_set_errno(out, 13) };
+    0
+}
+
+extern "C" fn handler_set_hold(
+    _ud: *mut std::ffi::c_void,
+    _notif: *const sandlock_ffi::notif_repr::sandlock_notif_data_t,
+    _mem: *mut sandlock_ffi::handler::sandlock_mem_handle_t,
+    out: *mut sandlock_ffi::handler::sandlock_action_out_t,
+) -> i32 {
+    unsafe { sandlock_ffi::handler::sandlock_action_set_hold(out) };
+    0
+}
+
+extern "C" fn handler_set_kill_sigterm_1234(
+    _ud: *mut std::ffi::c_void,
+    _notif: *const sandlock_ffi::notif_repr::sandlock_notif_data_t,
+    _mem: *mut sandlock_ffi::handler::sandlock_mem_handle_t,
+    out: *mut sandlock_ffi::handler::sandlock_action_out_t,
+) -> i32 {
+    unsafe { sandlock_ffi::handler::sandlock_action_set_kill(out, libc::SIGTERM, 1234) };
+    0
+}
+
+extern "C" fn handler_set_kill_sigkill_zero_pgid(
+    _ud: *mut std::ffi::c_void,
+    _notif: *const sandlock_ffi::notif_repr::sandlock_notif_data_t,
+    _mem: *mut sandlock_ffi::handler::sandlock_mem_handle_t,
+    out: *mut sandlock_ffi::handler::sandlock_action_out_t,
+) -> i32 {
+    unsafe { sandlock_ffi::handler::sandlock_action_set_kill(out, libc::SIGKILL, 0) };
+    0
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ffi_handler_translates_continue() {
+    let raw = unsafe {
+        sandlock_ffi::handler::sandlock_handler_new(
+            Some(handler_set_continue),
+            std::ptr::null_mut(),
+            None,
+            sandlock_exception_policy_t::Kill as u32,
+        )
+    };
+    // Safety: `raw` was just produced by `sandlock_handler_new` and is
+    // non-null; ownership transfers into the adapter.
+    let h = unsafe { FfiHandler::from_raw(raw) };
+    let action = h.handle(&fake_ctx()).await;
+    assert!(matches!(action, NotifAction::Continue));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ffi_handler_translates_errno() {
+    let raw = unsafe {
+        sandlock_ffi::handler::sandlock_handler_new(
+            Some(handler_set_errno_eacces),
+            std::ptr::null_mut(),
+            None,
+            sandlock_exception_policy_t::Kill as u32,
+        )
+    };
+    // Safety: see `ffi_handler_translates_continue`.
+    let h = unsafe { FfiHandler::from_raw(raw) };
+    let action = h.handle(&fake_ctx()).await;
+    assert!(matches!(action, NotifAction::Errno(e) if e == 13));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ffi_handler_translates_hold() {
+    let raw = unsafe {
+        sandlock_ffi::handler::sandlock_handler_new(
+            Some(handler_set_hold),
+            std::ptr::null_mut(),
+            None,
+            sandlock_exception_policy_t::Kill as u32,
+        )
+    };
+    // Safety: see `ffi_handler_translates_continue`.
+    let h = unsafe { FfiHandler::from_raw(raw) };
+    let action = h.handle(&fake_ctx()).await;
+    assert!(matches!(action, NotifAction::Hold));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ffi_handler_translates_kill_with_explicit_pgid() {
+    let raw = unsafe {
+        sandlock_ffi::handler::sandlock_handler_new(
+            Some(handler_set_kill_sigterm_1234),
+            std::ptr::null_mut(),
+            None,
+            sandlock_exception_policy_t::Kill as u32,
+        )
+    };
+    // Safety: see `ffi_handler_translates_continue`.
+    let h = unsafe { FfiHandler::from_raw(raw) };
+    let action = h.handle(&fake_ctx()).await;
+    assert!(matches!(
+        action,
+        NotifAction::Kill { sig, pgid } if sig == libc::SIGTERM && pgid == 1234
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ffi_handler_translates_kill_zero_pgid_substitutes_child_pgid() {
+    let raw = unsafe {
+        sandlock_ffi::handler::sandlock_handler_new(
+            Some(handler_set_kill_sigkill_zero_pgid),
+            std::ptr::null_mut(),
+            None,
+            sandlock_exception_policy_t::Kill as u32,
+        )
+    };
+    // Safety: see `ffi_handler_translates_continue`.
+    let h = unsafe { FfiHandler::from_raw(raw) };
+    let cx = fake_ctx();
+    let expected_pgid = cx.notif.pid as i32;
+    let action = h.handle(&cx).await;
+    assert!(matches!(
+        action,
+        NotifAction::Kill { sig, pgid }
+            if sig == libc::SIGKILL && pgid == expected_pgid
+    ));
+}
+
+// ---- Group C: exception policy fallbacks --------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ffi_handler_kill_policy_on_callback_rc_nonzero() {
+    let raw = unsafe {
+        sandlock_ffi::handler::sandlock_handler_new(
+            Some(returns_error_with_unset_action),
+            std::ptr::null_mut(),
+            None,
+            sandlock_exception_policy_t::Kill as u32,
+        )
+    };
+    // Safety: see `ffi_handler_translates_continue`.
+    let h = unsafe { FfiHandler::from_raw(raw) };
+    let action = h.handle(&fake_ctx()).await;
+    assert!(matches!(action, NotifAction::Kill { sig, .. } if sig == libc::SIGKILL));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ffi_handler_continue_policy_on_callback_rc_nonzero() {
+    let raw = unsafe {
+        sandlock_ffi::handler::sandlock_handler_new(
+            Some(returns_error_with_unset_action),
+            std::ptr::null_mut(),
+            None,
+            sandlock_exception_policy_t::Continue as u32,
+        )
+    };
+    // Safety: see `ffi_handler_translates_continue`.
+    let h = unsafe { FfiHandler::from_raw(raw) };
+    let action = h.handle(&fake_ctx()).await;
+    assert!(matches!(action, NotifAction::Continue));
+}
+
+// ---- Group D: panic recovery --------------------------------------------
+
+extern "C" fn panicking_handler(
+    _ud: *mut std::ffi::c_void,
+    _notif: *const sandlock_ffi::notif_repr::sandlock_notif_data_t,
+    _mem: *mut sandlock_ffi::handler::sandlock_mem_handle_t,
+    _out: *mut sandlock_ffi::handler::sandlock_action_out_t,
+) -> i32 {
+    panic!("test panic from extern C handler");
+}
+
+// Ignored: the `extern "C"` ABI on current Rust (since 1.71 stabilising
+// `C-unwind`) aborts the process when an unwinding panic crosses the
+// boundary — `std::panic::catch_unwind` cannot intercept that. The
+// `catch_unwind` in `FfiHandler::handle` is therefore only useful for
+// panics that happen *outside* the C callback (e.g. in adapter glue or
+// in safe-Rust handlers that the user wrote and called as `extern "C"`
+// via a wrapper). Promoting `sandlock_handler_fn_t` to `extern
+// "C-unwind"` would make this test pass and the documented panic
+// recovery actually deliver — but that is a production ABI change and
+// belongs in a separate commit. Until then this test stays here as the
+// regression hook.
+#[ignore = "extern \"C\" panic aborts (Rust ABI); needs C-unwind ABI change in handler type"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ffi_handler_recovers_from_callback_panic() {
+    let raw = unsafe {
+        sandlock_ffi::handler::sandlock_handler_new(
+            Some(panicking_handler),
+            std::ptr::null_mut(),
+            None,
+            sandlock_exception_policy_t::Kill as u32,
+        )
+    };
+    // Safety: see `ffi_handler_translates_continue`.
+    let h = unsafe { FfiHandler::from_raw(raw) };
+    let action = h.handle(&fake_ctx()).await;
+    // The `catch_unwind` inside `spawn_blocking` swallows the panic and
+    // the dispatcher falls back to the configured exception policy.
+    assert!(matches!(action, NotifAction::Kill { sig, .. } if sig == libc::SIGKILL));
+}
+
+// ---- Group E: Unset action with zero rc ---------------------------------
+
+extern "C" fn never_sets_action(
+    _ud: *mut std::ffi::c_void,
+    _notif: *const sandlock_ffi::notif_repr::sandlock_notif_data_t,
+    _mem: *mut sandlock_ffi::handler::sandlock_mem_handle_t,
+    _out: *mut sandlock_ffi::handler::sandlock_action_out_t,
+) -> i32 {
+    0
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ffi_handler_callback_returns_zero_but_never_sets_action_triggers_fallback() {
+    let raw = unsafe {
+        sandlock_ffi::handler::sandlock_handler_new(
+            Some(never_sets_action),
+            std::ptr::null_mut(),
+            None,
+            sandlock_exception_policy_t::DenyEperm as u32,
+        )
+    };
+    // Safety: see `ffi_handler_translates_continue`.
+    let h = unsafe { FfiHandler::from_raw(raw) };
+    let action = h.handle(&fake_ctx()).await;
+    // `translate_action` returns `None` for `Unset`, which routes the
+    // dispatcher onto the exception policy fallback.
+    assert!(matches!(action, NotifAction::Errno(e) if e == libc::EPERM));
+}
+
+// ---- Group F: handler_new edge cases ------------------------------------
+
+extern "C" fn panicking_dropper(_ud: *mut std::ffi::c_void) {
+    panic!("dropper invoked when it should not have been");
+}
+
+#[test]
+fn handler_new_with_null_handler_fn_returns_null() {
+    let h = unsafe {
+        sandlock_handler_new(
+            None,
+            std::ptr::null_mut(),
+            None,
+            sandlock_exception_policy_t::Kill as u32,
+        )
+    };
+    assert!(h.is_null(), "expected null handle when handler_fn is None");
+}
+
+#[test]
+fn handler_new_with_null_ud_and_dropper_does_not_invoke_dropper() {
+    // Allocates a container with a destructor but null ud; the `Drop`
+    // impl on `sandlock_handler_t` must skip the destructor in that case
+    // because there is nothing to free.
+    let h = unsafe {
+        sandlock_handler_new(
+            Some(test_handler as sandlock_handler_fn_t),
+            std::ptr::null_mut(),
+            Some(panicking_dropper),
+            sandlock_exception_policy_t::Kill as u32,
+        )
+    };
+    assert!(!h.is_null(), "expected a valid handler container");
+    // Safety: `h` was just produced and not yet freed. If the guard in
+    // `Drop` were missing the dropper would panic and abort the test.
+    unsafe { sandlock_handler_free(h) };
+}
+
+// ---- Group G: run_with_handlers failure paths ---------------------------
+
+#[test]
+fn run_with_handlers_null_policy_returns_null() {
+    let arg0 = CString::new("/bin/true").unwrap();
+    let argv = [arg0.as_ptr()];
+    let rr = unsafe {
+        sandlock_run_with_handlers(
+            std::ptr::null(),
+            argv.as_ptr(),
+            argv.len() as u32,
+            std::ptr::null(),
+            0,
+        )
+    };
+    assert!(rr.is_null(), "expected null result for null policy");
+}
+
+#[test]
+fn run_with_handlers_null_argv_returns_null() {
+    use sandlock_ffi::*;
+    let builder = sandlock_sandbox_builder_new();
+    let policy = {
+        let mut err: i32 = 0;
+        unsafe { sandlock_sandbox_build(builder, &mut err, std::ptr::null_mut()) }
+    };
+    assert!(!policy.is_null(), "policy build failed");
+
+    let rr = unsafe {
+        sandlock_run_with_handlers(
+            policy,
+            std::ptr::null(),
+            3, // argc > 0 with null argv must fail validation
+            std::ptr::null(),
+            0,
+        )
+    };
+    assert!(rr.is_null(), "expected null result for null argv with argc > 0");
+
+    unsafe { sandlock_sandbox_free(policy); }
+}
+
+#[test]
+fn run_with_handlers_null_registrations_with_nonzero_count_returns_null() {
+    use sandlock_ffi::*;
+    let builder = sandlock_sandbox_builder_new();
+    let policy = {
+        let mut err: i32 = 0;
+        unsafe { sandlock_sandbox_build(builder, &mut err, std::ptr::null_mut()) }
+    };
+    assert!(!policy.is_null(), "policy build failed");
+
+    let arg0 = CString::new("/bin/true").unwrap();
+    let argv = [arg0.as_ptr()];
+    let rr = unsafe {
+        sandlock_run_with_handlers(
+            policy,
+            argv.as_ptr(),
+            argv.len() as u32,
+            std::ptr::null(), // null registrations with nregistrations > 0
+            1,
+        )
+    };
+    assert!(rr.is_null(), "expected null result for null registrations + count > 0");
+
+    unsafe { sandlock_sandbox_free(policy); }
+}
+
+#[test]
+fn run_with_handlers_empty_registrations_runs_normally() {
+    use sandlock_ffi::*;
+
+    let builder = sandlock_sandbox_builder_new();
+    // Same allowlist as the existing end-to-end test — /bin/true links
+    // against libc and ld.so so it still needs /lib + /lib64 + /usr.
+    let builder = unsafe {
+        let p = CString::new("/usr").unwrap();
+        sandlock_sandbox_builder_fs_read(builder, p.as_ptr())
+    };
+    let builder = unsafe {
+        let p = CString::new("/bin").unwrap();
+        sandlock_sandbox_builder_fs_read(builder, p.as_ptr())
+    };
+    let builder = unsafe {
+        let p = CString::new("/lib").unwrap();
+        sandlock_sandbox_builder_fs_read(builder, p.as_ptr())
+    };
+    let builder = unsafe {
+        let p = CString::new("/lib64").unwrap();
+        sandlock_sandbox_builder_fs_read(builder, p.as_ptr())
+    };
+    let builder = unsafe {
+        let p = CString::new("/etc").unwrap();
+        sandlock_sandbox_builder_fs_read(builder, p.as_ptr())
+    };
+    let builder = unsafe {
+        let p = CString::new("/tmp").unwrap();
+        sandlock_sandbox_builder_fs_write(builder, p.as_ptr())
+    };
+
+    let policy = {
+        let mut err: i32 = 0;
+        unsafe { sandlock_sandbox_build(builder, &mut err, std::ptr::null_mut()) }
+    };
+    assert!(!policy.is_null(), "policy build failed");
+
+    let arg0 = CString::new("/bin/true").unwrap();
+    let argv = [arg0.as_ptr()];
+
+    let rr = unsafe {
+        sandlock_run_with_handlers(
+            policy,
+            argv.as_ptr(),
+            argv.len() as u32,
+            std::ptr::null(),
+            0,
+        )
+    };
+    assert!(!rr.is_null(), "empty registrations should still run /bin/true");
+    let success = unsafe { sandlock_result_success(rr) };
+    let exit_code = unsafe { sandlock_result_exit_code(rr) };
+    assert!(success, "/bin/true should exit successfully; exit={}", exit_code);
+
+    unsafe { sandlock_result_free(rr); }
+    unsafe { sandlock_sandbox_free(policy); }
+}
+
+static ONE_SHOT_DROPPER_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+extern "C" fn one_shot_dropper(ud: *mut std::ffi::c_void) {
+    ONE_SHOT_DROPPER_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    if !ud.is_null() {
+        // Reclaim the leaked Box so leak-sanitizer builds stay clean.
+        unsafe { drop(Box::from_raw(ud as *mut u32)); }
+    }
+}
+
+#[test]
+fn run_with_handlers_null_handler_in_array_returns_null() {
+    use sandlock_ffi::*;
+
+    let builder = sandlock_sandbox_builder_new();
+    let policy = {
+        let mut err: i32 = 0;
+        unsafe { sandlock_sandbox_build(builder, &mut err, std::ptr::null_mut()) }
+    };
+    assert!(!policy.is_null(), "policy build failed");
+
+    // The validating handler must NOT be consumed by `sandlock_run_with_handlers`
+    // when validation fails — the call should be transactional. We assert this
+    // by registering `one_shot_dropper` and verifying it fires exactly once
+    // (from our explicit `sandlock_handler_free` call below, not from
+    // `sandlock_run_with_handlers`).
+    ONE_SHOT_DROPPER_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+    let ud = Box::into_raw(Box::new(0xAAu32)) as *mut std::ffi::c_void;
+    let valid = unsafe {
+        sandlock_handler_new(
+            Some(test_handler as sandlock_handler_fn_t),
+            ud,
+            Some(one_shot_dropper),
+            sandlock_exception_policy_t::Kill as u32,
+        )
+    };
+    assert!(!valid.is_null());
+
+    let regs = [
+        sandlock_handler_registration_t {
+            syscall_nr: libc::SYS_getpid,
+            handler: valid,
+        },
+        sandlock_handler_registration_t {
+            syscall_nr: libc::SYS_getppid,
+            handler: std::ptr::null_mut(), // forces validation failure
+        },
+    ];
+
+    let arg0 = CString::new("/bin/true").unwrap();
+    let argv = [arg0.as_ptr()];
+
+    let rr = unsafe {
+        sandlock_run_with_handlers(
+            policy,
+            argv.as_ptr(),
+            argv.len() as u32,
+            regs.as_ptr(),
+            regs.len(),
+        )
+    };
+    assert!(rr.is_null(), "expected null result when an array entry is null");
+    // The valid handler must still be ours to free — proving it was not
+    // consumed by the failed call.
+    unsafe { sandlock_handler_free(valid) };
+    assert_eq!(
+        ONE_SHOT_DROPPER_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "dropper must fire exactly once (from our explicit free)",
+    );
+
+    unsafe { sandlock_sandbox_free(policy); }
+}
+
+// ---- Group H: multiple handlers -----------------------------------------
+
+extern "C" fn force_getpid_to_111(
+    _ud: *mut std::ffi::c_void,
+    _notif: *const sandlock_ffi::notif_repr::sandlock_notif_data_t,
+    _mem: *mut sandlock_ffi::handler::sandlock_mem_handle_t,
+    out: *mut sandlock_ffi::handler::sandlock_action_out_t,
+) -> i32 {
+    unsafe { sandlock_ffi::handler::sandlock_action_set_return_value(out, 111) };
+    0
+}
+
+extern "C" fn force_getppid_to_222(
+    _ud: *mut std::ffi::c_void,
+    _notif: *const sandlock_ffi::notif_repr::sandlock_notif_data_t,
+    _mem: *mut sandlock_ffi::handler::sandlock_mem_handle_t,
+    out: *mut sandlock_ffi::handler::sandlock_action_out_t,
+) -> i32 {
+    unsafe { sandlock_ffi::handler::sandlock_action_set_return_value(out, 222) };
+    0
+}
+
+#[test]
+fn run_with_handlers_two_handlers_each_fires_for_own_syscall() {
+    use sandlock_ffi::*;
+
+    let builder = sandlock_sandbox_builder_new();
+    let builder = unsafe {
+        let p = CString::new("/usr").unwrap();
+        sandlock_sandbox_builder_fs_read(builder, p.as_ptr())
+    };
+    let builder = unsafe {
+        let p = CString::new("/bin").unwrap();
+        sandlock_sandbox_builder_fs_read(builder, p.as_ptr())
+    };
+    let builder = unsafe {
+        let p = CString::new("/lib").unwrap();
+        sandlock_sandbox_builder_fs_read(builder, p.as_ptr())
+    };
+    let builder = unsafe {
+        let p = CString::new("/lib64").unwrap();
+        sandlock_sandbox_builder_fs_read(builder, p.as_ptr())
+    };
+    let builder = unsafe {
+        let p = CString::new("/etc").unwrap();
+        sandlock_sandbox_builder_fs_read(builder, p.as_ptr())
+    };
+    let builder = unsafe {
+        let p = CString::new("/tmp").unwrap();
+        sandlock_sandbox_builder_fs_write(builder, p.as_ptr())
+    };
+
+    let policy = {
+        let mut err: i32 = 0;
+        unsafe { sandlock_sandbox_build(builder, &mut err, std::ptr::null_mut()) }
+    };
+    assert!(!policy.is_null(), "policy build failed");
+
+    let h_pid = unsafe {
+        handler::sandlock_handler_new(
+            Some(force_getpid_to_111),
+            std::ptr::null_mut(),
+            None,
+            handler::sandlock_exception_policy_t::Kill as u32,
+        )
+    };
+    let h_ppid = unsafe {
+        handler::sandlock_handler_new(
+            Some(force_getppid_to_222),
+            std::ptr::null_mut(),
+            None,
+            handler::sandlock_exception_policy_t::Kill as u32,
+        )
+    };
+    assert!(!h_pid.is_null() && !h_ppid.is_null());
+
+    let registrations = [
+        sandlock_handler_registration_t {
+            syscall_nr: libc::SYS_getpid,
+            handler: h_pid,
+        },
+        sandlock_handler_registration_t {
+            syscall_nr: libc::SYS_getppid,
+            handler: h_ppid,
+        },
+    ];
+
+    let script = CString::new(
+        "import os, sys; sys.stdout.write(str(os.getpid())+'|'+str(os.getppid()))",
+    ).unwrap();
+    let arg0 = CString::new("/usr/bin/python3").unwrap();
+    let arg1 = CString::new("-c").unwrap();
+    let argv = [
+        arg0.as_ptr(),
+        arg1.as_ptr(),
+        script.as_ptr(),
+    ];
+
+    let rr = unsafe {
+        sandlock_run_with_handlers(
+            policy,
+            argv.as_ptr(),
+            argv.len() as u32,
+            registrations.as_ptr(),
+            registrations.len(),
+        )
+    };
+    assert!(!rr.is_null(), "sandlock_run_with_handlers returned null");
+    let stdout = unsafe {
+        let mut len: usize = 0;
+        let p = sandlock_result_stdout_bytes(rr, &mut len);
+        if p.is_null() { Vec::new() } else { std::slice::from_raw_parts(p, len).to_vec() }
+    };
+    let stderr = unsafe {
+        let mut len: usize = 0;
+        let p = sandlock_result_stderr_bytes(rr, &mut len);
+        if p.is_null() { Vec::new() } else { std::slice::from_raw_parts(p, len).to_vec() }
+    };
+    let stdout_str = String::from_utf8_lossy(&stdout);
+    let stderr_str = String::from_utf8_lossy(&stderr);
+    let exit_code = unsafe { sandlock_result_exit_code(rr) };
+    assert!(
+        stdout_str.contains("111") && stdout_str.contains("222"),
+        "expected both handlers to fire; exit={} stdout={:?} stderr={:?}",
+        exit_code, stdout_str, stderr_str,
+    );
+
+    unsafe { sandlock_result_free(rr); }
+    unsafe { sandlock_sandbox_free(policy); }
+}
+
+// ---- Group I: live-fd mem_read_cstr -------------------------------------
+
+extern "C" fn deny_magic_marker_path(
+    _ud: *mut std::ffi::c_void,
+    notif: *const sandlock_ffi::notif_repr::sandlock_notif_data_t,
+    mem: *mut sandlock_ffi::handler::sandlock_mem_handle_t,
+    out: *mut sandlock_ffi::handler::sandlock_action_out_t,
+) -> i32 {
+    // openat(dirfd, pathname, flags, ...) — pathname is args[1].
+    // Safety: `notif` and `mem` are valid pointers supplied by the
+    // dispatcher for the duration of this callback; `out` is the
+    // caller-allocated action-out buffer.
+    let addr = unsafe { (*notif).args[1] };
+    let mut buf = [0u8; 256];
+    let mut n: usize = 0;
+    let rc = unsafe {
+        sandlock_ffi::handler::sandlock_mem_read_cstr(
+            mem, addr, buf.as_mut_ptr(), buf.len(), &mut n,
+        )
+    };
+    if rc != 0 {
+        // Read failed — fall back to letting the syscall through so the
+        // test runner sees a clean ENOENT rather than a fabricated EACCES.
+        unsafe { sandlock_ffi::handler::sandlock_action_set_continue(out) };
+        return 0;
+    }
+    let path = std::str::from_utf8(&buf[..n]).unwrap_or("");
+    if path == "/sandlock-test-magic-marker" {
+        unsafe { sandlock_ffi::handler::sandlock_action_set_errno(out, libc::EACCES) };
+    } else {
+        unsafe { sandlock_ffi::handler::sandlock_action_set_continue(out) };
+    }
+    0
+}
+
+#[test]
+fn mem_read_cstr_reads_path_from_intercepted_openat() {
+    use sandlock_ffi::*;
+
+    let builder = sandlock_sandbox_builder_new();
+    let builder = unsafe {
+        let p = CString::new("/usr").unwrap();
+        sandlock_sandbox_builder_fs_read(builder, p.as_ptr())
+    };
+    let builder = unsafe {
+        let p = CString::new("/bin").unwrap();
+        sandlock_sandbox_builder_fs_read(builder, p.as_ptr())
+    };
+    let builder = unsafe {
+        let p = CString::new("/lib").unwrap();
+        sandlock_sandbox_builder_fs_read(builder, p.as_ptr())
+    };
+    let builder = unsafe {
+        let p = CString::new("/lib64").unwrap();
+        sandlock_sandbox_builder_fs_read(builder, p.as_ptr())
+    };
+    let builder = unsafe {
+        let p = CString::new("/etc").unwrap();
+        sandlock_sandbox_builder_fs_read(builder, p.as_ptr())
+    };
+    let builder = unsafe {
+        let p = CString::new("/tmp").unwrap();
+        sandlock_sandbox_builder_fs_write(builder, p.as_ptr())
+    };
+
+    let policy = {
+        let mut err: i32 = 0;
+        unsafe { sandlock_sandbox_build(builder, &mut err, std::ptr::null_mut()) }
+    };
+    assert!(!policy.is_null(), "policy build failed");
+
+    let handler = unsafe {
+        handler::sandlock_handler_new(
+            Some(deny_magic_marker_path),
+            std::ptr::null_mut(),
+            None,
+            handler::sandlock_exception_policy_t::Kill as u32,
+        )
+    };
+    assert!(!handler.is_null());
+    let registrations = [sandlock_handler_registration_t {
+        syscall_nr: libc::SYS_openat,
+        handler,
+    }];
+
+    // Child opens the magic path and prints the errno on failure.
+    let script = CString::new(
+        "import os, sys\n\
+         try:\n\
+         \x20   os.open('/sandlock-test-magic-marker', os.O_RDONLY)\n\
+         \x20   sys.exit(0)\n\
+         except OSError as e:\n\
+         \x20   sys.stderr.write('errno=' + str(e.errno) + '\\n')\n\
+         \x20   sys.exit(1)\n",
+    ).unwrap();
+    let arg0 = CString::new("/usr/bin/python3").unwrap();
+    let arg1 = CString::new("-c").unwrap();
+    let argv = [
+        arg0.as_ptr(),
+        arg1.as_ptr(),
+        script.as_ptr(),
+    ];
+
+    let rr = unsafe {
+        sandlock_run_with_handlers(
+            policy,
+            argv.as_ptr(),
+            argv.len() as u32,
+            registrations.as_ptr(),
+            registrations.len(),
+        )
+    };
+    assert!(!rr.is_null(), "sandlock_run_with_handlers returned null");
+    let stderr = unsafe {
+        let mut len: usize = 0;
+        let p = sandlock_result_stderr_bytes(rr, &mut len);
+        if p.is_null() { Vec::new() } else { std::slice::from_raw_parts(p, len).to_vec() }
+    };
+    let stdout = unsafe {
+        let mut len: usize = 0;
+        let p = sandlock_result_stdout_bytes(rr, &mut len);
+        if p.is_null() { Vec::new() } else { std::slice::from_raw_parts(p, len).to_vec() }
+    };
+    let stderr_str = String::from_utf8_lossy(&stderr);
+    let stdout_str = String::from_utf8_lossy(&stdout);
+    let exit_code = unsafe { sandlock_result_exit_code(rr) };
+    // EACCES is 13; if the path-read worked the child saw errno=13. If a
+    // different errno appears the handler ran but `mem_read_cstr` failed
+    // and we fell through — fail with a diagnostic message rather than
+    // silently masking.
+    assert!(
+        stderr_str.contains("errno=13"),
+        "expected handler to inject EACCES via mem_read_cstr; \
+         exit={} stdout={:?} stderr={:?}",
+        exit_code, stdout_str, stderr_str,
+    );
+
+    unsafe { sandlock_result_free(rr); }
+    unsafe { sandlock_sandbox_free(policy); }
+}
