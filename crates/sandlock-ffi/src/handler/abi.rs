@@ -370,10 +370,14 @@ unsafe impl Sync for sandlock_handler_t {}
 impl Drop for sandlock_handler_t {
     fn drop(&mut self) {
         if let Some(drop_fn) = self.ud_drop.take() {
-            if !self.ud.is_null() {
-                (drop_fn)(self.ud);
-                self.ud = std::ptr::null_mut();
-            }
+            // Per the C header contract on `sandlock_handler_ud_drop_t`:
+            // the dropper fires exactly once when the container is freed,
+            // regardless of whether `ud` is null. C callers that store
+            // metadata via `ud_drop` (e.g., for lifecycle logging) need
+            // the call even with null ud; idiomatic C dropper code can
+            // mirror `free(NULL)` semantics on its own.
+            (drop_fn)(self.ud);
+            self.ud = std::ptr::null_mut();
         }
     }
 }

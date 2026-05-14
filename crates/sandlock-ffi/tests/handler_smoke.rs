@@ -1068,8 +1068,13 @@ async fn ffi_handler_callback_returns_zero_but_never_sets_action_triggers_fallba
 
 // ---- Group F: handler_new edge cases ------------------------------------
 
-extern "C-unwind" fn panicking_dropper(_ud: *mut std::ffi::c_void) {
-    panic!("dropper invoked when it should not have been");
+static NULL_UD_DROP_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+extern "C-unwind" fn counting_null_ud_dropper(ud: *mut std::ffi::c_void) {
+    // Sanity: confirm the dropper sees the null ud we passed in.
+    assert!(ud.is_null(), "dropper invoked with non-null ud unexpectedly");
+    NULL_UD_DROP_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 }
 
 #[test]
@@ -1086,22 +1091,32 @@ fn handler_new_with_null_handler_fn_returns_null() {
 }
 
 #[test]
-fn handler_new_with_null_ud_and_dropper_does_not_invoke_dropper() {
-    // Allocates a container with a destructor but null ud; the `Drop`
-    // impl on `sandlock_handler_t` must skip the destructor in that case
-    // because there is nothing to free.
+fn handler_new_with_null_ud_still_invokes_dropper() {
+    // C header guarantees ud_drop fires exactly once on free, regardless
+    // of whether ud is null. C-side droppers can mirror free(NULL)
+    // semantics themselves; the Rust container does not gate on ud.
+
+    NULL_UD_DROP_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
     let h = unsafe {
         sandlock_handler_new(
             Some(test_handler as sandlock_handler_fn_t),
-            std::ptr::null_mut(),
-            Some(panicking_dropper),
+            std::ptr::null_mut(), // <-- null ud
+            Some(counting_null_ud_dropper),
             sandlock_exception_policy_t::Kill as u32,
         )
     };
-    assert!(!h.is_null(), "expected a valid handler container");
-    // Safety: `h` was just produced and not yet freed. If the guard in
-    // `Drop` were missing the dropper would panic and abort the test.
+    assert!(!h.is_null());
+    assert_eq!(
+        NULL_UD_DROP_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "dropper must not fire before sandlock_handler_free",
+    );
     unsafe { sandlock_handler_free(h) };
+    assert_eq!(
+        NULL_UD_DROP_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "dropper must fire exactly once during Drop",
+    );
 }
 
 // ---- Group G: run_with_handlers failure paths ---------------------------
@@ -1820,9 +1835,10 @@ fn a3_run_with_handlers_releases_registrations_on_null_policy() {
     // consumes every non-null handler pointer on entry, regardless of
     // return value.
     A3_UD_DROPPER_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
-    // Non-null ud — the `Drop` impl on `sandlock_handler_t` only fires
-    // the dropper when `ud` is non-null. The dropper itself ignores
-    // the value, so any non-null bit pattern works.
+    // Non-null ud — the dropper itself ignores the value, so any
+    // non-null bit pattern works. (Null ud would also fire the
+    // dropper per the C header contract; we just pick a non-null
+    // sentinel here for clarity of intent.)
     let h = unsafe {
         sandlock_handler_new(
             Some(test_handler as sandlock_handler_fn_t),
@@ -1888,8 +1904,9 @@ fn release_registrations_continues_after_mid_loop_panic() {
     let h1 = unsafe {
         sandlock_handler_new(
             Some(test_handler as sandlock_handler_fn_t),
-            // Non-null ud so the `Drop` impl fires the dropper. The
-            // dropper does not read the pointer.
+            // Non-null ud sentinel; the dropper does not read the
+            // pointer. Null ud would also fire the dropper per the
+            // C header contract.
             0xDEAD_BEEFusize as *mut std::ffi::c_void,
             Some(c_new_1_dropper_a),
             sandlock_exception_policy_t::Kill as u32,
@@ -1955,9 +1972,10 @@ fn a5_handler_free_unwinds_on_panicking_dropper() {
     let h = unsafe {
         sandlock_handler_new(
             Some(test_handler as sandlock_handler_fn_t),
-            // Non-null ud so the `Drop` impl invokes the dropper. Any
-            // non-null bit pattern works because the dropper itself
-            // never reads through the pointer — it just panics.
+            // Any non-null bit pattern works because the dropper
+            // itself never reads through the pointer — it just panics.
+            // Null ud would also fire the dropper per the C header
+            // contract.
             0xDEAD_BEEFusize as *mut std::ffi::c_void,
             Some(a5_panicking_dropper),
             sandlock_exception_policy_t::Kill as u32,
