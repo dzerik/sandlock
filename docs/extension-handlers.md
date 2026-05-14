@@ -163,7 +163,7 @@ Errors at registration time, before fork:
 - `SyscallError::Negative` / `SyscallError::UnknownForArch` from `Syscall::checked` (wrapped in
   `HandlerError::InvalidSyscall`, then in `SandlockError::Handler`).
 - `HandlerError::OnDenySyscall` if any registered syscall is in Sandlock's default syscall
-  blocklist or the policy's extra `block_syscalls` list (see [Security boundary](#security-boundary)).
+  blocklist or the policy's `extra_deny_syscalls` list (see [Security boundary](#security-boundary)).
 
 ### Interactive mode
 
@@ -432,7 +432,7 @@ returns the error without enqueueing the handler.
 The cBPF program emits notif JEQs *before* deny JEQs, so a syscall present in both lists
 hits `SECCOMP_RET_USER_NOTIF` first. A handler registered on a syscall in
 [`DEFAULT_BLOCKLIST_SYSCALLS`](../crates/sandlock-core/src/sys/structs.rs) — or in the policy's
-extra `block_syscalls` list — would convert a kernel-deny into a user-supervised
+`extra_deny_syscalls` list — would convert a kernel-deny into a user-supervised
 path; a handler returning `NotifAction::Continue` would become
 `SECCOMP_USER_NOTIF_FLAG_CONTINUE` and the kernel would actually run the syscall, silently
 bypassing deny.
@@ -441,7 +441,7 @@ bypassing deny.
 `HandlerError::OnDenySyscall { syscall_nr }`. The check is implemented in
 [`validate_handler_syscalls_against_policy`](../crates/sandlock-core/src/seccomp/dispatch.rs)
 and covers both the default blocklist (`DEFAULT_BLOCKLIST_SYSCALLS`) and the
-user-specified extras (`block_syscalls`); both branches are tested
+user-specified extras (`extra_deny_syscalls`); both branches are tested
 (`validate_extras_rejects_user_specified_blocklist`,
 `extra_handler_on_default_blocklist_syscall_is_rejected`,
 `run_with_extra_handlers_rejects_handler_on_default_blocklist_syscall`,
