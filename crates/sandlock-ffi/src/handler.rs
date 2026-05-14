@@ -917,12 +917,19 @@ unsafe fn run_with_handlers_inner(
             return std::ptr::null_mut();
         }
     };
-    // `collect_registrations` is itself transactional: on failure it
-    // doesn't consume any handlers. Preserve that contract — the
-    // caller still owns them on a `None` return from this point.
     let handlers = match collect_registrations(registrations, nregistrations) {
         Some(v) => v,
-        None => return std::ptr::null_mut(),
+        None => {
+            // Validation failed (null handler in the array). The
+            // non-null handlers in the array have not been taken into
+            // FfiHandler ownership by `collect_registrations` (it is
+            // validate-first), but the public C-ABI contract guarantees
+            // "array consumed as a whole" — release them here so the C
+            // caller is never responsible for any registered pointer
+            // after this call returns.
+            release_registrations(registrations, nregistrations);
+            return std::ptr::null_mut();
+        }
     };
     let sandbox_ref: &Sandbox = (*policy).inner();
     match block_on_run(sandbox_ref, name_opt, cmd, handlers, interactive) {

@@ -1143,11 +1143,13 @@ fn run_with_handlers_null_handler_in_array_returns_null() {
     };
     assert!(!policy.is_null(), "policy build failed");
 
-    // The validating handler must NOT be consumed by `sandlock_run_with_handlers`
-    // when validation fails — the call should be transactional. We assert this
-    // by registering `one_shot_dropper` and verifying it fires exactly once
-    // (from our explicit `sandlock_handler_free` call below, not from
-    // `sandlock_run_with_handlers`).
+    // The supervisor owns and frees the valid handler even when the
+    // call rejects the array because of a null entry. We assert this
+    // by registering `one_shot_dropper` and verifying it fires
+    // exactly once — from the supervisor's `release_registrations`,
+    // not from a manual `sandlock_handler_free` (which would now be
+    // a double-free per the always-consume contract documented in
+    // sandlock.h).
     ONE_SHOT_DROPPER_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
     let ud = Box::into_raw(Box::new(0xAAu32)) as *mut std::ffi::c_void;
     let valid = unsafe {
@@ -1185,13 +1187,10 @@ fn run_with_handlers_null_handler_in_array_returns_null() {
         )
     };
     assert!(rr.is_null(), "expected null result when an array entry is null");
-    // The valid handler must still be ours to free — proving it was not
-    // consumed by the failed call.
-    unsafe { sandlock_handler_free(valid) };
     assert_eq!(
         ONE_SHOT_DROPPER_CALLS.load(std::sync::atomic::Ordering::SeqCst),
         1,
-        "dropper must fire exactly once (from our explicit free)",
+        "dropper must fire exactly once (from the supervisor's release_registrations)",
     );
 
     unsafe { sandlock_sandbox_free(policy); }
