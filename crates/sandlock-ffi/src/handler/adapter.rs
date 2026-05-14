@@ -17,9 +17,16 @@ use super::abi::{
 };
 
 /// Sentinel for "we cannot safely resolve a process-group id for the
-/// trapped child." `i32::MIN` is not a valid pgid: `killpg(i32::MIN, _)`
-/// returns `ESRCH` rather than harming the supervisor or any real
-/// process group. Used in two places:
+/// trapped child." The value `i32::MIN` is never produced by
+/// `getpgid()` for a real process group, so it cannot be confused with
+/// a legitimately resolved pgid.
+///
+/// Safety does NOT rely on `killpg(i32::MIN, _)` being harmless: since
+/// `killpg(pgrp)` is defined as `kill(-pgrp)` and negating `i32::MIN`
+/// overflows, the resulting `kill()` target is not well-defined. The
+/// real guarantee is that every consumer checks the sentinel
+/// explicitly before it could reach a syscall, and none of them emit a
+/// Kill action carrying it:
 ///
 ///   * adapter.rs `child_pgid` resolution falls back to this when the
 ///     bare pid would otherwise be `0` (POSIX `killpg(0)` would target

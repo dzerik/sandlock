@@ -216,15 +216,34 @@ void sandlock_action_set_inject_fd_send(sandlock_action_out_t *out,
  * actions left with that kind tag are treated as `UNSET` and routed
  * through the handler's exception policy. */
 void sandlock_action_set_hold(sandlock_action_out_t *out);
-/** Kill action setter. `pgid == 0` is a sentinel — the supervisor
+/** Kill action setter. `pgid == 0` is a sentinel: the supervisor
  *  substitutes the child process group id (resolved via getpgid(pid)
  *  on the notification's pid). To target a specific group, pass an
- *  explicit non-zero pgid. */
+ *  explicit non-zero pgid.
+ *
+ *  If the supervisor cannot resolve a safe process group id for the
+ *  child, the Kill action is refused and the notification is routed
+ *  through the handler's exception policy instead. This happens when
+ *  the notification pid is <= 0, when getpgid() fails, or when the
+ *  resolved pgid collides with the supervisor's own group (all
+ *  reachable in nested PID namespaces, e.g. Kubernetes pod-in-pod).
+ *  An explicit non-zero pgid is likewise refused if it matches the
+ *  supervisor's own process group. */
 void sandlock_action_set_kill(sandlock_action_out_t *out, int32_t sig, int32_t pgid);
 
+/** Policy applied when a handler callback fails to set a valid action:
+ *  it returns non-zero, leaves the action UNSET, or panics across the
+ *  FFI boundary (Rust handlers only). */
 typedef enum sandlock_exception_policy {
+    /** Kill the child process group with SIGKILL. Fail-closed, and the
+     *  default. If no safe process group id is available for the child
+     *  (see `sandlock_action_set_kill`), this degrades to failing the
+     *  syscall with EPERM rather than risk signalling the supervisor's
+     *  own process group. */
     SANDLOCK_EXCEPTION_KILL       = 0,
+    /** Fail the syscall with EPERM. */
     SANDLOCK_EXCEPTION_DENY_EPERM = 1,
+    /** Let the syscall continue unchanged (explicit fail-open). */
     SANDLOCK_EXCEPTION_CONTINUE   = 2,
 } sandlock_exception_policy_t;
 
@@ -283,6 +302,11 @@ typedef struct sandlock_handler_registration_t {
  * `name` may be NULL to auto-generate as `sandbox-{pid}`, mirroring the
  * convention used by `sandlock_run`.
  *
+ * Must not be called from a thread already running a Tokio runtime.
+ * This function builds and drives its own runtime internally; calling
+ * it from within an existing runtime panics, and the panic unwinds
+ * across the FFI boundary via this function's `extern "C-unwind"` ABI.
+ *
  * Ownership of every `registrations[i].handler` pointer transfers into
  * the call on entry. After this function returns, the caller MUST NOT
  * call `sandlock_handler_free` on any handler pointer that was passed
@@ -304,6 +328,11 @@ sandlock_result_t *sandlock_run_with_handlers(
  *
  * `name` may be NULL to auto-generate as `sandbox-{pid}`, mirroring the
  * convention used by `sandlock_run_interactive`.
+ *
+ * Must not be called from a thread already running a Tokio runtime.
+ * This function builds and drives its own runtime internally; calling
+ * it from within an existing runtime panics, and the panic unwinds
+ * across the FFI boundary via this function's `extern "C-unwind"` ABI.
  *
  * Ownership of every `registrations[i].handler` pointer transfers into
  * the call on entry. After this function returns, the caller MUST NOT
