@@ -12,6 +12,9 @@ use sandlock_core::pipeline::Stage;
 use sandlock_core::sandbox::{BranchAction, ByteSize, FsIsolation, SandboxBuilder};
 use sandlock_core::{Sandbox, RunResult};
 
+pub mod handler;
+pub mod notif_repr;
+
 // ----------------------------------------------------------------
 // Opaque wrapper types
 // ----------------------------------------------------------------
@@ -20,6 +23,24 @@ use sandlock_core::{Sandbox, RunResult};
 #[repr(C)]
 pub struct sandlock_sandbox_t {
     _private: Sandbox,
+}
+
+impl sandlock_sandbox_t {
+    /// Crate-private accessor used by `handler.rs` to reach the inner
+    /// `Sandbox` when wiring `sandlock_run_with_handlers`. Public-API
+    /// callers still go through the opaque-pointer functions in this
+    /// module.
+    pub(crate) fn inner(&self) -> &Sandbox {
+        &self._private
+    }
+}
+
+impl sandlock_result_t {
+    /// Crate-private constructor used by `handler.rs` to wrap a
+    /// freshly-produced [`RunResult`] in the opaque public type.
+    pub(crate) fn from_run_result(rr: RunResult) -> Self {
+        Self { _private: rr }
+    }
 }
 
 /// Opaque handle wrapping a [`RunResult`].

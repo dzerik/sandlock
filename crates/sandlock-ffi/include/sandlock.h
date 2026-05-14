@@ -118,6 +118,209 @@ sandlock_result_t *sandlock_pipeline_run(sandlock_pipeline_t *pipe, uint64_t tim
 
 void sandlock_pipeline_free(sandlock_pipeline_t *pipe);
 
+/* ----------------------------------------------------------------
+ * Handler ABI — extension handlers for seccomp-notif syscalls.
+ * ---------------------------------------------------------------- */
+
+/** Snapshot of a kernel seccomp notification. Field layout must stay
+ *  in lock-step with `sandlock_ffi::notif_repr::sandlock_notif_data_t`. */
+typedef struct sandlock_notif_data_t {
+    uint64_t id;
+    uint32_t pid;
+    uint32_t flags;
+    int32_t  syscall_nr;
+    uint32_t arch;
+    uint64_t instruction_pointer;
+    uint64_t args[6];
+} sandlock_notif_data_t;
+
+/** Opaque child-memory accessor (lifetime: single callback invocation). */
+typedef struct sandlock_mem_handle_t sandlock_mem_handle_t;
+
+/** Read a NUL-terminated string. Returns 0 on success, -1 on failure.
+ *  On success the buffer is NUL-terminated and `*out_len` holds the byte
+ *  count copied (excluding NUL); `max_len` must be at least 1 to fit the
+ *  NUL. */
+int sandlock_mem_read_cstr(const sandlock_mem_handle_t *handle,
+                           uint64_t addr,
+                           uint8_t *buf, size_t max_len,
+                           size_t *out_len);
+
+/** Raw memory read. Returns 0/-1; `*out_len` holds actual bytes copied. */
+int sandlock_mem_read(const sandlock_mem_handle_t *handle,
+                      uint64_t addr,
+                      uint8_t *buf, size_t len,
+                      size_t *out_len);
+
+/** Raw memory write. Returns 0/-1. */
+int sandlock_mem_write(const sandlock_mem_handle_t *handle,
+                       uint64_t addr,
+                       const uint8_t *buf, size_t len);
+
+typedef enum sandlock_action_kind {
+    SANDLOCK_ACTION_UNSET                  = 0,
+    SANDLOCK_ACTION_CONTINUE               = 1,
+    SANDLOCK_ACTION_ERRNO                  = 2,
+    SANDLOCK_ACTION_RETURN_VALUE           = 3,
+    SANDLOCK_ACTION_INJECT_FD_SEND         = 4,
+    SANDLOCK_ACTION_INJECT_FD_SEND_TRACKED = 5,
+    SANDLOCK_ACTION_HOLD                   = 6,
+    SANDLOCK_ACTION_KILL                   = 7,
+} sandlock_action_kind_t;
+
+typedef struct { int32_t sig; int32_t pgid; } sandlock_action_kill_t;
+
+typedef struct {
+    int32_t  srcfd;
+    uint32_t newfd_flags;
+} sandlock_action_inject_t;
+
+typedef uint64_t sandlock_inject_tracker_t;
+
+typedef struct {
+    int32_t  srcfd;
+    uint32_t newfd_flags;
+    sandlock_inject_tracker_t tracker;
+} sandlock_action_inject_tracked_t;
+
+typedef union {
+    uint64_t none;
+    int32_t  errno_value;
+    int64_t  return_value;
+    sandlock_action_inject_t         inject_send;
+    sandlock_action_inject_tracked_t inject_send_tracked;
+    sandlock_action_kill_t           kill;
+} sandlock_action_payload_t;
+
+typedef struct sandlock_action_out_t {
+    uint32_t kind;                       /* sandlock_action_kind_t */
+    sandlock_action_payload_t payload;
+} sandlock_action_out_t;
+
+/* Setters — exactly one tag is written; the payload is filled in
+ * accordingly. Calling a setter overwrites any prior setting. */
+void sandlock_action_set_continue(sandlock_action_out_t *out);
+void sandlock_action_set_errno(sandlock_action_out_t *out, int32_t errno_value);
+void sandlock_action_set_return_value(sandlock_action_out_t *out, int64_t value);
+/** Ownership of `srcfd` transfers from the caller to the supervisor
+ *  only when the resulting action is actually dispatched. If the
+ *  caller subsequently calls a different setter on the same
+ *  `sandlock_action_out_t` (overwriting the kind tag before the
+ *  supervisor reads it), `srcfd` is NOT closed and leaks. Pick one
+ *  setter per action. */
+void sandlock_action_set_inject_fd_send(sandlock_action_out_t *out,
+                                        int32_t srcfd, uint32_t newfd_flags);
+/* NOTE: `SANDLOCK_ACTION_INJECT_FD_SEND_TRACKED` (= 5) and
+ * `sandlock_action_inject_tracked_t` are reserved for a future
+ * tracker-aware inject variant. No setter is exposed in this release;
+ * actions left with that kind tag are treated as `UNSET` and routed
+ * through the handler's exception policy. */
+void sandlock_action_set_hold(sandlock_action_out_t *out);
+/** Kill action setter. `pgid == 0` is a sentinel — the supervisor
+ *  substitutes the child process group id (resolved via getpgid(pid)
+ *  on the notification's pid). To target a specific group, pass an
+ *  explicit non-zero pgid. */
+void sandlock_action_set_kill(sandlock_action_out_t *out, int32_t sig, int32_t pgid);
+
+typedef enum sandlock_exception_policy {
+    SANDLOCK_EXCEPTION_KILL       = 0,
+    SANDLOCK_EXCEPTION_DENY_EPERM = 1,
+    SANDLOCK_EXCEPTION_CONTINUE   = 2,
+} sandlock_exception_policy_t;
+
+/** Opaque handler container.
+ *
+ * Ownership: allocated by `sandlock_handler_new` and freed by either
+ * `sandlock_handler_free` (if never registered) or by the supervisor
+ * after a successful or failed `sandlock_run_with_handlers` call.
+ *
+ * Thread safety: the supervisor MAY invoke the handler callback from
+ * multiple worker threads concurrently across different notifications
+ * (today's dispatch loop is largely serial; the public ABI makes no
+ * concurrency guarantee, so a future dispatcher could parallelise
+ * without breaking compatibility). The caller MUST ensure their `ud`
+ * pointer is thread-safe — either immutable, or guarded by their own
+ * synchronization primitives (atomics, mutex, etc.). Rust provides no
+ * synchronization for an opaque `void*`. */
+typedef struct sandlock_handler_t sandlock_handler_t;
+
+/** C handler signature. Return 0 on success; a non-zero return triggers
+ *  the handler's exception policy. The callee MUST call exactly one
+ *  sandlock_action_set_*() on `out` before returning 0.
+ *
+ *  Thread safety: see `sandlock_handler_t` — this function may be
+ *  invoked concurrently from multiple worker threads. Any state
+ *  reachable through `ud` must be thread-safe. */
+typedef int (*sandlock_handler_fn_t)(void *ud,
+                                     const sandlock_notif_data_t *notif,
+                                     sandlock_mem_handle_t *mem,
+                                     sandlock_action_out_t *out);
+
+typedef void (*sandlock_handler_ud_drop_t)(void *ud);
+
+/** Allocate a handler container. Returns NULL when `handler_fn` is NULL
+ *  or when `on_exception` is not one of the documented `SANDLOCK_EXCEPTION_*`
+ *  values.
+ *
+ *  `ud` must be thread-safe to access — see `sandlock_handler_t` for
+ *  the concurrency contract. `ud_drop`, if non-NULL, is invoked exactly
+ *  once when the container is freed. */
+sandlock_handler_t *sandlock_handler_new(sandlock_handler_fn_t handler_fn,
+                                         void *ud,
+                                         sandlock_handler_ud_drop_t ud_drop,
+                                         sandlock_exception_policy_t on_exception);
+
+/** Free a handler container that has not been handed to the supervisor. */
+void sandlock_handler_free(sandlock_handler_t *h);
+
+typedef struct sandlock_handler_registration_t {
+    int64_t syscall_nr;
+    sandlock_handler_t *handler; /* ownership transferred on a successful run */
+} sandlock_handler_registration_t;
+
+/** Run the policy with extra C handlers. Returns NULL on failure.
+ *
+ * `name` may be NULL to auto-generate as `sandbox-{pid}`, mirroring the
+ * convention used by `sandlock_run`.
+ *
+ * Ownership of every `registrations[i].handler` pointer transfers into
+ * the call on entry. After this function returns, the caller MUST NOT
+ * call `sandlock_handler_free` on any handler pointer that was passed
+ * in — successful or not, the supervisor is responsible for freeing
+ * the containers (which also invokes the registered `ud_drop`).
+ *
+ * Null handler pointers in the array are treated as a validation error
+ * and the call returns NULL; non-null entries in the same array are
+ * still freed by the supervisor (the array is consumed as a whole). */
+sandlock_result_t *sandlock_run_with_handlers(
+    const sandlock_sandbox_t *policy,
+    const char *name,
+    const char *const *argv, unsigned int argc,
+    const sandlock_handler_registration_t *registrations,
+    size_t nregistrations);
+
+/** Interactive-stdio variant of `sandlock_run_with_handlers`. Returns
+ * NULL on failure.
+ *
+ * `name` may be NULL to auto-generate as `sandbox-{pid}`, mirroring the
+ * convention used by `sandlock_run_interactive`.
+ *
+ * Ownership of every `registrations[i].handler` pointer transfers into
+ * the call on entry. After this function returns, the caller MUST NOT
+ * call `sandlock_handler_free` on any handler pointer that was passed
+ * in — successful or not, the supervisor is responsible for freeing
+ * the containers (which also invokes the registered `ud_drop`).
+ *
+ * Null handler pointers in the array are treated as a validation error
+ * and the call returns NULL; non-null entries in the same array are
+ * still freed by the supervisor (the array is consumed as a whole). */
+sandlock_result_t *sandlock_run_interactive_with_handlers(
+    const sandlock_sandbox_t *policy,
+    const char *name,
+    const char *const *argv, unsigned int argc,
+    const sandlock_handler_registration_t *registrations,
+    size_t nregistrations);
+
 #ifdef __cplusplus
 }
 #endif

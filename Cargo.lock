@@ -1601,6 +1601,7 @@ dependencies = [
 name = "sandlock-ffi"
 version = "0.7.0"
 dependencies = [
+ "libc",
  "sandlock-core",
  "serde_json",
  "tokio",
