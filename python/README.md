@@ -37,6 +37,31 @@ Returns -1 if Landlock is unavailable.
 
 Return the minimum Landlock ABI version required by sandlock (currently 6).
 
+### Confine
+
+Apply a `Sandbox`'s Landlock rules to the **current** process, in
+place. No fork, no exec.
+
+```python
+from sandlock import Sandbox, confine
+
+confine(Sandbox(
+    fs_readable=["/usr", "/lib"],
+    fs_writable=["/tmp"],
+))
+```
+
+#### `sandlock.confine(sandbox) -> None`
+
+Set `PR_SET_NO_NEW_PRIVS` and install the sandbox's Landlock ruleset
+on the live process. The confinement is **irreversible**.
+
+Only Landlock fields are honored (`fs_readable`, `fs_writable`,
+`fs_denied`); IPC and signal scoping are always applied. Sandbox
+config that requires a supervisor or a fresh child (seccomp, network,
+resource limits, COW, env, `policy_fn`, etc.) is rejected rather than
+silently ignored. Raises `ConfinementError` on failure.
+
 ### Sandbox
 
 ```python
@@ -321,6 +346,80 @@ Create a lazy `Stage` bound to this sandbox.
 #### `pipeline.run(stdout=None, timeout=None) -> Result`
 
 Run the pipeline. Each stage's stdout feeds the next stage's stdin.
+
+### Gather
+
+Fan multiple producers into one consumer via named pipes. Each
+producer's stdout is delivered to the consumer under a label the
+consumer reads from a `sandlock.inputs` dict. This is the structural
+primitive behind the XOA pattern: producers and consumer are
+independent sandboxes, and the consumer never executes producer code
+inside its own LLM call.
+
+```python
+from sandlock import Sandbox
+
+planner  = Sandbox(...)   # writes code
+searcher = Sandbox(...)   # produces data
+executor = Sandbox(...)   # consumes both
+
+result = (
+    searcher.cmd(["python3", "-c", "..."]).as_("data")
+    + planner.cmd(["python3", "-c", "..."]).as_("code")
+    | executor.cmd(["python3", "consume.py"])
+).run()
+```
+
+Inside `consume.py`:
+
+```python
+from sandlock import inputs
+
+code = inputs["code"]
+data = inputs["data"]
+exec(compile(code, "<planner>", "exec"), {"data": data})
+```
+
+#### `stage.as_(name) -> NamedStage`
+
+Label a `Stage`'s stdout so the consumer can address it by name.
+
+#### `named_stage + named_stage_or_gather -> Gather`
+
+Combine two or more `NamedStage` values into a `Gather`. Repeated `+`
+extends the gather:
+
+```python
+g = a.as_("x") + b.as_("y") + c.as_("z")
+```
+
+#### `gather | consumer_stage -> GatherPipeline`
+
+Compose a `Gather` with a consumer `Stage` to form the runnable
+pipeline.
+
+#### `gather_pipeline.run(timeout=None) -> Result`
+
+Run all producers in parallel; each producer's stdout is wired to a
+pipe the consumer reads via `inputs[name]`. Returns the consumer's
+`Result`.
+
+#### `sandlock.inputs`
+
+Lazy dict-like accessor available inside the consumer process. Reads
+each producer's pipe on first access and caches the value.
+
+```python
+from sandlock import inputs
+
+inputs["code"]        # str: the producer's full stdout, decoded as utf-8
+"data" in inputs      # bool
+list(inputs.keys())   # ["data", "code"]
+```
+
+The pipe fds are passed via the `_SANDLOCK_GATHER` env var
+(`name:fd,name:fd,...`); the `inputs` object parses it on first
+access. Users do not interact with the env var directly.
 
 ### Dynamic policy
 
