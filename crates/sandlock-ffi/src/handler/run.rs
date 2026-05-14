@@ -12,6 +12,20 @@ use sandlock_core::{RunResult, Sandbox, SandlockError};
 use super::abi::sandlock_handler_registration_t;
 use super::adapter::FfiHandler;
 
+/// Defensive upper bound on `argc`. Linux's `ARG_MAX` is typically
+/// 128 KiB-2 MiB of *characters* across all argv+envp; an argv with
+/// 4096 entries is already preposterous in practice. Bounding here
+/// turns a malicious or buggy caller passing `argc = u32::MAX` (which
+/// would otherwise drive an unbounded deref loop) into a fast NULL
+/// return at the FFI boundary.
+const MAX_ARGV: u32 = 4096;
+
+/// Defensive upper bound on `nregistrations`. The kernel exposes
+/// ~400-500 syscalls on Linux; registering even all of them is well
+/// under this cap. Bounding here closes the same unbounded-deref vector
+/// for the registration array.
+const MAX_REGISTRATIONS: usize = 4096;
+
 fn argv_from_c(
     argv: *const *const std::os::raw::c_char,
     argc: u32,
@@ -24,6 +38,12 @@ fn argv_from_c(
     // execute. Failing fast keeps the error surfacing at the FFI
     // boundary where the C caller can react.
     if argc == 0 {
+        return None;
+    }
+    // Reject implausible `argc` values before we start dereferencing
+    // `argv`. Without this cap, a caller passing `argc = u32::MAX`
+    // would have us walk 4 billion pointer slots looking for nulls.
+    if argc > MAX_ARGV {
         return None;
     }
     let mut out = Vec::with_capacity(argc as usize);
@@ -47,6 +67,13 @@ fn collect_registrations(
     }
     if nregs == 0 {
         return Some(Vec::new());
+    }
+    // Bound `nregs` before we materialise the slice. An attacker-supplied
+    // `nregs = usize::MAX` would otherwise hand `slice::from_raw_parts`
+    // a length larger than the underlying allocation — UB. The cap is
+    // generous enough for any legitimate caller.
+    if nregs > MAX_REGISTRATIONS {
+        return None;
     }
     let slice = unsafe { slice::from_raw_parts(regs, nregs) };
     // First pass: validate all entries before taking ownership of any.
@@ -185,6 +212,17 @@ unsafe fn release_registrations(
     nregs: usize,
 ) {
     if regs.is_null() || nregs == 0 {
+        return;
+    }
+    // Apply the same defensive cap as `collect_registrations`. Reach
+    // here from early-return paths in `run_with_handlers_inner` where
+    // `collect_registrations` may not have validated yet — without the
+    // cap, an attacker-supplied `nregs = usize::MAX` would feed
+    // `slice::from_raw_parts` a bogus length. Out-of-range counts
+    // can't have come from a valid registration array; refuse the
+    // walk entirely. The C-ABI "always consume" contract is then
+    // moot because no legitimate caller can hit this branch.
+    if nregs > MAX_REGISTRATIONS {
         return;
     }
     let slice = slice::from_raw_parts(regs, nregs);

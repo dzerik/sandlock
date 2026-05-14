@@ -75,19 +75,36 @@ use sandlock_ffi::handler::{
 #[test]
 fn action_setters_record_kind_and_payload() {
     let mut a = sandlock_action_out_t::zeroed();
+
+    // Plant a sentinel covering the first 8 bytes of the union (the
+    // largest scalar variant) before each tag-only setter. A setter
+    // documented as "kind only" that accidentally stomps the payload
+    // would clobber the sentinel.
+    const SENTINEL: u64 = 0xDEAD_BEEF_CAFE_F00D;
+
+    // Writing through a union field is safe; reading is unsafe (we
+    // might be looking at bytes deposited by a different variant). The
+    // sentinel writes therefore need no `unsafe`, the post-condition
+    // reads do.
+    a.payload.none = SENTINEL;
     unsafe { sandlock_action_set_continue(&mut a) };
     assert_eq!(a.kind, sandlock_action_kind_t::Continue as u32);
+    assert_eq!(unsafe { a.payload.none }, SENTINEL,
+               "set_continue must be tag-only and leave payload untouched");
 
     unsafe { sandlock_action_set_errno(&mut a, 13) };
     assert_eq!(a.kind, sandlock_action_kind_t::Errno as u32);
-    assert_eq!(unsafe { a.payload.errno }, 13);
+    assert_eq!(unsafe { a.payload.errno_value }, 13);
 
     unsafe { sandlock_action_set_return_value(&mut a, -1) };
     assert_eq!(a.kind, sandlock_action_kind_t::ReturnValue as u32);
     assert_eq!(unsafe { a.payload.return_value }, -1);
 
+    a.payload.none = SENTINEL;
     unsafe { sandlock_action_set_hold(&mut a) };
     assert_eq!(a.kind, sandlock_action_kind_t::Hold as u32);
+    assert_eq!(unsafe { a.payload.none }, SENTINEL,
+               "set_hold must be tag-only and leave payload untouched");
 
     unsafe { sandlock_action_set_kill(&mut a, libc::SIGKILL, 4321) };
     assert_eq!(a.kind, sandlock_action_kind_t::Kill as u32);
@@ -474,9 +491,14 @@ fn run_with_handlers_intercepts_getpid() {
     let stdout_str = String::from_utf8_lossy(&stdout);
     let stderr_str = String::from_utf8_lossy(&stderr);
     let exit_code = unsafe { sandlock_result_exit_code(rr) };
-    assert!(stdout_str.contains("777"),
-            "expected getpid to be intercepted; exit={} stdout={:?} stderr={:?}",
-            exit_code, stdout_str, stderr_str);
+    // The child script writes exactly `str(os.getpid())` with
+    // `sys.stdout.write`, so no trailing newline is expected. Match
+    // the full stdout — a substring check would silently pass on a
+    // mutation that broke dispatch when the real pid happened to
+    // contain "777" (pids 7770-7779, 17770-17779, ...).
+    assert_eq!(stdout_str.trim_end_matches('\n'), "777",
+               "expected getpid to be intercepted; exit={} stdout={:?} stderr={:?}",
+               exit_code, stdout_str, stderr_str);
 
     unsafe { sandlock_result_free(rr); }
     unsafe { sandlock_sandbox_free(policy); }
@@ -1221,6 +1243,82 @@ fn run_with_handlers_null_registrations_with_nonzero_count_returns_null() {
 }
 
 #[test]
+fn run_with_handlers_rejects_oversize_argc() {
+    // Defence-in-depth: `argc` is a `u32` from C, so a malicious or
+    // buggy caller could pass e.g. `u32::MAX` with a small backing
+    // array. Without an upper bound, `argv_from_c` would dereference
+    // four billion pointer slots before returning. We cap at 4096
+    // (vastly larger than any plausible argv) and reject anything
+    // above.
+    use sandlock_ffi::*;
+    let builder = sandlock_sandbox_builder_new();
+    let policy = {
+        let mut err: i32 = 0;
+        unsafe { sandlock_sandbox_build(builder, &mut err, std::ptr::null_mut()) }
+    };
+    assert!(!policy.is_null(), "policy build failed");
+
+    let arg0 = CString::new("/bin/true").unwrap();
+    // Backing argv has only one real entry; we lie about argc to
+    // exercise the bound check. The FFI must reject before reading
+    // past the first slot.
+    let argv = [arg0.as_ptr()];
+    let rr = unsafe {
+        sandlock_run_with_handlers(
+            policy,
+            std::ptr::null(),
+            argv.as_ptr(),
+            5000, // > MAX_ARGV (4096)
+            std::ptr::null(),
+            0,
+        )
+    };
+    assert!(rr.is_null(), "expected null result for argc > MAX_ARGV");
+
+    unsafe { sandlock_sandbox_free(policy); }
+}
+
+#[test]
+fn run_with_handlers_rejects_oversize_nregistrations() {
+    // Mirror of `..._oversize_argc` for the registration count.
+    // A `nregistrations = usize::MAX` with a small backing array
+    // would hand `slice::from_raw_parts` a length larger than the
+    // allocation — UB. The FFI must refuse before that point.
+    use sandlock_ffi::*;
+    let builder = sandlock_sandbox_builder_new();
+    let policy = {
+        let mut err: i32 = 0;
+        unsafe { sandlock_sandbox_build(builder, &mut err, std::ptr::null_mut()) }
+    };
+    assert!(!policy.is_null(), "policy build failed");
+
+    let arg0 = CString::new("/bin/true").unwrap();
+    let argv = [arg0.as_ptr()];
+    // Single real registration slot; we lie about the count.
+    // `handler` is null so even if the bound check were bypassed the
+    // validation pass would still fail — that is fine because the
+    // bound check must trip first (a missing check would have us
+    // walk 5000 invalid slots before noticing).
+    let regs = [sandlock_handler_registration_t {
+        syscall_nr: libc::SYS_getpid,
+        handler: std::ptr::null_mut(),
+    }];
+    let rr = unsafe {
+        sandlock_run_with_handlers(
+            policy,
+            std::ptr::null(),
+            argv.as_ptr(),
+            argv.len() as u32,
+            regs.as_ptr(),
+            5000, // > MAX_REGISTRATIONS (4096)
+        )
+    };
+    assert!(rr.is_null(), "expected null result for nregistrations > MAX_REGISTRATIONS");
+
+    unsafe { sandlock_sandbox_free(policy); }
+}
+
+#[test]
 fn run_with_handlers_empty_registrations_runs_normally() {
     use sandlock_ffi::*;
 
@@ -1477,8 +1575,13 @@ fn run_with_handlers_two_handlers_each_fires_for_own_syscall() {
     let stdout_str = String::from_utf8_lossy(&stdout);
     let stderr_str = String::from_utf8_lossy(&stderr);
     let exit_code = unsafe { sandlock_result_exit_code(rr) };
-    assert!(
-        stdout_str.contains("111") && stdout_str.contains("222"),
+    // The child writes exactly `getpid|getppid` with `sys.stdout.write`
+    // — no trailing newline. Exact-match catches mutations where one
+    // handler silently fails but the real pid/ppid still contains the
+    // sentinel substring.
+    assert_eq!(
+        stdout_str.trim_end_matches('\n'),
+        "111|222",
         "expected both handlers to fire; exit={} stdout={:?} stderr={:?}",
         exit_code, stdout_str, stderr_str,
     );

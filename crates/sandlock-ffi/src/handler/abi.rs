@@ -49,7 +49,26 @@ pub unsafe extern "C" fn sandlock_mem_read_cstr(
     }
     let h = &*handle;
     // `max_len` is the caller-supplied buffer size including space for the
-    // trailing NUL; reserve one byte so we can always terminate the string.
+    // trailing NUL. The C header documents `max_len >= 1` as sufficient
+    // (the buffer holds at least the NUL terminator), so a 1-byte buffer
+    // must succeed when the target string is empty. The general path
+    // below computes `cap = max_len - 1`, which is 0 for `max_len == 1`
+    // — and `read_child_cstr` rejects `max_len == 0` outright. Take the
+    // edge case via an explicit fast-path: probe the target for one
+    // byte; on a NUL (= empty string) write the terminator and return
+    // success, otherwise the caller's buffer cannot fit the payload.
+    if max_len == 1 {
+        match read_child_cstr(h.notif_fd, h.notif_id, h.pid, addr, 1) {
+            Some(s) if s.is_empty() => {
+                *buf = 0;
+                *out_len = 0;
+                return 0;
+            }
+            // Either the target string is non-empty (we have no room
+            // for it) or the read failed entirely. Either way, -1.
+            _ => return -1,
+        }
+    }
     let cap = max_len - 1;
     let s = match read_child_cstr(h.notif_fd, h.notif_id, h.pid, addr, cap) {
         Some(s) => s,
@@ -170,7 +189,11 @@ pub struct sandlock_action_inject_tracked_t {
 #[allow(non_camel_case_types)]
 pub union sandlock_action_payload_t {
     pub none: u64,
-    pub errno: i32,
+    /// `errno_value` rather than `errno` to mirror the C header field
+    /// (the C side avoids the name `errno` because `<errno.h>` macros
+    /// it). Keeping both languages in sync removes a documentation
+    /// hazard for callers that grep across Rust and C sources.
+    pub errno_value: i32,
     pub return_value: i64,
     pub inject_send: sandlock_action_inject_t,
     pub inject_send_tracked: sandlock_action_inject_tracked_t,
@@ -216,10 +239,13 @@ pub unsafe extern "C" fn sandlock_action_set_continue(out: *mut sandlock_action_
 /// # Safety
 /// Same constraints as `sandlock_action_set_continue`.
 #[no_mangle]
-pub unsafe extern "C" fn sandlock_action_set_errno(out: *mut sandlock_action_out_t, errno: i32) {
+pub unsafe extern "C" fn sandlock_action_set_errno(
+    out: *mut sandlock_action_out_t,
+    errno_value: i32,
+) {
     if out.is_null() { return; }
     (*out).kind = sandlock_action_kind_t::Errno as u32;
-    (*out).payload.errno = errno;
+    (*out).payload.errno_value = errno_value;
 }
 
 /// Return a specific value from the syscall without entering the kernel.

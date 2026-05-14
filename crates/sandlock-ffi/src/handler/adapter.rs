@@ -284,7 +284,7 @@ fn translate_action(out: &sandlock_action_out_t, child_pgid: i32) -> Option<Noti
     let action = unsafe {
         match kind {
             K::Continue => NotifAction::Continue,
-            K::Errno => NotifAction::Errno(out.payload.errno),
+            K::Errno => NotifAction::Errno(out.payload.errno_value),
             K::ReturnValue => NotifAction::ReturnValue(out.payload.return_value),
             K::Hold => NotifAction::Hold,
             K::Kill => {
