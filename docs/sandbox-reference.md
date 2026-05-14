@@ -325,16 +325,6 @@ parse_ports([80, "443", "8000-8005"])
 # => [80, 443, 8000, 8001, 8002, 8003, 8004, 8005]
 ```
 
-The `Sandbox` instance exposes the following helper methods for
-inspecting the parsed configuration:
-
-| Method                    | Return type     | Description                                            |
-| ------------------------- | --------------- | ------------------------------------------------------ |
-| `bind_ports()`            | `list[int]`     | Parsed `net_bind` ports, or an empty list if unset.    |
-| `memory_bytes()`          | `int \| None`   | `max_memory` resolved to a byte count.                 |
-| `time_start_timestamp()`  | `float \| None` | `time_start` resolved to a Unix timestamp.             |
-| `cpu_pct()`               | `int \| None`   | Validated `max_cpu` percentage.                        |
-
 ## Behavioral notes
 
 1. **Default-deny network.** `net_allow=()` (the default) denies all
