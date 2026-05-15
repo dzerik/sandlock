@@ -102,3 +102,54 @@ def test_action_kind_enum_values_match_c_header():
     assert _ActionKind.INJECT_FD_SEND_TRACKED == 5
     assert _ActionKind.HOLD == 6
     assert _ActionKind.KILL == 7
+
+
+def test_handler_ctx_exposes_notif_fields():
+    from sandlock.handler import HandlerCtx
+
+    # Construct via the test helper; the production constructor is
+    # called only from the trampoline.
+    ctx = HandlerCtx._for_test(
+        id=42, pid=1234, flags=0,
+        syscall_nr=39, arch=0xC000003E,
+        instruction_pointer=0xDEADBEEF,
+        args=(1, 2, 3, 4, 5, 6),
+    )
+    assert ctx.id == 42
+    assert ctx.pid == 1234
+    assert ctx.flags == 0
+    assert ctx.syscall_nr == 39
+    assert ctx.arch == 0xC000003E
+    assert ctx.instruction_pointer == 0xDEADBEEF
+    assert ctx.args == (1, 2, 3, 4, 5, 6)
+
+
+def test_handler_ctx_mem_methods_return_falsy_without_handle():
+    from sandlock.handler import HandlerCtx
+
+    # _for_test ctx has no mem handle — accessors must degrade safely,
+    # not crash.
+    ctx = HandlerCtx._for_test(
+        id=1, pid=1, flags=0, syscall_nr=0, arch=0,
+        instruction_pointer=0, args=(0, 0, 0, 0, 0, 0),
+    )
+    assert ctx.read_cstr(0x1000, 64) is None
+    assert ctx.read(0x1000, 16) is None
+    assert ctx.write(0x1000, b"x") is False
+
+
+def test_handler_ctx_is_frozen():
+    import dataclasses
+
+    from sandlock.handler import HandlerCtx
+
+    ctx = HandlerCtx._for_test(
+        id=1, pid=1, flags=0, syscall_nr=0, arch=0,
+        instruction_pointer=0, args=(0, 0, 0, 0, 0, 0),
+    )
+    try:
+        ctx.pid = 999  # type: ignore[misc]
+    except dataclasses.FrozenInstanceError:
+        pass
+    else:
+        raise AssertionError("HandlerCtx must be frozen (immutable)")

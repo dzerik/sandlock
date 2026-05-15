@@ -134,3 +134,80 @@ class Handler:
         raise NotImplementedError(
             "Handler subclasses must override handle(ctx) -> NotifAction"
         )
+
+
+@dataclass(frozen=True)
+class HandlerCtx:
+    """Read-only snapshot of the seccomp notification the supervisor
+    received, plus an opaque handle for child-memory access.
+
+    Field names match ``sandlock_notif_data_t`` in the C header. The
+    ``_mem_handle`` field is an implementation detail (a ctypes
+    pointer); use ``read_cstr``, ``read``, ``write`` to access child
+    memory.
+
+    Do not retain a HandlerCtx beyond the ``handle()`` call — the mem
+    handle is valid only for the duration of the callback.
+    """
+    id: int
+    pid: int
+    flags: int
+    syscall_nr: int
+    arch: int
+    instruction_pointer: int
+    args: tuple[int, int, int, int, int, int]  # the six syscall args
+
+    # Set by the trampoline; opaque to user code. None in test contexts.
+    _mem_handle: object = None
+
+    @classmethod
+    def _for_test(
+        cls,
+        *,
+        id: int,
+        pid: int,
+        flags: int,
+        syscall_nr: int,
+        arch: int,
+        instruction_pointer: int,
+        args: tuple[int, int, int, int, int, int],
+    ) -> HandlerCtx:
+        """Test-only constructor with no mem handle."""
+        return cls(
+            id=id, pid=pid, flags=flags, syscall_nr=syscall_nr,
+            arch=arch, instruction_pointer=instruction_pointer,
+            args=args, _mem_handle=None,
+        )
+
+    def read_cstr(self, addr: int, max_len: int) -> str | None:
+        """Read a NUL-terminated string from the child at ``addr``.
+
+        Returns the decoded string on success, or None on failure
+        (invalid address, target string longer than max_len, race with
+        child exit, or no mem handle). ``max_len`` must be at least 1
+        to fit the NUL terminator.
+        """
+        if self._mem_handle is None:
+            return None
+        from . import _handler_ffi
+        return _handler_ffi.mem_read_cstr(self._mem_handle, addr, max_len)
+
+    def read(self, addr: int, length: int) -> bytes | None:
+        """Read ``length`` raw bytes from the child at ``addr``.
+
+        Returns bytes on success, or None on failure.
+        """
+        if self._mem_handle is None:
+            return None
+        from . import _handler_ffi
+        return _handler_ffi.mem_read(self._mem_handle, addr, length)
+
+    def write(self, addr: int, data: bytes) -> bool:
+        """Write ``data`` into the child at ``addr``.
+
+        Returns True on success, False on failure.
+        """
+        if self._mem_handle is None:
+            return False
+        from . import _handler_ffi
+        return _handler_ffi.mem_write(self._mem_handle, addr, data)
