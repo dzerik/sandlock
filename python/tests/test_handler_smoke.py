@@ -203,6 +203,7 @@ def test_handler_ctx_is_frozen():
 # ----------------------------------------------------------------
 
 import os
+import platform
 
 import pytest
 
@@ -219,6 +220,27 @@ _PYTHON_READABLE = ["/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", "/dev"]
 _SYSTEM_PYTHON = "/usr/bin/python3"
 
 
+# Syscall numbers are architecture-specific. run_with_handlers registers
+# on raw kernel syscall numbers (the C ABI takes a plain int), so the
+# number must match the host arch — x86_64 and aarch64 differ. The Rust
+# side gets this for free via libc::SYS_*; Python has no such table, so
+# the test resolves it explicitly. An unmapped arch skips rather than
+# silently registering on the wrong syscall.
+_SYSCALL_NRS = {
+    "x86_64": {"openat": 257, "getpid": 39},
+    "aarch64": {"openat": 56, "getpid": 172},
+}
+
+
+def _syscall_nr(name: str) -> int:
+    """Return the kernel syscall number for ``name`` on the host arch."""
+    machine = platform.machine()
+    arch = _SYSCALL_NRS.get(machine)
+    if arch is None or name not in arch:
+        pytest.skip(f"syscall {name!r} not mapped for arch {machine!r}")
+    return arch[name]
+
+
 def test_smoke_audit_openat(tmp_dir):
     """RFC #43 phasing item 2: an audit handler counts the child's
     SYS_openat calls. Counts only opens of a unique probe file so the
@@ -232,7 +254,7 @@ def test_smoke_audit_openat(tmp_dir):
     if not os.path.exists(_SYSTEM_PYTHON):
         pytest.skip(f"{_SYSTEM_PYTHON} not available")
 
-    SYS_openat = 257  # x86_64
+    SYS_openat = _syscall_nr("openat")
 
     probe = tmp_dir / "audit-probe-file"
     probe.write_text("x")
@@ -287,7 +309,7 @@ def test_handler_ctx_mem_handle_invalidated_after_handle():
     if not os.path.exists(_SYSTEM_PYTHON):
         pytest.skip(f"{_SYSTEM_PYTHON} not available")
 
-    SYS_openat = 257  # x86_64
+    SYS_openat = _syscall_nr("openat")
 
     captured = {}
 
@@ -343,7 +365,7 @@ def test_handler_exception_continue_policy_lets_child_run(tmp_dir):
     if not os.path.exists(_SYSTEM_PYTHON):
         pytest.skip(f"{_SYSTEM_PYTHON} not available")
 
-    SYS_openat = 257  # x86_64
+    SYS_openat = _syscall_nr("openat")
 
     probe = tmp_dir / "probe.txt"
     probe.write_text("payload\n")
@@ -390,7 +412,7 @@ def test_handler_exception_kill_policy_terminates_child(tmp_dir):
     if not os.path.exists(_SYSTEM_PYTHON):
         pytest.skip(f"{_SYSTEM_PYTHON} not available")
 
-    SYS_openat = 257  # x86_64
+    SYS_openat = _syscall_nr("openat")
 
     probe = tmp_dir / "probe.txt"
     probe.write_text("payload\n")
@@ -456,7 +478,7 @@ def test_handler_errno_action_makes_child_observe_eperm(tmp_dir):
     if not os.path.exists(_SYSTEM_PYTHON):
         pytest.skip(f"{_SYSTEM_PYTHON} not available")
 
-    SYS_openat = 257  # x86_64
+    SYS_openat = _syscall_nr("openat")
     import errno as _errno
 
     probe = tmp_dir / "probe.txt"
@@ -500,7 +522,7 @@ def test_handler_return_value_action_overrides_getpid():
     if not os.path.exists(_SYSTEM_PYTHON):
         pytest.skip(f"{_SYSTEM_PYTHON} not available")
 
-    SYS_getpid = 39  # x86_64
+    SYS_getpid = _syscall_nr("getpid")
 
     class _FakePid(Handler):
         on_exception = ExceptionPolicy.KILL
@@ -526,7 +548,7 @@ def test_handler_kill_action_terminates_child():
     if not os.path.exists(_SYSTEM_PYTHON):
         pytest.skip(f"{_SYSTEM_PYTHON} not available")
 
-    SYS_openat = 257
+    SYS_openat = _syscall_nr("openat")
     import signal
 
     class _KillOnOpen(Handler):
@@ -560,7 +582,7 @@ def test_handler_mem_read_cstr_reads_child_path(tmp_dir):
     if not os.path.exists(_SYSTEM_PYTHON):
         pytest.skip(f"{_SYSTEM_PYTHON} not available")
 
-    SYS_openat = 257
+    SYS_openat = _syscall_nr("openat")
     import errno as _errno
 
     probe = tmp_dir / "probe.txt"
@@ -609,7 +631,7 @@ def test_handler_ctx_notif_fields_populated_from_real_notification(tmp_dir):
     if not os.path.exists(_SYSTEM_PYTHON):
         pytest.skip(f"{_SYSTEM_PYTHON} not available")
 
-    SYS_openat = 257  # x86_64
+    SYS_openat = _syscall_nr("openat")
 
     probe = tmp_dir / "probe.txt"
     probe.write_text("payload\n")
@@ -717,6 +739,9 @@ def test_run_with_handlers_rollback_leaves_registry_clean():
     with pytest.raises(ValueError):
         sb.run_with_handlers(
             cmd=["/bin/true"],
+            # The first syscall number is arbitrary — registration fails
+            # on the second entry, before the kernel is ever reached, so
+            # no arch-correct number is needed here.
             handlers=[(257, _Noop()), ("not-a-syscall-number", _Noop())],
         )
     assert len(_handler_ffi._HANDLERS) == before, (
@@ -745,7 +770,9 @@ def test_run_with_handlers_clears_registry_after_run():
     before = len(_handler_ffi._HANDLERS)
     result = sb.run_with_handlers(
         cmd=[_SYSTEM_PYTHON, "-c", "pass"],
-        handlers=[(257, _Noop())],
+        # A real run, so the syscall number must be valid for the host
+        # arch — openat is always notif-eligible and never deny-listed.
+        handlers=[(_syscall_nr("openat"), _Noop())],
     )
     assert result.success, result
     assert len(_handler_ffi._HANDLERS) == before, (
