@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Smoke tests for the sandlock Python handler wrapper."""
 
-from sandlock.handler import NotifAction
+from sandlock.handler import ExceptionPolicy, Handler, NotifAction
 
 
 def test_notif_action_continue_has_continue_kind():
@@ -50,3 +50,55 @@ def test_notif_action_is_frozen():
         pass
     else:
         raise AssertionError("NotifAction must be frozen (immutable)")
+
+
+def test_exception_policy_enum_values_match_c_header():
+    # Must match include/sandlock.h SANDLOCK_EXCEPTION_* discriminants.
+    assert ExceptionPolicy.KILL == 0
+    assert ExceptionPolicy.DENY_EPERM == 1
+    assert ExceptionPolicy.CONTINUE == 2
+    assert ExceptionPolicy.DENY_EIO == 3
+
+
+def test_handler_subclass_has_default_kill_policy():
+    class MyHandler(Handler):
+        def handle(self, ctx):
+            return NotifAction.continue_()
+
+    h = MyHandler()
+    assert h.on_exception == ExceptionPolicy.KILL  # fail-closed default
+
+
+def test_handler_subclass_can_override_exception_policy():
+    class AuditHandler(Handler):
+        on_exception = ExceptionPolicy.CONTINUE
+
+        def handle(self, ctx):
+            return NotifAction.continue_()
+
+    h = AuditHandler()
+    assert h.on_exception == ExceptionPolicy.CONTINUE
+
+
+def test_base_handler_handle_raises_not_implemented():
+    h = Handler()
+    try:
+        h.handle(None)
+    except NotImplementedError:
+        pass
+    else:
+        raise AssertionError("base Handler.handle must raise NotImplementedError")
+
+
+def test_action_kind_enum_values_match_c_header():
+    # Must match SANDLOCK_ACTION_* in crates/sandlock-ffi/include/sandlock.h.
+    from sandlock.handler import _ActionKind
+
+    assert _ActionKind.UNSET == 0
+    assert _ActionKind.CONTINUE == 1
+    assert _ActionKind.ERRNO == 2
+    assert _ActionKind.RETURN_VALUE == 3
+    assert _ActionKind.INJECT_FD_SEND == 4
+    assert _ActionKind.INJECT_FD_SEND_TRACKED == 5
+    assert _ActionKind.HOLD == 6
+    assert _ActionKind.KILL == 7

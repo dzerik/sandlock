@@ -60,27 +60,27 @@ class NotifAction:
     pgid: int = 0
 
     @classmethod
-    def continue_(cls) -> "NotifAction":
+    def continue_(cls) -> NotifAction:
         return cls(kind=int(_ActionKind.CONTINUE))
 
     @classmethod
-    def errno(cls, value: int) -> "NotifAction":
+    def errno(cls, value: int) -> NotifAction:
         return cls(kind=int(_ActionKind.ERRNO), errno_value=value)
 
     @classmethod
-    def return_value_(cls, value: int) -> "NotifAction":
+    def return_value_(cls, value: int) -> NotifAction:
         return cls(kind=int(_ActionKind.RETURN_VALUE), return_value=value)
 
     @classmethod
-    def hold(cls) -> "NotifAction":
+    def hold(cls) -> NotifAction:
         return cls(kind=int(_ActionKind.HOLD))
 
     @classmethod
-    def kill(cls, sig: int, pgid: int = 0) -> "NotifAction":
+    def kill(cls, sig: int, pgid: int = 0) -> NotifAction:
         return cls(kind=int(_ActionKind.KILL), sig=sig, pgid=pgid)
 
     @classmethod
-    def inject_fd_send(cls, srcfd: int, newfd_flags: int = 0) -> "NotifAction":
+    def inject_fd_send(cls, srcfd: int, newfd_flags: int = 0) -> NotifAction:
         """Inject a file descriptor into the child.
 
         Ownership of ``srcfd`` transfers to the supervisor on successful
@@ -92,4 +92,45 @@ class NotifAction:
             kind=int(_ActionKind.INJECT_FD_SEND),
             srcfd=srcfd,
             newfd_flags=newfd_flags,
+        )
+
+
+class ExceptionPolicy(enum.IntEnum):
+    """Maps to sandlock_exception_policy_t in the C ABI.
+
+    Applied when a handler's ``handle()`` raises, returns an invalid
+    value, or the trampoline cannot reach the Python interpreter
+    (e.g. ``Py_FinalizeEx``). See ``crates/sandlock-ffi/include/sandlock.h``
+    for the supervisor's exact behaviour per policy.
+    """
+    KILL = 0
+    DENY_EPERM = 1
+    CONTINUE = 2
+    DENY_EIO = 3
+
+
+class Handler:
+    """Base class for Python sandlock handlers.
+
+    Subclass and override ``handle()``. Optionally override
+    ``on_exception`` to choose what the supervisor does when this
+    handler errors. Default is ``ExceptionPolicy.KILL`` (fail-closed).
+
+    Lifetime: a Handler instance must outlive any Sandbox run it is
+    registered with. The Sandbox holds a Python-side reference for the
+    duration of the run; the underlying C container's ``ud_drop``
+    releases that reference when the run completes (or fails).
+    """
+
+    on_exception: ExceptionPolicy = ExceptionPolicy.KILL
+
+    def handle(self, ctx: HandlerCtx) -> NotifAction:
+        """Override in a subclass to inspect ``ctx`` and return a NotifAction.
+
+        Raising an exception triggers the configured ``on_exception``
+        policy. Returning a non-NotifAction value is treated as an
+        exception. The default implementation raises NotImplementedError.
+        """
+        raise NotImplementedError(
+            "Handler subclasses must override handle(ctx) -> NotifAction"
         )
