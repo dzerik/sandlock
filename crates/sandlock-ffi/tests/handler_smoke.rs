@@ -1773,15 +1773,34 @@ fn make_pipe() -> (i32, i32) {
     (fds[0], fds[1])
 }
 
-// Reads up to one byte from `fd` with `O_NONBLOCK` set first. Returns
-// the value `libc::read` returned (>=0 byte count, or -1 on error;
-// `errno` is preserved in that case so the caller can distinguish EOF
-// from EAGAIN).
-fn read_eof_or_eagain(fd: i32) -> isize {
-    // SAFETY: `F_SETFL` with `O_NONBLOCK` is a simple flag set; `read`
-    // reads at most one byte into the on-stack buffer.
+// Waits up to ~2 seconds for `fd` to reach EOF, returning 0 on EOF,
+// the byte count if any data was written (shouldn't happen in the
+// drain tests), or -1 on timeout / poll error. Uses `poll(2)` watching
+// POLLHUP rather than a single nonblocking `read` because the
+// `pipe2(O_CLOEXEC)` defense in `make_pipe` is incomplete: CLOEXEC
+// closes the inherited duplicate only at `exec(2)`, so a sibling test
+// that's mid-fork-exec can transiently hold our write end open and
+// suppress EOF on the first read. Polling for POLLHUP lets the kernel
+// notify us once the last writer (including any short-lived inherited
+// copy) is gone.
+fn wait_for_eof(fd: i32) -> isize {
+    const TIMEOUT_MS: i32 = 2000;
+    let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+    // SAFETY: `pfd` is a stack-local with a single valid fd; `poll`
+    // reads/writes only the supplied entry.
+    let pret = unsafe { libc::poll(&mut pfd, 1, TIMEOUT_MS) };
+    if pret <= 0 {
+        return -1;
+    }
+    // POLLHUP is reported in `revents` unconditionally when every
+    // writer has closed; readers then return 0 from `read`.
+    if pfd.revents & libc::POLLHUP != 0 {
+        return 0;
+    }
+    // Readable but not hung up: data was written. Surface the count so
+    // the caller's assertion includes informative output.
+    // SAFETY: `read` writes at most one byte into the on-stack buffer.
     unsafe {
-        libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
         let mut buf = [0u8; 1];
         libc::read(fd, buf.as_mut_ptr() as *mut std::ffi::c_void, 1)
     }
@@ -1840,14 +1859,13 @@ async fn a1_ffi_handler_drains_inject_fd_on_panic() {
     );
 
     // After `handle` returns, the drain path should have closed
-    // `write_fd`. Reading from `read_fd` (with O_NONBLOCK) returns 0
-    // (EOF). If the leak were still present, the write end would
-    // remain open and `read` would return -1/EAGAIN.
-    let n = read_eof_or_eagain(read_fd);
-    let errno = std::io::Error::last_os_error();
+    // `write_fd`. Poll for EOF via POLLHUP with a timeout; if the leak
+    // were still present, no writer would ever close and the poll
+    // would time out (-1).
+    let n = wait_for_eof(read_fd);
     assert_eq!(
         n, 0,
-        "expected EOF on read end (write end closed by drain); got n={n} errno={errno}",
+        "expected EOF on read end (write end closed by drain); got n={n}",
     );
 
     // Reclaim the heap allocation for the fd holder so the test is
@@ -1911,11 +1929,10 @@ async fn a2_ffi_handler_drains_inject_fd_tracked_discriminant() {
         "unsupported tracked discriminant must route to the exception-policy fallback (Kill degraded to EPERM under UNSAFE_PGID), got {action:?}",
     );
 
-    let n = read_eof_or_eagain(read_fd);
-    let errno = std::io::Error::last_os_error();
+    let n = wait_for_eof(read_fd);
     assert_eq!(
         n, 0,
-        "expected EOF on read end (write end closed by drain); got n={n} errno={errno}",
+        "expected EOF on read end (write end closed by drain); got n={n}",
     );
 
     // SAFETY: `fd_ptr` came from `Box::into_raw` on a `Box<i32>`.
