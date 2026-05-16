@@ -68,6 +68,14 @@ fn parse_port_from_sockaddr(bytes: &[u8]) -> Option<u16> {
     }
 }
 
+fn set_port_in_sockaddr(bytes: &mut [u8], port: u16) {
+    if bytes.len() >= 4 {
+        let port_bytes = port.to_be_bytes();
+        bytes[2] = port_bytes[0];
+        bytes[3] = port_bytes[1];
+    }
+}
+
 // ============================================================
 // query_socket_protocol — derive the rule Protocol from a fd via getsockopt
 // ============================================================
@@ -179,6 +187,11 @@ async fn connect_on_behalf(
         let http_acl_addr = ns.http_acl_addr;
         let http_acl_intercept = dest_port.map_or(false, |p| ns.http_acl_ports.contains(&p));
         let http_acl_orig_dest = ns.http_acl_orig_dest.clone();
+        let remapped_loopback_port = if ctx.policy.port_remap && ip.is_loopback() {
+            dest_port.and_then(|p| ns.port_map.get_real(p))
+        } else {
+            None
+        };
 
         drop(ns);
 
@@ -186,7 +199,7 @@ async fn connect_on_behalf(
         let mut redirected = false;
         let is_ipv6 = parse_ip_from_sockaddr(&addr_bytes)
             .map_or(false, |ip| ip.is_ipv6());
-        let (connect_addr, connect_len) = if let Some(proxy_addr) = http_acl_addr {
+        let (mut connect_addr, connect_len) = if let Some(proxy_addr) = http_acl_addr {
             if http_acl_intercept {
                 redirected = true;
                 if is_ipv6 {
@@ -240,6 +253,13 @@ async fn connect_on_behalf(
         } else {
             (addr_bytes.clone(), addr_len)
         };
+        if !redirected {
+            if let Some(real_port) = remapped_loopback_port {
+                // The child sees virtual ports via getsockname(); connect
+                // still has to target the real bound loopback port.
+                set_port_in_sockaddr(&mut connect_addr, real_port);
+            }
+        }
 
         // (The supervisor-side dup is the same fd we already created
         // for the SO_PROTOCOL probe above — reuse it rather than
