@@ -148,7 +148,7 @@ pub(crate) async fn handle_bind(
 
     let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
         Ok(fd) => fd,
-        Err(_) => return NotifAction::Errno(libc::ENOSYS),
+        Err(e) => return NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EBADF)),
     };
 
     // Non-IP family or ephemeral (port == 0): bind verbatim — nothing to
@@ -284,7 +284,7 @@ pub(crate) async fn handle_getsockname(
 
     let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
         Ok(fd) => fd,
-        Err(_) => return NotifAction::Errno(libc::ENOSYS),
+        Err(e) => return NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EBADF)),
     };
 
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };

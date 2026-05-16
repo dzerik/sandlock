@@ -152,7 +152,7 @@ async fn connect_on_behalf(
         let dest_port = parse_port_from_sockaddr(&addr_bytes);
         let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
             Ok(fd) => fd,
-            Err(_) => return NotifAction::Errno(libc::ENOSYS),
+            Err(e) => return NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EBADF)),
         };
         let protocol = match query_socket_protocol(dup_fd.as_raw_fd()) {
             Some(p) => p,
@@ -416,7 +416,7 @@ async fn sendto_on_behalf(
         let dest_port = parse_port_from_sockaddr(&addr_bytes);
         let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
             Ok(fd) => fd,
-            Err(_) => return NotifAction::Errno(libc::ENOSYS),
+            Err(e) => return NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EBADF)),
         };
         let protocol = match query_socket_protocol(dup_fd.as_raw_fd()) {
             Some(p) => p,
@@ -504,7 +504,7 @@ async fn sendmsg_on_behalf(
 
     let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
         Ok(fd) => fd,
-        Err(_) => return NotifAction::Errno(libc::ENOSYS),
+        Err(e) => return NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EBADF)),
     };
     let protocol = match query_socket_protocol(dup_fd.as_raw_fd()) {
         Some(p) => p,
@@ -741,7 +741,7 @@ async fn sendmmsg_on_behalf(
 
     let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
         Ok(fd) => fd,
-        Err(_) => return NotifAction::Errno(libc::ENOSYS),
+        Err(e) => return NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EBADF)),
     };
     let protocol = match query_socket_protocol(dup_fd.as_raw_fd()) {
         Some(p) => p,
