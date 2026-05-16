@@ -1108,8 +1108,21 @@ pub async fn supervisor(
     notif_fd: OwnedFd,
     ctx: Arc<super::ctx::SupervisorCtx>,
     pending_handlers: Vec<(i64, std::sync::Arc<dyn super::dispatch::Handler>)>,
+    startup: tokio::sync::oneshot::Sender<io::Result<()>>,
 ) {
-    let fd = notif_fd.as_raw_fd();
+    // Register the notif fd with the Tokio IO driver so we can wait for
+    // readiness via epoll instead of a dedicated blocking thread.
+    let async_fd = match tokio::io::unix::AsyncFd::with_interest(
+        notif_fd,
+        tokio::io::Interest::READABLE,
+    ) {
+        Ok(fd) => fd,
+        Err(err) => {
+            let _ = startup.send(Err(err));
+            return;
+        }
+    };
+    let fd = async_fd.get_ref().as_raw_fd();
 
     // Build the dispatch table once at startup.
     let dispatch_table = Arc::new(super::dispatch::build_dispatch_table(
@@ -1122,28 +1135,10 @@ pub async fn supervisor(
     // Try to enable sync wakeup (Linux 6.7+, ignore error on older kernels).
     try_set_sync_wakeup(fd);
 
-    // SECCOMP_IOCTL_NOTIF_RECV blocks regardless of O_NONBLOCK, so we
-    // receive notifications in a blocking thread and send them to the
-    // async handler via a channel.  This guarantees we never miss a
-    // notification — the thread is always blocked in recv_notif ready
-    // for the next one.
-    //
-    // Notifications are processed sequentially (not spawned) to avoid
-    // mutex contention between concurrent handlers.
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SeccompNotif>();
-
-    std::thread::spawn(move || {
-        loop {
-            match recv_notif(fd) {
-                Ok(notif) => {
-                    if tx.send(notif).is_err() {
-                        break; // receiver dropped — supervisor shutting down
-                    }
-                }
-                Err(_) => break, // fd closed — child exited
-            }
-        }
-    });
+    // The IO driver has the fd registered; subsequent block_on cycles
+    // can resume this task and pick up readiness events. Tell the
+    // caller it is safe to release the child.
+    let _ = startup.send(Ok(()));
 
     // Periodic sweep as a defensive backstop in case pidfd-based
     // lifecycle cleanup misses an entry (e.g. pidfd_open failed for a
@@ -1152,8 +1147,61 @@ pub async fn supervisor(
     // still per-child pidfd readiness in `spawn_pid_watcher`.
     let gc = tokio::spawn(process_index_gc(Arc::clone(&ctx.processes)));
 
-    while let Some(notif) = rx.recv().await {
-        handle_notification(notif, &ctx, &dispatch_table, fd).await;
+    // SECCOMP_IOCTL_NOTIF_RECV is a blocking ioctl that ignores
+    // O_NONBLOCK on the notif fd (see kernel/seccomp.c
+    // `seccomp_notify_recv`, which calls `wait_event_interruptible`
+    // unconditionally). So we cannot call it speculatively. The
+    // notif fd does implement `seccomp_notify_poll` and fires
+    // EPOLLIN whenever an INIT-state notification is queued, so we:
+    //
+    //   1. Wait for readiness via AsyncFd (one EPOLLET edge per
+    //      wake_up_poll batch).
+    //   2. Re-arm immediately so any new arrivals during drain queue
+    //      a fresh edge.
+    //   3. Drain the queue using `poll(timeout=0)` as a non-blocking
+    //      probe before each recv. This is required because tokio's
+    //      AsyncFd is edge-triggered: a burst of arrivals between
+    //      our `clear_ready` and the next `readable().await` would
+    //      coalesce into a single event, so the recv side must drain
+    //      to empty before re-awaiting.
+    //
+    // Notifications are processed sequentially (not spawned) to avoid
+    // mutex contention between concurrent handlers.
+    'outer: loop {
+        let mut ready = match async_fd.readable().await {
+            Ok(r) => r,
+            Err(_) => break 'outer,
+        };
+        ready.clear_ready();
+        drop(ready);
+
+        loop {
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let r = unsafe { libc::poll(&mut pfd, 1, 0) };
+            if r > 0 && (pfd.revents & libc::POLLIN) != 0 {
+                match recv_notif(fd) {
+                    Ok(notif) => {
+                        handle_notification(notif, &ctx, &dispatch_table, fd).await;
+                        continue;
+                    }
+                    Err(err) if err.raw_os_error() == Some(libc::EINTR) => continue,
+                    Err(_) => break 'outer,
+                }
+            }
+            // No POLLIN. POLLHUP/POLLERR/POLLNVAL on the notif fd are
+            // terminal (filter released or fd invalid); leaving them
+            // unhandled would busy-spin because tokio keeps reporting
+            // the fd ready. Otherwise the queue is just empty for now,
+            // so go back to awaiting an edge.
+            if (pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0 {
+                break 'outer;
+            }
+            break;
+        }
     }
 
     gc.abort();
