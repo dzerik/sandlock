@@ -257,6 +257,47 @@ fn recv_notif(fd: RawFd) -> io::Result<SeccompNotif> {
     }
 }
 
+/// Result of a non-blocking probe on the seccomp notif fd.
+enum NotifFdState {
+    /// At least one INIT-state notification is queued. `recv_notif`
+    /// will return without blocking.
+    Pending,
+    /// No notifications and no terminal flags. Wait for the next
+    /// epoll edge before probing again.
+    Empty,
+    /// `POLLHUP`/`POLLERR`/`POLLNVAL` set, or `poll(2)` itself failed:
+    /// filter has been released or the fd is invalid. The supervisor
+    /// should exit; subsequent waits would busy-spin because epoll
+    /// keeps reporting the fd ready.
+    Terminal,
+}
+
+/// Non-blocking probe of the seccomp notif fd.
+///
+/// `SECCOMP_IOCTL_NOTIF_RECV` ignores `O_NONBLOCK` and calls
+/// `wait_event_interruptible` unconditionally (kernel/seccomp.c
+/// `seccomp_notify_recv`). So `recv_notif` cannot be invoked
+/// speculatively to detect an empty queue. This helper uses
+/// `poll(timeout=0)` as a non-blocking predictor: if POLLIN is set
+/// the kernel will hand us a notification without blocking; if a
+/// terminal flag is set the fd will keep waking AsyncFd until the
+/// supervisor exits.
+fn probe_notif_fd(fd: RawFd) -> NotifFdState {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let r = unsafe { libc::poll(&mut pfd, 1, 0) };
+    if r > 0 && (pfd.revents & libc::POLLIN) != 0 {
+        return NotifFdState::Pending;
+    }
+    if r < 0 || (pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0 {
+        return NotifFdState::Terminal;
+    }
+    NotifFdState::Empty
+}
+
 /// Send a response with SECCOMP_USER_NOTIF_FLAG_CONTINUE.
 fn respond_continue(fd: RawFd, id: u64) -> io::Result<()> {
     let resp = SeccompNotifResp {
@@ -1147,23 +1188,12 @@ pub async fn supervisor(
     // still per-child pidfd readiness in `spawn_pid_watcher`.
     let gc = tokio::spawn(process_index_gc(Arc::clone(&ctx.processes)));
 
-    // SECCOMP_IOCTL_NOTIF_RECV is a blocking ioctl that ignores
-    // O_NONBLOCK on the notif fd (see kernel/seccomp.c
-    // `seccomp_notify_recv`, which calls `wait_event_interruptible`
-    // unconditionally). So we cannot call it speculatively. The
-    // notif fd does implement `seccomp_notify_poll` and fires
-    // EPOLLIN whenever an INIT-state notification is queued, so we:
-    //
-    //   1. Wait for readiness via AsyncFd (one EPOLLET edge per
-    //      wake_up_poll batch).
-    //   2. Re-arm immediately so any new arrivals during drain queue
-    //      a fresh edge.
-    //   3. Drain the queue using `poll(timeout=0)` as a non-blocking
-    //      probe before each recv. This is required because tokio's
-    //      AsyncFd is edge-triggered: a burst of arrivals between
-    //      our `clear_ready` and the next `readable().await` would
-    //      coalesce into a single event, so the recv side must drain
-    //      to empty before re-awaiting.
+    // Edge-triggered drain: each `readable().await` returns once per
+    // epoll edge, then we drain the kernel queue via `probe_notif_fd`
+    // until empty. The drain is necessary because tokio's AsyncFd is
+    // edge-triggered and `recv_notif` does not signal "would block",
+    // so a burst of arrivals between two `readable().await` calls
+    // would coalesce into a single wake event.
     //
     // Notifications are processed sequentially (not spawned) to avoid
     // mutex contention between concurrent handlers.
@@ -1176,31 +1206,18 @@ pub async fn supervisor(
         drop(ready);
 
         loop {
-            let mut pfd = libc::pollfd {
-                fd,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let r = unsafe { libc::poll(&mut pfd, 1, 0) };
-            if r > 0 && (pfd.revents & libc::POLLIN) != 0 {
-                match recv_notif(fd) {
-                    Ok(notif) => {
-                        handle_notification(notif, &ctx, &dispatch_table, fd).await;
-                        continue;
-                    }
-                    Err(err) if err.raw_os_error() == Some(libc::EINTR) => continue,
-                    Err(_) => break 'outer,
+            match probe_notif_fd(fd) {
+                NotifFdState::Pending => {
+                    let notif = match recv_notif(fd) {
+                        Ok(n) => n,
+                        Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+                        Err(_) => break 'outer,
+                    };
+                    handle_notification(notif, &ctx, &dispatch_table, fd).await;
                 }
+                NotifFdState::Empty => break,
+                NotifFdState::Terminal => break 'outer,
             }
-            // No POLLIN. POLLHUP/POLLERR/POLLNVAL on the notif fd are
-            // terminal (filter released or fd invalid); leaving them
-            // unhandled would busy-spin because tokio keeps reporting
-            // the fd ready. Otherwise the queue is just empty for now,
-            // so go back to awaiting an edge.
-            if (pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0 {
-                break 'outer;
-            }
-            break;
         }
     }
 
