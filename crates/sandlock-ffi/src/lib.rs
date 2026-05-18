@@ -527,6 +527,35 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_extra_allow_syscalls(
     Box::into_raw(Box::new(builder.extra_allow_syscalls(names)))
 }
 
+/// Resolve a syscall name (e.g. `"openat"`) to its kernel syscall
+/// number for the host architecture.
+///
+/// Intended for filling a `sandlock_handler_registration_t`'s
+/// `syscall_nr` without hard-coding architecture-specific numbers.
+///
+/// Returns the syscall number on success, or `-1` if `name` is NULL,
+/// is not valid UTF-8, or names a syscall sandlock does not know. The
+/// resolvable set covers the syscalls sandlock filters or supervises;
+/// syscalls outside that set (e.g. `getpid`) return `-1` and must be
+/// registered by raw number.
+///
+/// # Safety
+/// `name` must be NULL or a valid NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_syscall_nr(name: *const c_char) -> i64 {
+    if name.is_null() {
+        return -1;
+    }
+    let name = match CStr::from_ptr(name).to_str() {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+    match sandlock_core::context::syscall_name_to_nr(name) {
+        Some(nr) => i64::from(nr),
+        None => -1,
+    }
+}
+
 /// # Safety
 /// `b` must be a valid builder pointer.
 #[no_mangle]

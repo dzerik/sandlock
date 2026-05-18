@@ -220,25 +220,10 @@ _PYTHON_READABLE = ["/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", "/dev"]
 _SYSTEM_PYTHON = "/usr/bin/python3"
 
 
-# Syscall numbers are architecture-specific. run_with_handlers registers
-# on raw kernel syscall numbers (the C ABI takes a plain int), so the
-# number must match the host arch — x86_64 and aarch64 differ. The Rust
-# side gets this for free via libc::SYS_*; Python has no such table, so
-# the test resolves it explicitly. An unmapped arch skips rather than
-# silently registering on the wrong syscall.
-_SYSCALL_NRS = {
-    "x86_64": {"openat": 257, "getpid": 39},
-    "aarch64": {"openat": 56, "getpid": 172},
-}
-
-
-def _syscall_nr(name: str) -> int:
-    """Return the kernel syscall number for ``name`` on the host arch."""
-    machine = platform.machine()
-    arch = _SYSCALL_NRS.get(machine)
-    if arch is None or name not in arch:
-        pytest.skip(f"syscall {name!r} not mapped for arch {machine!r}")
-    return arch[name]
+# getpid is not a syscall sandlock filters, so sandlock_syscall_nr (and
+# the name form of run_with_handlers) cannot resolve it — the one test
+# that intercepts getpid registers it by raw number, per arch.
+_GETPID_NR = {"x86_64": 39, "aarch64": 172}
 
 
 def test_smoke_audit_openat(tmp_dir):
@@ -253,8 +238,6 @@ def test_smoke_audit_openat(tmp_dir):
     """
     if not os.path.exists(_SYSTEM_PYTHON):
         pytest.skip(f"{_SYSTEM_PYTHON} not available")
-
-    SYS_openat = _syscall_nr("openat")
 
     probe = tmp_dir / "audit-probe-file"
     probe.write_text("x")
@@ -284,7 +267,7 @@ def test_smoke_audit_openat(tmp_dir):
     )
     result = sb.run_with_handlers(
         cmd=[_SYSTEM_PYTHON, "-c", script],
-        handlers=[(SYS_openat, counter)],
+        handlers=[("openat", counter)],
     )
 
     assert result.success, result
@@ -309,8 +292,6 @@ def test_handler_ctx_mem_handle_invalidated_after_handle():
     if not os.path.exists(_SYSTEM_PYTHON):
         pytest.skip(f"{_SYSTEM_PYTHON} not available")
 
-    SYS_openat = _syscall_nr("openat")
-
     captured = {}
 
     class _EscapingHandler(Handler):
@@ -331,7 +312,7 @@ def test_handler_ctx_mem_handle_invalidated_after_handle():
     result = sb.run_with_handlers(
         cmd=[_SYSTEM_PYTHON, "-c",
              "import os\nfd = os.open('/etc/hostname', os.O_RDONLY)\nos.close(fd)\n"],
-        handlers=[(SYS_openat, handler)],
+        handlers=[("openat", handler)],
     )
     assert result.success, result
 
@@ -365,8 +346,6 @@ def test_handler_exception_continue_policy_lets_child_run(tmp_dir):
     if not os.path.exists(_SYSTEM_PYTHON):
         pytest.skip(f"{_SYSTEM_PYTHON} not available")
 
-    SYS_openat = _syscall_nr("openat")
-
     probe = tmp_dir / "probe.txt"
     probe.write_text("payload\n")
     probe_path = str(probe)
@@ -392,7 +371,7 @@ def test_handler_exception_continue_policy_lets_child_run(tmp_dir):
     result = sb.run_with_handlers(
         cmd=[_SYSTEM_PYTHON, "-c",
              "import os; fd = os.open(%r, os.O_RDONLY); os.close(fd)" % probe_path],
-        handlers=[(SYS_openat, handler)],
+        handlers=[("openat", handler)],
     )
     # The handler must have been called and must have raised — proving
     # the trampoline's except-path + CONTINUE policy were exercised.
@@ -411,8 +390,6 @@ def test_handler_exception_kill_policy_terminates_child(tmp_dir):
     """
     if not os.path.exists(_SYSTEM_PYTHON):
         pytest.skip(f"{_SYSTEM_PYTHON} not available")
-
-    SYS_openat = _syscall_nr("openat")
 
     probe = tmp_dir / "probe.txt"
     probe.write_text("payload\n")
@@ -442,7 +419,7 @@ def test_handler_exception_kill_policy_terminates_child(tmp_dir):
     )
     result = sb.run_with_handlers(
         cmd=[_SYSTEM_PYTHON, "-c", script],
-        handlers=[(SYS_openat, _RaisingHandler(probe_path))],
+        handlers=[("openat", _RaisingHandler(probe_path))],
     )
     stdout = result.stdout
     assert b"BEFORE" in stdout, f"child never reached the syscall: {stdout!r}"
@@ -478,7 +455,6 @@ def test_handler_errno_action_makes_child_observe_eperm(tmp_dir):
     if not os.path.exists(_SYSTEM_PYTHON):
         pytest.skip(f"{_SYSTEM_PYTHON} not available")
 
-    SYS_openat = _syscall_nr("openat")
     import errno as _errno
 
     probe = tmp_dir / "probe.txt"
@@ -507,7 +483,7 @@ def test_handler_errno_action_makes_child_observe_eperm(tmp_dir):
     )
     result = sb.run_with_handlers(
         cmd=[_SYSTEM_PYTHON, "-c", script],
-        handlers=[(SYS_openat, _DenyProbe())],
+        handlers=[("openat", _DenyProbe())],
     )
     # Child caught OSError(EPERM) -> exit 3, stderr 'errno=1'.
     assert not result.success, result
@@ -522,7 +498,10 @@ def test_handler_return_value_action_overrides_getpid():
     if not os.path.exists(_SYSTEM_PYTHON):
         pytest.skip(f"{_SYSTEM_PYTHON} not available")
 
-    SYS_getpid = _syscall_nr("getpid")
+    machine = platform.machine()
+    if machine not in _GETPID_NR:
+        pytest.skip(f"getpid syscall number unknown for arch {machine!r}")
+    SYS_getpid = _GETPID_NR[machine]
 
     class _FakePid(Handler):
         on_exception = ExceptionPolicy.KILL
@@ -548,7 +527,6 @@ def test_handler_kill_action_terminates_child():
     if not os.path.exists(_SYSTEM_PYTHON):
         pytest.skip(f"{_SYSTEM_PYTHON} not available")
 
-    SYS_openat = _syscall_nr("openat")
     import signal
 
     class _KillOnOpen(Handler):
@@ -561,7 +539,7 @@ def test_handler_kill_action_terminates_child():
     result = sb.run_with_handlers(
         cmd=[_SYSTEM_PYTHON, "-c",
              "import os; os.open('/etc/hostname', os.O_RDONLY)"],
-        handlers=[(SYS_openat, _KillOnOpen())],
+        handlers=[("openat", _KillOnOpen())],
     )
     assert not result.success, (
         f"child must be killed by the handler's Kill action; got {result}"
@@ -582,7 +560,6 @@ def test_handler_mem_read_cstr_reads_child_path(tmp_dir):
     if not os.path.exists(_SYSTEM_PYTHON):
         pytest.skip(f"{_SYSTEM_PYTHON} not available")
 
-    SYS_openat = _syscall_nr("openat")
     import errno as _errno
 
     probe = tmp_dir / "probe.txt"
@@ -612,7 +589,7 @@ def test_handler_mem_read_cstr_reads_child_path(tmp_dir):
     )
     result = sb.run_with_handlers(
         cmd=[_SYSTEM_PYTHON, "-c", script],
-        handlers=[(SYS_openat, _PathReader())],
+        handlers=[("openat", _PathReader())],
     )
     # Handler read the real probe path from child memory and denied it.
     assert str(probe) in seen_paths, seen_paths
@@ -631,7 +608,12 @@ def test_handler_ctx_notif_fields_populated_from_real_notification(tmp_dir):
     if not os.path.exists(_SYSTEM_PYTHON):
         pytest.skip(f"{_SYSTEM_PYTHON} not available")
 
-    SYS_openat = _syscall_nr("openat")
+    from sandlock._sdk import _lib
+    # The handler registers by name ("openat"); resolve the number
+    # independently so the assertion can verify the trampoline unpacked
+    # syscall_nr correctly (a field-swap, e.g. syscall_nr <- arch, fails
+    # it).
+    expected_openat = _lib.sandlock_syscall_nr(b"openat")
 
     probe = tmp_dir / "probe.txt"
     probe.write_text("payload\n")
@@ -661,13 +643,13 @@ def test_handler_ctx_notif_fields_populated_from_real_notification(tmp_dir):
     result = sb.run_with_handlers(
         cmd=[_SYSTEM_PYTHON, "-c",
              "import os; fd = os.open(%r, os.O_RDONLY); os.close(fd)" % probe_path],
-        handlers=[(SYS_openat, _FieldInspector(probe_path))],
+        handlers=[("openat", _FieldInspector(probe_path))],
     )
     assert result.success, result
-    # The handler ran for the probe's SYS_openat: syscall_nr must equal
-    # the registered number — a field-swap in the trampoline (e.g.
-    # syscall_nr <- arch) would make this fail.
-    assert seen.get("syscall_nr") == SYS_openat, seen
+    # The handler ran for the probe's openat: syscall_nr must equal the
+    # resolved number — a field-swap in the trampoline (e.g. syscall_nr
+    # <- arch) would make this fail.
+    assert seen.get("syscall_nr") == expected_openat, seen
     # pid must be a real, positive child pid.
     assert isinstance(seen.get("pid"), int) and seen["pid"] > 0, seen
     # openat takes 6 syscall args; args[1] (pathname pointer) must be a
@@ -717,16 +699,16 @@ def test_run_with_handlers_rollback_leaves_registry_clean():
     handler container freed and the process-global handler registry
     left with no orphaned entries.
 
-    The second entry carries a syscall_nr that ``int()`` rejects, so
-    handler 0 is fully registered while handler 1 fails AFTER
-    _register_handler + sandlock_handler_new but before the regs store
-    — the exact mid-loop window the rollback code in run_with_handlers
-    handles. The failure is raised before sandlock_run_with_handlers is
-    reached, so no kernel/child is involved.
+    Entry 0 registers fully; entry 1 is a non-Handler, so the
+    registration loop fails reading its ``on_exception`` — after entry
+    1's id is already in the registry. That is the exact mid-loop
+    window the rollback code in run_with_handlers handles. The failure
+    is raised before sandlock_run_with_handlers, so no kernel/child is
+    involved.
 
-    Destructive check: deleting the rollback ``except`` block in
-    run_with_handlers leaves handler 0's id orphaned and the assert
-    fails with a count of before+1.
+    Destructive check: deleting the rollback container-free loop in
+    run_with_handlers leaves entry 0's id orphaned and the assert fails
+    with a count of before+1.
     """
     from sandlock import _handler_ffi
 
@@ -736,13 +718,10 @@ def test_run_with_handlers_rollback_leaves_registry_clean():
 
     sb = sandlock.Sandbox(fs_readable=_PYTHON_READABLE)
     before = len(_handler_ffi._HANDLERS)
-    with pytest.raises(ValueError):
+    with pytest.raises(AttributeError):
         sb.run_with_handlers(
             cmd=["/bin/true"],
-            # The first syscall number is arbitrary — registration fails
-            # on the second entry, before the kernel is ever reached, so
-            # no arch-correct number is needed here.
-            handlers=[(257, _Noop()), ("not-a-syscall-number", _Noop())],
+            handlers=[("openat", _Noop()), ("openat", "not a handler")],
         )
     assert len(_handler_ffi._HANDLERS) == before, (
         "mid-loop rollback orphaned handler registry entries: "
@@ -772,10 +751,71 @@ def test_run_with_handlers_clears_registry_after_run():
         cmd=[_SYSTEM_PYTHON, "-c", "pass"],
         # A real run, so the syscall number must be valid for the host
         # arch — openat is always notif-eligible and never deny-listed.
-        handlers=[(_syscall_nr("openat"), _Noop())],
+        handlers=[("openat", _Noop())],
     )
     assert result.success, result
     assert len(_handler_ffi._HANDLERS) == before, (
         "a registry entry survived a completed run: "
         f"{len(_handler_ffi._HANDLERS)} != {before}"
     )
+
+
+# ----------------------------------------------------------------
+# Syscall-name resolution. run_with_handlers accepts a syscall name
+# (str), resolved per host arch, as well as a raw number (int) — so
+# callers need not hard-code architecture-specific numbers.
+# ----------------------------------------------------------------
+
+
+def test_resolve_syscall_passes_int_through():
+    """An int key is a raw syscall number — used verbatim."""
+    from sandlock.sandbox import _resolve_syscall
+    assert _resolve_syscall(257) == 257
+
+
+def test_resolve_syscall_resolves_a_name():
+    """A known syscall name resolves to its host-arch number."""
+    from sandlock.sandbox import _resolve_syscall
+    # openat is a syscall sandlock filters, so it is name-resolvable;
+    # the number is arch-specific but always non-negative.
+    nr = _resolve_syscall("openat")
+    assert isinstance(nr, int) and nr >= 0
+
+
+def test_resolve_syscall_rejects_unknown_name():
+    """A name sandlock cannot resolve raises ValueError, not a guess."""
+    from sandlock.sandbox import _resolve_syscall
+    with pytest.raises(ValueError, match="definitely_not_a_real_syscall"):
+        _resolve_syscall("definitely_not_a_real_syscall")
+
+
+def test_resolve_syscall_rejects_bad_type():
+    """A key that is neither a name nor a number raises TypeError."""
+    from sandlock.sandbox import _resolve_syscall
+    with pytest.raises(TypeError):
+        _resolve_syscall(3.5)
+
+
+def test_resolve_syscall_rejects_bool():
+    """bool is an int subclass — True/False must be rejected, not
+    silently resolved to syscalls 1/0 (write/read)."""
+    from sandlock.sandbox import _resolve_syscall
+    for value in (True, False):
+        with pytest.raises(TypeError):
+            _resolve_syscall(value)
+
+
+def test_run_with_handlers_rejects_unknown_syscall_name():
+    """An unknown syscall name must raise ValueError up front — before
+    any native policy is built or any handler container is allocated —
+    naming the offending syscall."""
+    class _Noop(Handler):
+        def handle(self, ctx):
+            return NotifAction.continue_()
+
+    sb = sandlock.Sandbox(fs_readable=_PYTHON_READABLE)
+    with pytest.raises(ValueError, match="definitely_not_a_real_syscall"):
+        sb.run_with_handlers(
+            cmd=["/bin/true"],
+            handlers=[("definitely_not_a_real_syscall", _Noop())],
+        )

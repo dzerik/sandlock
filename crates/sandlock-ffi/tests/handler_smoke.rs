@@ -2137,3 +2137,32 @@ async fn ffi_handler_deny_eio_policy_on_callback_rc_nonzero() {
     assert!(matches!(action, NotifAction::Errno(e) if e == libc::EIO),
             "expected Errno(EIO), got {:?}", action);
 }
+
+// ----------------------------------------------------------------
+// sandlock_syscall_nr — syscall-name -> number resolution.
+// ----------------------------------------------------------------
+
+#[test]
+fn syscall_nr_resolves_a_known_name() {
+    let name = std::ffi::CString::new("openat").unwrap();
+    let nr = unsafe { sandlock_ffi::sandlock_syscall_nr(name.as_ptr()) };
+    assert_eq!(
+        nr, libc::SYS_openat,
+        "\"openat\" must resolve to the host-arch SYS_openat",
+    );
+}
+
+#[test]
+fn syscall_nr_rejects_an_unknown_name() {
+    // A syscall sandlock does not filter is absent from the resolver
+    // table; the function must say so (-1), not guess a number.
+    let name = std::ffi::CString::new("definitely_not_a_syscall").unwrap();
+    let nr = unsafe { sandlock_ffi::sandlock_syscall_nr(name.as_ptr()) };
+    assert_eq!(nr, -1, "an unknown name must resolve to -1");
+}
+
+#[test]
+fn syscall_nr_rejects_null() {
+    let nr = unsafe { sandlock_ffi::sandlock_syscall_nr(std::ptr::null()) };
+    assert_eq!(nr, -1, "a NULL name must resolve to -1, not dereference");
+}

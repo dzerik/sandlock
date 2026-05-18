@@ -492,6 +492,10 @@ _lib.sandlock_run_interactive_with_handlers.argtypes = [
     ctypes.POINTER(_SandlockHandlerRegistration), ctypes.c_size_t,
 ]
 
+# Resolve a syscall name to its host-arch number; -1 on unknown/NULL.
+_lib.sandlock_syscall_nr.restype = ctypes.c_int64
+_lib.sandlock_syscall_nr.argtypes = [ctypes.c_char_p]
+
 # Action setters — exactly one per action, called from the trampoline.
 _lib.sandlock_action_set_continue.restype = None
 _lib.sandlock_action_set_continue.argtypes = [ctypes.POINTER(_SandlockActionOut)]

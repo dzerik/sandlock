@@ -676,9 +676,17 @@ class AuditOpens(Handler):
 sb = sandlock.Sandbox(fs_readable=["/usr", "/etc", "/lib", "/lib64", "/bin"])
 sb.run_with_handlers(
     cmd=["/usr/bin/cat", "/etc/hostname"],
-    handlers=[(257, AuditOpens())],   # 257 = x86_64 SYS_openat
+    handlers=[("openat", AuditOpens())],
 )
 ```
+
+Each handler is registered for one syscall. The key is a syscall name
+(`str`, e.g. `"openat"`), resolved for the host architecture, or a raw
+kernel syscall number (`int`). Prefer the name — raw numbers are
+architecture-specific (`openat` is 257 on x86_64 but 56 on aarch64). A
+name sandlock cannot resolve raises `ValueError`; syscalls sandlock does
+not filter (e.g. `getpid`) are not name-resolvable and must be passed as
+an `int`. C callers can resolve a name with `sandlock_syscall_nr`.
 
 ### Threading & safety contract
 

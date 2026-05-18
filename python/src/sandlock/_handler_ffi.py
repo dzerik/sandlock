@@ -54,6 +54,15 @@ ctypes.pythonapi.Py_IsInitialized.restype = ctypes.c_int
 # The C ABI's ``ud`` pointer is this id; ``ud_drop`` removes the entry.
 _HANDLERS: Dict[int, Handler] = {}
 _REGISTRY_LOCK = threading.Lock()
+
+# Monotonic registration counter — never reset or recycled. A fresh id
+# per registration is the simplest guarantee that every concurrently
+# live handler has a distinct ``ud``. Unbounded growth is not a
+# concern: it is a Python int (no fixed width), and the registry is
+# emptied after every run (see ``Sandbox.run_with_handlers``), so only
+# the counter advances, never memory. The sole hard ceiling is the C
+# ABI's ``ud`` slot — a pointer-width ``c_void_p`` (2**64 on 64-bit
+# hosts) — astronomically beyond any realistic process lifetime.
 _NEXT_ID = 1
 
 

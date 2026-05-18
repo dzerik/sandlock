@@ -526,10 +526,15 @@ class Sandbox:
     ):
         """Run ``cmd`` under this sandbox with extra seccomp-notif handlers.
 
-        ``handlers`` is a sequence of ``(syscall_nr, Handler)`` pairs;
-        ``syscall_nr`` is the kernel syscall number to intercept (e.g.
-        ``257`` for ``openat`` on x86_64) and ``Handler`` is an instance
-        of :class:`sandlock.handler.Handler`. See that class for handler
+        ``handlers`` is a sequence of ``(syscall, Handler)`` pairs.
+        ``syscall`` is either a syscall name (``str``, e.g. ``"openat"``)
+        resolved for the host architecture, or a raw kernel syscall
+        number (``int``). Prefer the name — raw numbers are
+        architecture-specific. A name sandlock cannot resolve raises
+        ``ValueError``; syscalls sandlock does not filter (e.g.
+        ``getpid``) are not name-resolvable and must be passed as an
+        ``int``. ``Handler`` is an instance of
+        :class:`sandlock.handler.Handler`; see that class for handler
         semantics.
 
         Ownership of every ``Handler`` is held by the sandlock supervisor
@@ -544,7 +549,8 @@ class Sandbox:
 
         Args:
             cmd: Command and arguments to execute.
-            handlers: Sequence of ``(syscall_nr, Handler)`` pairs.
+            handlers: Sequence of ``(syscall, Handler)`` pairs, where
+                ``syscall`` is a name (``str``) or raw number (``int``).
             name: Optional sandbox name. ``None`` resolves to the same
                 auto-generated name as :meth:`run`.
 
@@ -566,7 +572,10 @@ class Sandbox:
         if self._handle is not None:
             raise RuntimeError("sandbox is already running")
 
-        handlers = list(handlers)
+        # Resolve syscall keys (str name -> host-arch number, int as is)
+        # up front: an unknown name fails loudly here, before any native
+        # policy is built or any handler container is allocated.
+        handlers = [(_resolve_syscall(key), h) for key, h in list(handlers)]
         native = self._ensure_native()
         argv, argc = _make_argv(list(cmd))
         resolved_name = name if name is not None else self._resolve_name()
@@ -622,11 +631,14 @@ class Sandbox:
                 if regs[j].handler:
                     _lib.sandlock_handler_free(regs[j].handler)
             # A container created by sandlock_handler_new in the failing
-            # iteration but not yet stored into regs[i] (e.g.
-            # int(syscall_nr) raised between the alloc and the store).
-            # It is owned by nothing else — free it here. After a
-            # successful store ``container`` is None, so this branch
-            # never double-frees a container already covered above.
+            # iteration but not yet stored into regs[i]. With syscall
+            # numbers resolved up front, no step currently sits between
+            # the alloc and the store that can raise — but this stays as
+            # forward defense (a future fallible step there would leak
+            # the container otherwise). It is owned by nothing else, so
+            # free it here. After a successful store ``container`` is
+            # None, so this branch never double-frees a container
+            # already covered above.
             if container:
                 _lib.sandlock_handler_free(container)
             # The current slot `i` registered a handler id but its
@@ -1033,3 +1045,45 @@ def _encode(s: str) -> bytes:
     if b'\x00' in result:
         raise ValueError(f"NUL byte in string argument: {result!r}")
     return result
+
+
+def _resolve_syscall(key) -> int:
+    """Resolve a handler-registration key to a kernel syscall number.
+
+    ``key`` is either:
+
+    * an ``int`` — a raw kernel syscall number, used as is; or
+    * a ``str`` — a syscall name (e.g. ``"openat"``), resolved for the
+      host architecture so callers need not hard-code arch-specific
+      numbers.
+
+    A numeric string (e.g. ``"257"``) is treated as a name, not a
+    number — it will not resolve; pass an ``int`` for a raw number.
+
+    Raises ``ValueError`` for a name sandlock cannot resolve (syscalls
+    sandlock does not filter, e.g. ``getpid``, are not name-resolvable
+    and must be passed as an ``int``), and ``TypeError`` for any other
+    key type.
+    """
+    # bool is an int subclass: True/False would otherwise slip through
+    # the int branch and resolve to syscalls 1/0 (write/read) — a silent
+    # wrong registration. Reject before the int check.
+    if isinstance(key, bool):
+        raise TypeError(
+            "syscall key must be a name (str) or number (int), not bool"
+        )
+    if isinstance(key, str):
+        from ._sdk import _lib
+        nr = _lib.sandlock_syscall_nr(_encode(key))
+        if nr < 0:
+            raise ValueError(
+                f"unknown syscall name {key!r}: sandlock cannot resolve it "
+                f"— pass the raw kernel syscall number as an int instead"
+            )
+        return nr
+    if isinstance(key, int):
+        return key
+    raise TypeError(
+        f"syscall key must be a name (str) or number (int), "
+        f"got {type(key).__name__}"
+    )
