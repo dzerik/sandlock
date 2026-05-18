@@ -1785,9 +1785,25 @@ impl Sandbox {
             });
 
             let extra_handlers = std::mem::take(&mut self.rt_mut().extra_handlers);
+            let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
             self.rt_mut().notif_handle = Some(tokio::spawn(
-                notif::supervisor(notif_fd, ctx, extra_handlers),
+                notif::supervisor(notif_fd, ctx, extra_handlers, startup_tx),
             ));
+            // Wait for the supervisor to register the notif fd with the IO
+            // driver before we release the child to execve. Otherwise an
+            // early traced syscall would queue a notification on a fd no
+            // one is polling, and the child would block until the next
+            // `block_on` re-enters the runtime. Critical for current-thread
+            // runtimes, harmless overhead for multi-thread.
+            match startup_rx.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Err(SandboxRuntimeError::Io(e).into()),
+                Err(_) => {
+                    return Err(SandboxRuntimeError::Child(
+                        "seccomp supervisor exited during startup".into(),
+                    ).into());
+                }
+            }
 
             let la_resource = Arc::clone(&res_state);
             self.rt_mut().loadavg_handle = Some(tokio::spawn(async move {
