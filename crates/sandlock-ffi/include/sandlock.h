@@ -245,6 +245,10 @@ typedef enum sandlock_exception_policy {
     SANDLOCK_EXCEPTION_DENY_EPERM = 1,
     /** Let the syscall continue unchanged (explicit fail-open). */
     SANDLOCK_EXCEPTION_CONTINUE   = 2,
+    /** Fail the syscall with EIO. Idiomatic for audit-only handlers that
+     *  propagate the failure as a plain OSError rather than
+     *  PermissionError. */
+    SANDLOCK_EXCEPTION_DENY_EIO   = 3,
 } sandlock_exception_policy_t;
 
 /** Opaque handler container.
@@ -349,6 +353,17 @@ sandlock_result_t *sandlock_run_interactive_with_handlers(
     const char *const *argv, unsigned int argc,
     const sandlock_handler_registration_t *registrations,
     size_t nregistrations);
+
+/** Resolve a syscall name (e.g. "openat") to its kernel syscall number
+ * for the host architecture, for use as a `sandlock_handler_registration_t`
+ * `syscall_nr`. Saves callers from hard-coding architecture-specific
+ * numbers.
+ *
+ * Returns -1 if `name` is NULL, is not valid UTF-8, or names a syscall
+ * sandlock does not know. The resolvable set covers the syscalls
+ * sandlock filters or supervises; syscalls outside that set (e.g.
+ * `getpid`) return -1 and must be registered by raw number. */
+int64_t sandlock_syscall_nr(const char *name);
 
 #ifdef __cplusplus
 }
