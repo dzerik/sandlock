@@ -1007,3 +1007,60 @@ def test_path_deny_handler_uses_custom_errno(monkeypatch):
     handler = PathDenyHandler(deny=["/etc/*"], errno=_e.EACCES)
     assert handler.handle(_make_ctx(syscall_nr=_openat_nr())) == \
         NotifAction.errno(_e.EACCES)
+
+
+def test_path_allow_list_handler_default_policy_is_kill():
+    from sandlock.presets import PathAllowListHandler
+    assert PathAllowListHandler(allow=[]).on_exception == ExceptionPolicy.KILL
+
+
+def test_path_allow_list_handler_rejects_non_list_allow():
+    from sandlock.presets import PathAllowListHandler
+    with pytest.raises(TypeError):
+        PathAllowListHandler(allow="/tmp/*")  # type: ignore[arg-type]
+
+
+def test_path_allow_list_handler_allows_matching_path(monkeypatch):
+    from sandlock.handler import HandlerCtx
+    from sandlock.presets import PathAllowListHandler
+    monkeypatch.setattr(HandlerCtx, "read_path",
+                        lambda self, max_len=4096: "/tmp/ok")
+    handler = PathAllowListHandler(allow=["/tmp/*"])
+    assert handler.handle(_make_ctx(syscall_nr=_openat_nr())) == \
+        NotifAction.continue_()
+
+
+def test_path_allow_list_handler_denies_non_matching_path(monkeypatch):
+    from sandlock.handler import HandlerCtx
+    from sandlock.presets import PathAllowListHandler
+    import errno as _e
+    monkeypatch.setattr(HandlerCtx, "read_path",
+                        lambda self, max_len=4096: "/etc/passwd")
+    handler = PathAllowListHandler(allow=["/tmp/*"])
+    assert handler.handle(_make_ctx(syscall_nr=_openat_nr())) == \
+        NotifAction.errno(_e.EACCES)
+
+
+def test_path_allow_list_handler_denies_on_none_path(monkeypatch):
+    """Allow-list contract: cannot verify -> deny (fail-closed)."""
+    from sandlock.handler import HandlerCtx
+    from sandlock.presets import PathAllowListHandler
+    import errno as _e
+    monkeypatch.setattr(HandlerCtx, "read_path",
+                        lambda self, max_len=4096: None)
+    handler = PathAllowListHandler(allow=["/tmp/*"])
+    assert handler.handle(_make_ctx(syscall_nr=_openat_nr())) == \
+        NotifAction.errno(_e.EACCES)
+
+
+def test_path_allow_list_handler_uses_custom_errno(monkeypatch):
+    """The errno= constructor parameter overrides the default on a
+    non-match. Pins the public-API surface (symmetric with the deny test)."""
+    from sandlock.handler import HandlerCtx
+    from sandlock.presets import PathAllowListHandler
+    import errno as _e
+    monkeypatch.setattr(HandlerCtx, "read_path",
+                        lambda self, max_len=4096: "/etc/passwd")
+    handler = PathAllowListHandler(allow=["/tmp/*"], errno=_e.EPERM)
+    assert handler.handle(_make_ctx(syscall_nr=_openat_nr())) == \
+        NotifAction.errno(_e.EPERM)

@@ -92,3 +92,41 @@ class PathDenyHandler(Handler):
             if fnmatch.fnmatchcase(path, pattern):
                 return NotifAction.errno(self.errno)
         return NotifAction.continue_()
+
+
+class PathAllowListHandler(Handler):
+    """Allow only syscalls whose path matches a pattern in ``allow``; deny others.
+
+    ``on_exception=KILL`` — security handler, fail-closed if it itself errors.
+
+    The ``path is None`` case is deliberately restrictive: an allow-list
+    claims "everything except the listed paths is denied", so failing to
+    verify the path means failing closed (deny).
+
+    Patterns are tested in the order given; the first match wins.
+    """
+
+    on_exception = ExceptionPolicy.KILL
+
+    def __init__(
+        self,
+        allow: list[str],
+        errno: int = _errno.EACCES,
+        max_len: int = 4096,
+    ) -> None:
+        if not isinstance(allow, list):
+            raise TypeError(
+                f"allow must be a list of str patterns, got {type(allow).__name__}"
+            )
+        self.allow = allow
+        self.errno = errno
+        self.max_len = max_len
+
+    def handle(self, ctx: HandlerCtx) -> NotifAction:
+        path = ctx.read_path(max_len=self.max_len)
+        if path is None:
+            return NotifAction.errno(self.errno)
+        for pattern in self.allow:
+            if fnmatch.fnmatchcase(path, pattern):
+                return NotifAction.continue_()
+        return NotifAction.errno(self.errno)
