@@ -196,6 +196,11 @@ def _reverse_path_table() -> dict[int, str]:
         rev: dict[int, str] = {}
         for name in list(_PATH_ARG) + list(_MULTI_PATH):
             nr = _lib.sandlock_syscall_nr(name.encode())
+            # Names absent on this kernel are intentionally skipped — read_path()
+            # then reports the number as unknown, which is the spec'd behaviour
+            # (see PR 3 design doc). Note: a syscall the kernel does not know
+            # cannot be registered for handler dispatch via sandlock_syscall_nr,
+            # so a notification with that nr cannot arrive in practice.
             if nr >= 0:
                 rev[nr] = name
         _REVERSE_PATH_TABLE = rev
