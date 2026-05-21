@@ -37,6 +37,10 @@ class AuditPathsHandler(Handler):
     is whatever :meth:`HandlerCtx.read_path` returns for the syscall; the
     callback is invoked even when it is ``None`` so the caller sees
     "couldn't read".
+
+    ``callback`` may be invoked concurrently on the same handler instance
+    from different supervisor worker threads — if it mutates shared state,
+    the caller must provide its own synchronization.
     """
 
     on_exception = ExceptionPolicy.CONTINUE
