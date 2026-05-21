@@ -1064,3 +1064,21 @@ def test_path_allow_list_handler_uses_custom_errno(monkeypatch):
     handler = PathAllowListHandler(allow=["/tmp/*"], errno=_e.EPERM)
     assert handler.handle(_make_ctx(syscall_nr=_openat_nr())) == \
         NotifAction.errno(_e.EPERM)
+
+
+def test_log_syscalls_handler_default_policy_is_continue():
+    from sandlock.presets import LogSyscallsHandler
+    assert LogSyscallsHandler().on_exception == ExceptionPolicy.CONTINUE
+
+
+def test_log_syscalls_handler_emits_one_line_and_continues():
+    from sandlock.presets import LogSyscallsHandler
+    lines: list[str] = []
+    handler = LogSyscallsHandler(logger=lines.append)
+    ctx = _make_ctx(syscall_nr=_openat_nr(), args=(3, 0xABCD, 0, 0, 0, 0))
+    action = handler.handle(ctx)
+    assert action == NotifAction.continue_()
+    assert len(lines) == 1
+    assert f"syscall={_openat_nr()}" in lines[0]
+    assert "pid=1" in lines[0]
+    assert "args=(3, 43981, 0, 0, 0, 0)" in lines[0]

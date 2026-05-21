@@ -130,3 +130,28 @@ class PathAllowListHandler(Handler):
             if fnmatch.fnmatchcase(path, pattern):
                 return NotifAction.continue_()
         return NotifAction.errno(self.errno)
+
+
+class LogSyscallsHandler(Handler):
+    """Log each intercepted syscall as one line; never modify behaviour.
+
+    ``on_exception=CONTINUE`` — observational handler. The default logger
+    is ``logging.getLogger("sandlock.audit").info``; pass any
+    ``Callable[[str], None]`` to redirect (e.g. a list's ``append`` for
+    tests).
+
+    If ``logger`` raises, the exception is absorbed by
+    ``on_exception=CONTINUE`` — the child proceeds but the log line is
+    silently lost.
+    """
+
+    on_exception = ExceptionPolicy.CONTINUE
+
+    def __init__(self, logger: Callable[[str], None] | None = None) -> None:
+        self.logger = logger or logging.getLogger("sandlock.audit").info
+
+    def handle(self, ctx: HandlerCtx) -> NotifAction:
+        self.logger(
+            f"syscall={ctx.syscall_nr} pid={ctx.pid} args={ctx.args}"
+        )
+        return NotifAction.continue_()
