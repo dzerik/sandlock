@@ -902,3 +902,52 @@ def test_reverse_path_table_only_contains_known_names():
     known = set(_PATH_ARG) | _MULTI_PATH
     for nr, name in rev.items():
         assert name in known, f"reverse map leaked unknown name {name!r} for nr={nr}"
+
+
+# ----------------------------------------------------------------
+# Preset handlers — sandlock.presets.
+# ----------------------------------------------------------------
+
+
+def test_common_path_syscalls_lists_modern_path_syscalls():
+    from sandlock.presets import COMMON_PATH_SYSCALLS
+    assert "openat" in COMMON_PATH_SYSCALLS
+    assert "execveat" in COMMON_PATH_SYSCALLS
+    assert len(COMMON_PATH_SYSCALLS) == len(set(COMMON_PATH_SYSCALLS))
+
+
+def test_audit_paths_handler_default_policy_is_continue():
+    from sandlock.presets import AuditPathsHandler
+    h = AuditPathsHandler(callback=lambda p, c: None)
+    assert h.on_exception == ExceptionPolicy.CONTINUE
+
+
+def test_audit_paths_handler_calls_callback_and_continues(monkeypatch):
+    from sandlock.handler import HandlerCtx
+    from sandlock.presets import AuditPathsHandler
+    monkeypatch.setattr(HandlerCtx, "read_path",
+                        lambda self, max_len=4096: "/tmp/probe")
+    seen = []
+    handler = AuditPathsHandler(callback=lambda p, ctx: seen.append((p, ctx.pid)))
+    action = handler.handle(_make_ctx(syscall_nr=_openat_nr()))
+    assert action == NotifAction.continue_()
+    assert seen == [("/tmp/probe", 1)]
+
+
+def test_audit_paths_handler_invokes_callback_even_on_none_path(monkeypatch):
+    from sandlock.handler import HandlerCtx
+    from sandlock.presets import AuditPathsHandler
+    monkeypatch.setattr(HandlerCtx, "read_path",
+                        lambda self, max_len=4096: None)
+    seen = []
+    handler = AuditPathsHandler(callback=lambda p, c: seen.append(p))
+    handler.handle(_make_ctx(syscall_nr=_openat_nr()))
+    assert seen == [None]
+
+
+def test_presets_not_reexported_from_root():
+    """The root sandlock package must stay minimal; presets are imported
+    explicitly from sandlock.presets."""
+    import sandlock
+    assert not hasattr(sandlock, "AuditPathsHandler")
+    assert not hasattr(sandlock, "COMMON_PATH_SYSCALLS")
