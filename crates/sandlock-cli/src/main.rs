@@ -490,11 +490,7 @@ async fn run_command(args: RunArgs) -> Result<()> {
     let image_cmd: Option<Vec<String>>;
     if let Some(ref img) = args.image {
         let rootfs = sandlock_core::image::extract(img, None)?;
-        builder = builder.chroot(rootfs);
-        // Add standard paths inside the chroot
-        builder = builder.fs_read("/usr").fs_read("/lib").fs_read("/lib64")
-            .fs_read("/bin").fs_read("/sbin").fs_read("/etc")
-            .fs_read("/proc").fs_read("/dev");
+        builder = builder.chroot(rootfs).fs_read("/");
         if args.cmd.is_empty() {
             image_cmd = Some(sandlock_core::image::inspect_cmd(img)?);
         } else {
