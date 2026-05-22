@@ -254,3 +254,11 @@ def test_policy_extra_readable_is_added():
     pol = policy_for_tool(workspace="/tmp/ws", extra_readable=["/opt/tools"])
     assert "/opt/tools" in pol.fs_readable
     assert "/tmp/ws" in pol.fs_readable  # default still present
+
+
+def test_worker_invokes_module_function(capsys):
+    import sandlock.mcp._worker as worker
+    here = os.path.dirname(os.path.abspath(__file__))
+    rc = worker.main(["--syspath", here, "_worker_fixture", "echo", '{"text": "hi"}'])
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == "fixture:hi"
