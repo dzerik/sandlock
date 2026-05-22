@@ -625,12 +625,15 @@ fresh per-call sandbox. Module-level imports, helpers, constants, and state
 are all fine; lambdas, methods, and nested functions are rejected. Guard any
 module startup logic under `if __name__ == "__main__":`.
 
+A tool that declares a parameter named `workspace` receives the sandbox's
+workspace path automatically (injected at call time, hidden from the LLM
+schema, and not overridable by the model). No env wiring needed.
+
 ```python
 # tools.py  (an importable module)
 import os
 
-def read_file(path: str) -> str:
-    workspace = os.environ["SANDLOCK_WORKSPACE"]
+def read_file(path: str, *, workspace: str) -> str:
     with open(os.path.join(workspace, path)) as f:
         return f.read()
 ```
@@ -640,7 +643,6 @@ import tools
 
 mcp.add_tool("read_file", tools.read_file,
     description="Read a file from the workspace",
-    capabilities={"env": {"SANDLOCK_WORKSPACE": "/tmp/agent"}},
 )
 ```
 

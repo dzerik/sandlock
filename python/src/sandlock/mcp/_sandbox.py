@@ -128,6 +128,10 @@ class McpSandbox:
         are rejected, and any startup logic in the module must be guarded
         under ``if __name__ == "__main__":``.
 
+        If the function declares a parameter named ``workspace``, the
+        sandbox's workspace path is injected for it at call time (hidden
+        from the tool schema and not overridable by the caller).
+
         Args:
             name: Tool name.
             func: Python function implementing the tool.
