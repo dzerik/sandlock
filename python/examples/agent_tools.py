@@ -12,16 +12,14 @@ import os
 from urllib.request import urlopen
 
 
-def read_file(path: str) -> str:
+def read_file(path: str, *, workspace: str) -> str:
     """Read a file from the workspace."""
-    workspace = os.environ["SANDLOCK_WORKSPACE"]
     with open(os.path.join(workspace, path)) as f:
         return f.read()
 
 
-def write_file(path: str, content: str) -> str:
+def write_file(path: str, content: str, *, workspace: str) -> str:
     """Write content to a file in the workspace."""
-    workspace = os.environ["SANDLOCK_WORKSPACE"]
     full = os.path.join(workspace, path)
     parent = os.path.dirname(full)
     if parent:
@@ -39,9 +37,8 @@ def run_python(code: str) -> str:
     return buf.getvalue()
 
 
-def list_files() -> str:
+def list_files(*, workspace: str) -> str:
     """List files in the workspace."""
-    workspace = os.environ["SANDLOCK_WORKSPACE"]
     entries = sorted(os.listdir(workspace))
     lines = []
     for e in entries:
