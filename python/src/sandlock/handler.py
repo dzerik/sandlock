@@ -38,7 +38,7 @@ class NotifAction:
 
     - CONTINUE: no payload fields used.
     - ERRNO: ``errno_value`` set.
-    - RETURN_VALUE: ``return_value`` set (factory: ``return_value_``).
+    - RETURN_VALUE: ``return_value`` set (factory: ``returns``).
     - INJECT_FD_SEND: ``srcfd``, ``newfd_flags`` set; the supervisor
       takes ownership of the fd on dispatch.
     - HOLD: no payload fields used.
@@ -68,7 +68,7 @@ class NotifAction:
         return cls(kind=int(_ActionKind.ERRNO), errno_value=value)
 
     @classmethod
-    def return_value_(cls, value: int) -> NotifAction:
+    def returns(cls, value: int) -> NotifAction:
         return cls(kind=int(_ActionKind.RETURN_VALUE), return_value=value)
 
     @classmethod
@@ -150,6 +150,61 @@ class Handler:
         raise NotImplementedError(
             "Handler subclasses must override handle(ctx) -> NotifAction"
         )
+
+
+# Single-path syscalls — name -> 0-based index of the path argument.
+# Keys are syscall NAMES (arch-agnostic); the reverse map below resolves
+# them to host-arch numbers via the C ABI's sandlock_syscall_nr.
+_PATH_ARG: dict[str, int] = {
+    "openat": 1, "open": 0,
+    "unlinkat": 1, "unlink": 0,
+    "mkdirat": 1, "mkdir": 0,
+    "rmdir": 0,
+    "newfstatat": 1, "statx": 1, "stat": 0, "lstat": 0,
+    "faccessat": 1, "access": 0,
+    "readlinkat": 1, "readlink": 0,
+    "execve": 0, "execveat": 1,
+}
+
+# Multi-path syscalls — listed only so we give a helpful error message
+# instructing the caller to pass arg= explicitly.
+_MULTI_PATH: set[str] = {
+    "renameat2", "rename", "linkat", "link", "symlinkat", "symlink",
+}
+
+# Invariant: a syscall is either single-path (entry in _PATH_ARG) or
+# multi-path (entry in _MULTI_PATH), never both. Checked at module load
+# so a future edit that puts a multi-path name into _PATH_ARG fails
+# loudly instead of silently letting auto-arg resolve a "primary" path
+# for a multi-path syscall.
+assert not (set(_PATH_ARG) & _MULTI_PATH), (
+    "single-path / multi-path tables must be disjoint; overlap: "
+    f"{set(_PATH_ARG) & _MULTI_PATH}"
+)
+
+# Lazy, memoised: syscall_nr -> name. Built on first read_path() call by
+# resolving every known name via the C ABI's sandlock_syscall_nr. Names
+# the host kernel does not know are silently absent (read_path() then
+# reports the number as unknown, which is correct).
+_REVERSE_PATH_TABLE: dict[int, str] | None = None
+
+
+def _reverse_path_table() -> dict[int, str]:
+    global _REVERSE_PATH_TABLE
+    if _REVERSE_PATH_TABLE is None:
+        from ._sdk import _lib
+        rev: dict[int, str] = {}
+        for name in list(_PATH_ARG) + list(_MULTI_PATH):
+            nr = _lib.sandlock_syscall_nr(name.encode())
+            # Names absent on this kernel are intentionally skipped — read_path()
+            # then reports the number as unknown, which is the spec'd behaviour
+            # (see PR 3 design doc). Note: a syscall the kernel does not know
+            # cannot be registered for handler dispatch via sandlock_syscall_nr,
+            # so a notification with that nr cannot arrive in practice.
+            if nr >= 0:
+                rev[nr] = name
+        _REVERSE_PATH_TABLE = rev
+    return _REVERSE_PATH_TABLE
 
 
 class _MemHandle:
@@ -248,3 +303,36 @@ class HandlerCtx:
             return False
         from . import _handler_ffi
         return _handler_ffi.mem_write(cell.ptr, addr, data)
+
+    def read_path(self, arg: int | None = None, max_len: int = 4096) -> str | None:
+        """Read a path syscall argument from the child as a Python string.
+
+        With ``arg=None`` (default) the path-argument index is inferred
+        from ``self.syscall_nr`` via a name-keyed table. Multi-path
+        syscalls (renameat2, rename, linkat, link, symlinkat, symlink)
+        and syscalls not in the table raise ``ValueError`` — pass
+        ``arg=`` explicitly in those cases.
+
+        With an explicit ``arg`` (0..5), reads the path from
+        ``self.args[arg]`` without consulting the table.
+
+        On a live ``HandlerCtx`` returns the decoded string; on a stale
+        or absent mem handle returns ``None`` (the behaviour of
+        :meth:`read_cstr`).
+        """
+        if arg is None:
+            name = _reverse_path_table().get(self.syscall_nr)
+            if name is None:
+                raise ValueError(
+                    f"read_path: syscall_nr {self.syscall_nr} is not a known "
+                    f"path syscall — pass arg= explicitly"
+                )
+            if name in _MULTI_PATH:
+                raise ValueError(
+                    f"read_path: {name} has multiple path args — pass arg= "
+                    f"explicitly (e.g. arg=1 and arg=3 for renameat2)"
+                )
+            arg = _PATH_ARG[name]
+        if not (0 <= arg < 6):
+            raise ValueError(f"read_path: arg must be in 0..5, got {arg}")
+        return self.read_cstr(self.args[arg], max_len)

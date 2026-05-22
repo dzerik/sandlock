@@ -23,7 +23,7 @@ def test_notif_action_kill_carries_sig_and_pgid():
 
 
 def test_notif_action_return_value_carries_value():
-    a = NotifAction.return_value_(42)
+    a = NotifAction.returns(42)
     assert a.kind == 3
     assert a.return_value == 42  # field, not the classmethod
 
@@ -491,7 +491,7 @@ def test_handler_errno_action_makes_child_observe_eperm(tmp_dir):
 
 
 def test_handler_return_value_action_overrides_getpid():
-    """A handler returning NotifAction.return_value_(777) must make the
+    """A handler returning NotifAction.returns(777) must make the
     child's os.getpid() return the synthetic 777 — only reachable if the
     trampoline translates the ReturnValue action into
     sandlock_action_set_return_value."""
@@ -507,7 +507,7 @@ def test_handler_return_value_action_overrides_getpid():
         on_exception = ExceptionPolicy.KILL
 
         def handle(self, ctx):
-            return NotifAction.return_value_(777)
+            return NotifAction.returns(777)
 
     sb = sandlock.Sandbox(fs_readable=_PYTHON_READABLE)
     result = sb.run_with_handlers(
@@ -819,3 +819,346 @@ def test_run_with_handlers_rejects_unknown_syscall_name():
             cmd=["/bin/true"],
             handlers=[("definitely_not_a_real_syscall", _Noop())],
         )
+
+
+# ----------------------------------------------------------------
+# HandlerCtx.read_path — name-keyed path-arg resolution.
+# ----------------------------------------------------------------
+
+
+def _openat_nr() -> int:
+    from sandlock._sdk import _lib
+    return _lib.sandlock_syscall_nr(b"openat")
+
+
+def _renameat2_nr() -> int:
+    from sandlock._sdk import _lib
+    return _lib.sandlock_syscall_nr(b"renameat2")
+
+
+def _make_ctx(*, syscall_nr: int, args=(0, 0, 0, 0, 0, 0)):
+    from sandlock.handler import HandlerCtx
+    return HandlerCtx(
+        id=1, pid=1, flags=0, syscall_nr=syscall_nr, arch=0,
+        instruction_pointer=0, args=args,
+    )
+
+
+def test_read_path_auto_arg_resolves_openat_to_args1(monkeypatch):
+    """For openat, read_path() with no arg= must read the path from args[1]."""
+    from sandlock.handler import HandlerCtx
+    captured = []
+    monkeypatch.setattr(
+        HandlerCtx, "read_cstr",
+        lambda self, addr, max_len: (captured.append((addr, max_len)) or "/tmp/x"),
+    )
+    ctx = _make_ctx(syscall_nr=_openat_nr(),
+                    args=(0, 0xCAFEBABE, 0, 0, 0, 0))
+    result = ctx.read_path()
+    assert result == "/tmp/x"
+    assert captured == [(0xCAFEBABE, 4096)]
+
+
+def test_read_path_multi_path_syscall_requires_explicit_arg():
+    """renameat2 has two path args; read_path() without arg= must raise."""
+    if _renameat2_nr() < 0:
+        pytest.skip("renameat2 not known to host kernel")
+    ctx = _make_ctx(syscall_nr=_renameat2_nr())
+    with pytest.raises(ValueError, match="renameat2"):
+        ctx.read_path()
+
+
+def test_read_path_unknown_syscall_requires_explicit_arg():
+    """A syscall_nr no path-table entry knows about must raise with
+    instructions to pass arg= explicitly."""
+    ctx = _make_ctx(syscall_nr=99999)
+    with pytest.raises(ValueError, match="pass arg= explicitly"):
+        ctx.read_path()
+
+
+def test_read_path_rejects_arg_out_of_range():
+    ctx = _make_ctx(syscall_nr=_openat_nr())
+    for bad in (-1, 6, 99):
+        with pytest.raises(ValueError, match="arg"):
+            ctx.read_path(arg=bad)
+
+
+def test_read_path_explicit_arg_works_for_multi_path(monkeypatch):
+    """An explicit arg= bypasses the multi-path / unknown check."""
+    from sandlock.handler import HandlerCtx
+    monkeypatch.setattr(HandlerCtx, "read_cstr",
+                        lambda self, addr, max_len: "/from")
+    ctx = _make_ctx(syscall_nr=_renameat2_nr(),
+                    args=(0, 0x1, 0, 0x2, 0, 0))
+    assert ctx.read_path(arg=1) == "/from"
+
+
+def test_reverse_path_table_only_contains_known_names():
+    """The lazily-built reverse map must contain only names from the two
+    source tables — locks the contract so a future change cannot leak
+    other names into auto-arg resolution."""
+    from sandlock.handler import (
+        _PATH_ARG, _MULTI_PATH, _reverse_path_table,
+    )
+    rev = _reverse_path_table()
+    known = set(_PATH_ARG) | _MULTI_PATH
+    for nr, name in rev.items():
+        assert name in known, f"reverse map leaked unknown name {name!r} for nr={nr}"
+
+
+# ----------------------------------------------------------------
+# Preset handlers — sandlock.presets.
+# ----------------------------------------------------------------
+
+
+def test_common_path_syscalls_lists_modern_path_syscalls():
+    from sandlock.presets import COMMON_PATH_SYSCALLS
+    assert "openat" in COMMON_PATH_SYSCALLS
+    assert "execveat" in COMMON_PATH_SYSCALLS
+    assert len(COMMON_PATH_SYSCALLS) == len(set(COMMON_PATH_SYSCALLS))
+
+
+def test_audit_paths_handler_default_policy_is_continue():
+    from sandlock.presets import AuditPathsHandler
+    h = AuditPathsHandler(callback=lambda p, c: None)
+    assert h.on_exception == ExceptionPolicy.CONTINUE
+
+
+def test_audit_paths_handler_calls_callback_and_continues(monkeypatch):
+    from sandlock.handler import HandlerCtx
+    from sandlock.presets import AuditPathsHandler
+    monkeypatch.setattr(HandlerCtx, "read_path",
+                        lambda self, max_len=4096: "/tmp/probe")
+    seen = []
+    handler = AuditPathsHandler(callback=lambda p, ctx: seen.append((p, ctx.pid)))
+    action = handler.handle(_make_ctx(syscall_nr=_openat_nr()))
+    assert action == NotifAction.continue_()
+    assert seen == [("/tmp/probe", 1)]
+
+
+def test_audit_paths_handler_invokes_callback_even_on_none_path(monkeypatch):
+    from sandlock.handler import HandlerCtx
+    from sandlock.presets import AuditPathsHandler
+    monkeypatch.setattr(HandlerCtx, "read_path",
+                        lambda self, max_len=4096: None)
+    seen = []
+    handler = AuditPathsHandler(callback=lambda p, c: seen.append(p))
+    handler.handle(_make_ctx(syscall_nr=_openat_nr()))
+    assert seen == [None]
+
+
+def test_presets_not_reexported_from_root():
+    """The root sandlock package must stay minimal; presets are imported
+    explicitly from sandlock.presets."""
+    import sandlock
+    assert not hasattr(sandlock, "AuditPathsHandler")
+    assert not hasattr(sandlock, "COMMON_PATH_SYSCALLS")
+
+
+def test_path_deny_handler_default_policy_is_kill():
+    from sandlock.presets import PathDenyHandler
+    assert PathDenyHandler(deny=[]).on_exception == ExceptionPolicy.KILL
+
+
+def test_path_deny_handler_rejects_non_list_deny():
+    from sandlock.presets import PathDenyHandler
+    with pytest.raises(TypeError):
+        PathDenyHandler(deny="/etc/*")  # type: ignore[arg-type]
+
+
+def test_path_deny_handler_denies_matching_path(monkeypatch):
+    from sandlock.handler import HandlerCtx
+    from sandlock.presets import PathDenyHandler
+    import errno as _e
+    monkeypatch.setattr(HandlerCtx, "read_path",
+                        lambda self, max_len=4096: "/etc/shadow")
+    handler = PathDenyHandler(deny=["/etc/*"])
+    assert handler.handle(_make_ctx(syscall_nr=_openat_nr())) == \
+        NotifAction.errno(_e.EPERM)
+
+
+def test_path_deny_handler_passes_non_matching_path(monkeypatch):
+    from sandlock.handler import HandlerCtx
+    from sandlock.presets import PathDenyHandler
+    monkeypatch.setattr(HandlerCtx, "read_path",
+                        lambda self, max_len=4096: "/tmp/ok")
+    handler = PathDenyHandler(deny=["/etc/*"])
+    assert handler.handle(_make_ctx(syscall_nr=_openat_nr())) == \
+        NotifAction.continue_()
+
+
+def test_path_deny_handler_continues_on_none_path(monkeypatch):
+    """Deny-list contract: cannot classify -> defer (continue), not deny."""
+    from sandlock.handler import HandlerCtx
+    from sandlock.presets import PathDenyHandler
+    monkeypatch.setattr(HandlerCtx, "read_path",
+                        lambda self, max_len=4096: None)
+    handler = PathDenyHandler(deny=["/etc/*"])
+    assert handler.handle(_make_ctx(syscall_nr=_openat_nr())) == \
+        NotifAction.continue_()
+
+
+def test_path_deny_handler_uses_custom_errno(monkeypatch):
+    """The errno= constructor parameter is the value returned on a match —
+    not always EPERM. Pins the public-API surface."""
+    from sandlock.handler import HandlerCtx
+    from sandlock.presets import PathDenyHandler
+    import errno as _e
+    monkeypatch.setattr(HandlerCtx, "read_path",
+                        lambda self, max_len=4096: "/etc/shadow")
+    handler = PathDenyHandler(deny=["/etc/*"], errno=_e.EACCES)
+    assert handler.handle(_make_ctx(syscall_nr=_openat_nr())) == \
+        NotifAction.errno(_e.EACCES)
+
+
+def test_path_allow_list_handler_default_policy_is_kill():
+    from sandlock.presets import PathAllowHandler
+    assert PathAllowHandler(allow=[]).on_exception == ExceptionPolicy.KILL
+
+
+def test_path_allow_list_handler_rejects_non_list_allow():
+    from sandlock.presets import PathAllowHandler
+    with pytest.raises(TypeError):
+        PathAllowHandler(allow="/tmp/*")  # type: ignore[arg-type]
+
+
+def test_path_allow_list_handler_allows_matching_path(monkeypatch):
+    from sandlock.handler import HandlerCtx
+    from sandlock.presets import PathAllowHandler
+    monkeypatch.setattr(HandlerCtx, "read_path",
+                        lambda self, max_len=4096: "/tmp/ok")
+    handler = PathAllowHandler(allow=["/tmp/*"])
+    assert handler.handle(_make_ctx(syscall_nr=_openat_nr())) == \
+        NotifAction.continue_()
+
+
+def test_path_allow_list_handler_denies_non_matching_path(monkeypatch):
+    from sandlock.handler import HandlerCtx
+    from sandlock.presets import PathAllowHandler
+    import errno as _e
+    monkeypatch.setattr(HandlerCtx, "read_path",
+                        lambda self, max_len=4096: "/etc/passwd")
+    handler = PathAllowHandler(allow=["/tmp/*"])
+    assert handler.handle(_make_ctx(syscall_nr=_openat_nr())) == \
+        NotifAction.errno(_e.EACCES)
+
+
+def test_path_allow_list_handler_denies_on_none_path(monkeypatch):
+    """Allow-list contract: cannot verify -> deny (fail-closed)."""
+    from sandlock.handler import HandlerCtx
+    from sandlock.presets import PathAllowHandler
+    import errno as _e
+    monkeypatch.setattr(HandlerCtx, "read_path",
+                        lambda self, max_len=4096: None)
+    handler = PathAllowHandler(allow=["/tmp/*"])
+    assert handler.handle(_make_ctx(syscall_nr=_openat_nr())) == \
+        NotifAction.errno(_e.EACCES)
+
+
+def test_path_allow_list_handler_uses_custom_errno(monkeypatch):
+    """The errno= constructor parameter overrides the default on a
+    non-match. Pins the public-API surface (symmetric with the deny test)."""
+    from sandlock.handler import HandlerCtx
+    from sandlock.presets import PathAllowHandler
+    import errno as _e
+    monkeypatch.setattr(HandlerCtx, "read_path",
+                        lambda self, max_len=4096: "/etc/passwd")
+    handler = PathAllowHandler(allow=["/tmp/*"], errno=_e.EPERM)
+    assert handler.handle(_make_ctx(syscall_nr=_openat_nr())) == \
+        NotifAction.errno(_e.EPERM)
+
+
+def test_log_syscalls_handler_default_policy_is_continue():
+    from sandlock.presets import LogSyscallsHandler
+    assert LogSyscallsHandler().on_exception == ExceptionPolicy.CONTINUE
+
+
+def test_log_syscalls_handler_emits_one_line_and_continues():
+    from sandlock.presets import LogSyscallsHandler
+    lines: list[str] = []
+    handler = LogSyscallsHandler(logger=lines.append)
+    ctx = _make_ctx(syscall_nr=_openat_nr(), args=(3, 0xABCD, 0, 0, 0, 0))
+    action = handler.handle(ctx)
+    assert action == NotifAction.continue_()
+    assert len(lines) == 1
+    assert f"syscall={_openat_nr()}" in lines[0]
+    assert "pid=1" in lines[0]
+    assert "args=(3, 43981, 0, 0, 0, 0)" in lines[0]
+
+
+def test_audit_paths_handler_e2e_counts_probe_opens(tmp_dir):
+    """Success criterion: AuditPathsHandler + COMMON_PATH_SYSCALLS observes
+    the child's opens of a unique probe file the expected number of times.
+    Exercises the public preset API plus HandlerCtx.read_path() through the
+    live trampoline."""
+    if not os.path.exists(_SYSTEM_PYTHON):
+        pytest.skip(f"{_SYSTEM_PYTHON} not available")
+
+    from sandlock.presets import AuditPathsHandler, COMMON_PATH_SYSCALLS
+
+    probe = tmp_dir / "preset-probe-file"
+    probe.write_text("x")
+    probe_path = str(probe)
+
+    seen: list[str] = []
+    seen_all: list[str | None] = []
+
+    def _cb(path, _ctx):
+        seen_all.append(path)
+        if path == probe_path:
+            seen.append(path)
+
+    audit = AuditPathsHandler(callback=_cb)
+
+    sb = sandlock.Sandbox(fs_readable=[*_PYTHON_READABLE, str(tmp_dir)])
+    script = (
+        "import os\n"
+        "for _ in range(3):\n"
+        "    fd = os.open(%r, os.O_RDONLY)\n"
+        "    os.close(fd)\n" % probe_path
+    )
+    result = sb.run_with_handlers(
+        cmd=[_SYSTEM_PYTHON, "-c", script],
+        handlers=[(s, audit) for s in COMMON_PATH_SYSCALLS],
+    )
+
+    assert result.success, result
+    assert len(seen) == 3, (
+        f"expected 3 opens of probe at {probe_path!r}; got {len(seen)} matched. "
+        f"Total handler invocations: {len(seen_all)}; "
+        f"first few paths seen: {seen_all[:10]}"
+    )
+
+
+def test_log_syscalls_handler_e2e_observes_openat(tmp_dir):
+    """LogSyscallsHandler captures one line per intercepted syscall
+    through the live trampoline. Pin syscall=, pid=, args= structure."""
+    if not os.path.exists(_SYSTEM_PYTHON):
+        pytest.skip(f"{_SYSTEM_PYTHON} not available")
+
+    from sandlock.presets import LogSyscallsHandler
+
+    probe = tmp_dir / "log-syscalls-probe"
+    probe.write_text("x")
+    probe_path = str(probe)
+
+    lines: list[str] = []
+    handler = LogSyscallsHandler(logger=lines.append)
+
+    sb = sandlock.Sandbox(fs_readable=[*_PYTHON_READABLE, str(tmp_dir)])
+    script = (
+        "import os\n"
+        "fd = os.open(%r, os.O_RDONLY)\n"
+        "os.close(fd)\n" % probe_path
+    )
+    result = sb.run_with_handlers(
+        cmd=[_SYSTEM_PYTHON, "-c", script],
+        handlers=[("openat", handler)],
+    )
+
+    assert result.success, result
+    # At least one openat line was captured (the supervisor may also see
+    # other openat calls from the child's runtime initialization, so
+    # exact count is not pinned).
+    assert any("syscall=" in line and "pid=" in line and "args=(" in line
+               for line in lines), f"no recognizable log line; got {lines[:5]}"
