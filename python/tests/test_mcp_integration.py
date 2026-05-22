@@ -11,6 +11,13 @@ import pytest
 
 from sandlock.mcp import policy_for_tool, McpSandbox
 
+from _tool_helpers import (
+    _read_file_tool,
+    _write_file_tool,
+    _run_python_tool,
+    _list_files_tool,
+)
+
 
 # -- Helpers --
 
@@ -18,37 +25,6 @@ def _run_in_sandbox(capabilities, script, workspace, timeout=15.0):
     """Run a script in a sandbox with given capabilities."""
     policy = policy_for_tool(workspace=workspace, capabilities=capabilities)
     return policy.run([sys.executable, "-c", script], timeout=timeout)
-
-
-# -- Tool functions for McpSandbox tests --
-
-def _read_file_tool(path: str) -> str:
-    import os
-    workspace = os.environ["SANDLOCK_WORKSPACE"]
-    with open(os.path.join(workspace, path)) as f:
-        return f.read()
-
-
-def _write_file_tool(path: str, content: str) -> str:
-    import os
-    workspace = os.environ["SANDLOCK_WORKSPACE"]
-    with open(os.path.join(workspace, path), "w") as f:
-        f.write(content)
-    return f"wrote {len(content)} bytes"
-
-
-def _run_python_tool(code: str) -> str:
-    import io, contextlib
-    buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
-        exec(code)
-    return buf.getvalue()
-
-
-def _list_files_tool() -> str:
-    import os, json
-    workspace = os.environ["SANDLOCK_WORKSPACE"]
-    return json.dumps(sorted(os.listdir(workspace)))
 
 
 # -- Tests --
@@ -262,3 +238,33 @@ def test_worker_invokes_module_function(capsys):
     rc = worker.main(["--syspath", here, "_worker_fixture", "echo", '{"text": "hi"}'])
     assert rc == 0
     assert capsys.readouterr().out.strip() == "fixture:hi"
+
+
+def test_module_level_state_tool_runs(tmp_path):
+    import _worker_fixture  # tests dir is on sys.path under pytest
+    mcp = McpSandbox(workspace=str(tmp_path))
+    mcp.add_tool("echo", _worker_fixture.echo)  # top-level import + const + helper
+    out = asyncio.run(mcp.call_tool("echo", {"text": "hi"}))
+    assert out.strip() == "fixture:hi"
+
+
+def test_lambda_rejected():
+    with pytest.raises(ValueError):
+        McpSandbox().add_tool("bad", lambda x: x)
+
+
+def test_method_rejected():
+    class C:
+        def m(self, x):
+            return x
+    with pytest.raises(ValueError):
+        McpSandbox().add_tool("bad", C().m)
+
+
+def test_nested_function_rejected():
+    def outer():
+        def inner(x):
+            return x
+        return inner
+    with pytest.raises(ValueError):
+        McpSandbox().add_tool("bad", outer())

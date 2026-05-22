@@ -16,6 +16,7 @@ Example::
 from __future__ import annotations
 
 import os
+import site
 import sys
 from dataclasses import fields
 from typing import Any, Mapping, Sequence
@@ -26,6 +27,33 @@ from ..sandbox import Sandbox
 # processes can always exec the current interpreter, even when it lives
 # outside the standard system paths (e.g. /opt on CI, virtualenvs, etc.).
 _PYTHON_PREFIX = sys.prefix
+
+
+def _interpreter_readable() -> list[str]:
+    """Paths the sandboxed worker must read to launch and import a tool.
+
+    Covers the interpreter prefixes, the site-packages directories, and the
+    sandlock package root (the last so the worker script is readable even in
+    an editable install).
+    """
+    paths = [sys.prefix, sys.base_prefix]
+    try:
+        paths.extend(site.getsitepackages())
+    except Exception:
+        pass
+    try:
+        paths.append(site.getusersitepackages())
+    except Exception:
+        pass
+    # Parent of the 'sandlock' package dir, e.g. .../site-packages or the
+    # editable source root .../python/src.
+    paths.append(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    )
+    return [p for p in dict.fromkeys(paths) if p and os.path.isdir(p)]
+
+
+_INTERP_READABLE = _interpreter_readable()
 
 
 _POLICY_FIELDS = frozenset(f.name for f in fields(Sandbox))
@@ -67,7 +95,7 @@ def policy_for_tool(
         "fs_writable": [],
         "fs_readable": list(dict.fromkeys([
             workspace, "/usr", "/lib", "/lib64", "/etc", "/bin", "/sbin",
-            _PYTHON_PREFIX, *extra_readable,
+            _PYTHON_PREFIX, *_INTERP_READABLE, *extra_readable,
         ])),
         "net_bind": [],
         "net_allow": [],
