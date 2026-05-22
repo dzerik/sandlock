@@ -121,8 +121,12 @@ class McpSandbox:
     ) -> None:
         """Register a local tool.
 
-        The function runs in a per-call sandbox.  It must be
-        self-contained (imports inside the function body).
+        Each call runs in a fresh per-call sandbox.  The function must be
+        a top-level function in an import-safe module: the worker imports
+        that module by name, so module-level imports, helpers, constants,
+        and state are all fine, but lambdas, methods, and nested functions
+        are rejected, and any startup logic in the module must be guarded
+        under ``if __name__ == "__main__":``.
 
         Args:
             name: Tool name.

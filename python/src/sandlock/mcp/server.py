@@ -50,7 +50,7 @@ from mcp.server.stdio import stdio_server
 from ._sandbox import McpSandbox
 
 # ---------------------------------------------------------------------------
-# Built-in tool functions (self-contained — imports inside body)
+# Built-in tool functions (top-level functions in this importable module)
 # ---------------------------------------------------------------------------
 
 

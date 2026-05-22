@@ -619,17 +619,26 @@ mcp = McpSandbox(workspace="/tmp/agent", timeout=30.0)
 
 #### `mcp.add_tool(name, func, *, description="", capabilities=None, input_schema=None)`
 
-Register a local tool. The function must be self-contained (imports inside
-the body) -- it is serialized and executed in a fresh sandbox process.
+Register a local tool. `func` must be a top-level function in an import-safe
+module: the worker imports that module by name and calls the function in a
+fresh per-call sandbox. Module-level imports, helpers, constants, and state
+are all fine; lambdas, methods, and nested functions are rejected. Guard any
+module startup logic under `if __name__ == "__main__":`.
 
 ```python
+# tools.py  (an importable module)
+import os
+
 def read_file(path: str) -> str:
-    import os
     workspace = os.environ["SANDLOCK_WORKSPACE"]
     with open(os.path.join(workspace, path)) as f:
         return f.read()
+```
 
-mcp.add_tool("read_file", read_file,
+```python
+import tools
+
+mcp.add_tool("read_file", tools.read_file,
     description="Read a file from the workspace",
     capabilities={"env": {"SANDLOCK_WORKSPACE": "/tmp/agent"}},
 )
