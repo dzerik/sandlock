@@ -246,3 +246,11 @@ class TestMcpSandboxLocalTools:
             assert "HELLO" in await mcp.call_tool("read_file", {"path": "out.txt"})
 
         self._run(workflow())
+
+
+# -- Import-by-entrypoint execution --
+
+def test_policy_extra_readable_is_added():
+    pol = policy_for_tool(workspace="/tmp/ws", extra_readable=["/opt/tools"])
+    assert "/opt/tools" in pol.fs_readable
+    assert "/tmp/ws" in pol.fs_readable  # default still present

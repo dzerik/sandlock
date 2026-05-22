@@ -36,6 +36,7 @@ def policy_for_tool(
     *,
     workspace: str = "/tmp/sandlock",
     capabilities: Mapping[str, Any] | None = None,
+    extra_readable: Sequence[str] = (),
 ) -> Sandbox:
     """Build a :class:`Sandbox` from explicit capabilities.
 
@@ -66,7 +67,7 @@ def policy_for_tool(
         "fs_writable": [],
         "fs_readable": list(dict.fromkeys([
             workspace, "/usr", "/lib", "/lib64", "/etc", "/bin", "/sbin",
-            _PYTHON_PREFIX,
+            _PYTHON_PREFIX, *extra_readable,
         ])),
         "net_bind": [],
         "net_allow": [],
