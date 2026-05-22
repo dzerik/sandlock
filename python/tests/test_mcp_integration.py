@@ -277,3 +277,21 @@ def test_llm_cannot_override_workspace(tmp_path):
     mcp.add_tool("whereami", _worker_fixture.whereami)
     out = asyncio.run(mcp.call_tool("whereami", {"workspace": "/evil"}))
     assert out.strip() == str(tmp_path)
+
+
+def test_builtins_import_does_not_pull_in_mcp():
+    """The per-call worker imports the built-in tools' module; it must stay
+    light, i.e. not drag in the heavy ``mcp`` framework."""
+    import subprocess
+    code = "import sandlock.mcp._builtins, sys; print('mcp' in sys.modules)"
+    out = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True,
+    )
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == "False", out.stdout
+
+
+def test_create_server_still_importable():
+    """create_server is lazily importable from the package."""
+    from sandlock.mcp import create_server
+    assert callable(create_server)
