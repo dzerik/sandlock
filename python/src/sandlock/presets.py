@@ -4,7 +4,7 @@
 Imported explicitly:
 
     from sandlock.presets import AuditPathsHandler, PathDenyHandler, \
-        PathAllowListHandler, LogSyscallsHandler, COMMON_PATH_SYSCALLS
+        PathAllowHandler, LogSyscallsHandler, COMMON_PATH_SYSCALLS
 
 The root ``sandlock`` package deliberately does not re-export these — the
 root surface stays minimal; callers reach for presets when they want them.
@@ -98,7 +98,7 @@ class PathDenyHandler(Handler):
         return NotifAction.continue_()
 
 
-class PathAllowListHandler(Handler):
+class PathAllowHandler(Handler):
     """Allow only syscalls whose path matches a pattern in ``allow``; deny others.
 
     ``on_exception=KILL`` — security handler, fail-closed if it itself errors.

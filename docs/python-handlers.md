@@ -122,7 +122,7 @@ handlers = [(s, my_handler) for s in COMMON_PATH_SYSCALLS]
   "everything else is allowed", so when the path cannot be classified we
   defer to Landlock and other handlers in the chain.
 
-### `PathAllowListHandler(allow: list[str], errno=errno.EACCES, max_len=4096)`
+### `PathAllowHandler(allow: list[str], errno=errno.EACCES, max_len=4096)`
 
 - `on_exception=KILL` — security handler, fail-closed.
 - `allow` is a `list[str]` of `fnmatch` patterns; passing a single string
@@ -162,7 +162,7 @@ sb.run_with_handlers(cmd, [(s, deny) for s in COMMON_PATH_SYSCALLS])
 ### Allow-list paths (fail-closed)
 
 ```python
-allow = PathAllowListHandler(allow=["/tmp/sandbox/*", "/usr/lib/*"])
+allow = PathAllowHandler(allow=["/tmp/sandbox/*", "/usr/lib/*"])
 sb.run_with_handlers(cmd, [(s, allow) for s in COMMON_PATH_SYSCALLS])
 ```
 
