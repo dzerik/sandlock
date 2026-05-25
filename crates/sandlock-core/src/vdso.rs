@@ -259,9 +259,11 @@ fn vdso_targets() -> Vec<(&'static str, &'static str, u32)> {
 //
 // Like aarch64, riscv64 places a full stub in the slack space at the tail of
 // the vDSO mapping and patches each function entry with a single 4-byte `j`
-// (jal x0) that jumps to its stub. Inline time-offset virtualization is not
-// yet implemented on riscv64; the offset stubs simply force a real syscall so
-// that seccomp can intercept it (the offset is not applied in the vDSO).
+// (jal x0) that jumps to its stub. The offset stubs run the real syscall, then
+// add the time offset to the returned tv_sec (mirroring x86_64/aarch64). The
+// 64-bit offset is stored as data at the tail of each stub and loaded
+// PC-relative via `auipc`, so the stub is position-independent. It is read with
+// two naturally-aligned 4-byte loads (lwu/lw) to avoid a misaligned 8-byte load.
 // ============================================================
 
 /// Emit `li a7, value` (load syscall number into a7/x17). Uses a single `addi`
@@ -312,6 +314,76 @@ fn riscv_j_insn(from: u64, to: u64) -> Result<u32, SandlockError> {
     Ok((b20 << 31) | (b10_1 << 21) | (b11 << 20) | (b19_12 << 12) | 0x6f)
 }
 
+/// Minimal RV64I instruction encoders for the time-offset stubs. Registers are
+/// ABI numbers; the stubs touch only caller-saved temporaries (t0-t6) and the
+/// syscall registers (a0/a1/a7), so they need no prologue/epilogue.
+#[cfg(target_arch = "riscv64")]
+mod rv {
+    pub const X0: u32 = 0;
+    pub const T0: u32 = 5;
+    pub const T1: u32 = 6;
+    pub const T2: u32 = 7;
+    pub const A0: u32 = 10;
+    pub const A1: u32 = 11;
+    pub const A7: u32 = 17;
+    pub const T3: u32 = 28;
+    pub const T4: u32 = 29;
+    pub const T5: u32 = 30;
+    pub const T6: u32 = 31;
+    pub const ECALL: u32 = 0x0000_0073;
+    pub const RET: u32 = 0x0000_8067; // jalr x0, 0(ra)
+
+    pub fn addi(rd: u32, rs1: u32, imm: i32) -> u32 {
+        ((imm as u32 & 0xfff) << 20) | (rs1 << 15) | (rd << 7) | 0x13
+    }
+    /// `mv rd, rs` == `addi rd, rs, 0`
+    pub fn mv(rd: u32, rs: u32) -> u32 {
+        addi(rd, rs, 0)
+    }
+    pub fn auipc(rd: u32, imm20: u32) -> u32 {
+        (imm20 << 12) | (rd << 7) | 0x17
+    }
+    pub fn lwu(rd: u32, rs1: u32, imm: i32) -> u32 {
+        ((imm as u32 & 0xfff) << 20) | (rs1 << 15) | (6 << 12) | (rd << 7) | 0x03
+    }
+    pub fn lw(rd: u32, rs1: u32, imm: i32) -> u32 {
+        ((imm as u32 & 0xfff) << 20) | (rs1 << 15) | (2 << 12) | (rd << 7) | 0x03
+    }
+    pub fn ld(rd: u32, rs1: u32, imm: i32) -> u32 {
+        ((imm as u32 & 0xfff) << 20) | (rs1 << 15) | (3 << 12) | (rd << 7) | 0x03
+    }
+    pub fn sd(rs2: u32, rs1: u32, imm: i32) -> u32 {
+        let i = imm as u32;
+        ((i >> 5 & 0x7f) << 25) | (rs2 << 20) | (rs1 << 15) | (3 << 12) | ((i & 0x1f) << 7) | 0x23
+    }
+    pub fn slli(rd: u32, rs1: u32, shamt: u32) -> u32 {
+        ((shamt & 0x3f) << 20) | (rs1 << 15) | (1 << 12) | (rd << 7) | 0x13
+    }
+    pub fn or(rd: u32, rs1: u32, rs2: u32) -> u32 {
+        (rs2 << 20) | (rs1 << 15) | (6 << 12) | (rd << 7) | 0x33
+    }
+    pub fn add(rd: u32, rs1: u32, rs2: u32) -> u32 {
+        (rs2 << 20) | (rs1 << 15) | (rd << 7) | 0x33
+    }
+    pub fn beq(rs1: u32, rs2: u32, imm: i32) -> u32 {
+        branch(0, rs1, rs2, imm)
+    }
+    pub fn bne(rs1: u32, rs2: u32, imm: i32) -> u32 {
+        branch(1, rs1, rs2, imm)
+    }
+    fn branch(funct3: u32, rs1: u32, rs2: u32, imm: i32) -> u32 {
+        let i = imm as u32;
+        ((i >> 12 & 1) << 31)
+            | ((i >> 5 & 0x3f) << 25)
+            | (rs2 << 20)
+            | (rs1 << 15)
+            | (funct3 << 12)
+            | ((i >> 1 & 0xf) << 8)
+            | ((i >> 11 & 1) << 7)
+            | 0x63
+    }
+}
+
 #[cfg(target_arch = "riscv64")]
 fn simple_stub(syscall_nr: u32) -> Vec<u8> {
     let mut stub = Vec::new();
@@ -321,16 +393,67 @@ fn simple_stub(syscall_nr: u32) -> Vec<u8> {
     stub
 }
 
+/// clock_gettime(clockid=a0, timespec*=a1): run the real syscall, then add the
+/// time offset to tv_sec for CLOCK_REALTIME (0) and CLOCK_REALTIME_COARSE (5).
 #[cfg(target_arch = "riscv64")]
-fn offset_stub_clock_gettime(_offset_secs: i64) -> Vec<u8> {
-    // Inline offset application is not implemented on riscv64; force a real
-    // syscall so seccomp can intercept it.
-    simple_stub(libc::SYS_clock_gettime as u32)
+fn offset_stub_clock_gettime(offset_secs: i64) -> Vec<u8> {
+    use rv::*;
+    const DOFF: i32 = 36; // bytes from the `auipc` to the embedded offset data
+    let nr = libc::SYS_clock_gettime as i32;
+    let insns: [u32; 16] = [
+        mv(T0, A0),           // save clockid (a0 is overwritten by the return)
+        mv(T4, A1),           // save timespec*
+        addi(A7, X0, nr),     // li a7, SYS_clock_gettime
+        ECALL,                // a0 = kernel return value (preserved to the caller)
+        beq(T0, X0, 12),      // clockid == CLOCK_REALTIME -> apply
+        addi(T1, X0, 5),      // li t1, CLOCK_REALTIME_COARSE
+        bne(T0, T1, 36),      // clockid != COARSE -> end (skip offset)
+        auipc(T2, 0),         // apply: t2 = &this instruction
+        lwu(T5, T2, DOFF),    // t5 = low 32 bits of offset (zero-extended)
+        lw(T6, T2, DOFF + 4), // t6 = high 32 bits (sign-extended)
+        slli(T6, T6, 32),
+        or(T2, T5, T6),       // t2 = full 64-bit offset
+        ld(T3, T4, 0),        // t3 = tv_sec
+        add(T3, T3, T2),      // t3 += offset
+        sd(T3, T4, 0),        // tv_sec = t3
+        RET,                  // end
+    ];
+    let mut stub = Vec::with_capacity(insns.len() * 4 + 8);
+    for insn in insns {
+        push_insn(&mut stub, insn);
+    }
+    stub.extend_from_slice(&offset_secs.to_le_bytes());
+    stub
 }
 
+/// gettimeofday(timeval*=a0): run the real syscall, then add the time offset to
+/// tv_sec, unless the timeval pointer is NULL.
 #[cfg(target_arch = "riscv64")]
-fn offset_stub_gettimeofday(_offset_secs: i64) -> Vec<u8> {
-    simple_stub(libc::SYS_gettimeofday as u32)
+fn offset_stub_gettimeofday(offset_secs: i64) -> Vec<u8> {
+    use rv::*;
+    const DOFF: i32 = 36;
+    let nr = libc::SYS_gettimeofday as i32;
+    let insns: [u32; 13] = [
+        mv(T4, A0),           // save timeval*
+        addi(A7, X0, nr),     // li a7, SYS_gettimeofday
+        ECALL,
+        beq(T4, X0, 36),      // timeval == NULL -> end
+        auipc(T2, 0),
+        lwu(T5, T2, DOFF),
+        lw(T6, T2, DOFF + 4),
+        slli(T6, T6, 32),
+        or(T2, T5, T6),
+        ld(T3, T4, 0),        // t3 = tv_sec
+        add(T3, T3, T2),
+        sd(T3, T4, 0),
+        RET,                  // end
+    ];
+    let mut stub = Vec::with_capacity(insns.len() * 4 + 8);
+    for insn in insns {
+        push_insn(&mut stub, insn);
+    }
+    stub.extend_from_slice(&offset_secs.to_le_bytes());
+    stub
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -497,6 +620,24 @@ mod tests {
         // ecall and ret are fixed encodings.
         assert_eq!(&stub[4..8], &0x0000_0073u32.to_le_bytes());
         assert_eq!(&stub[8..12], &0x0000_8067u32.to_le_bytes());
+    }
+
+    #[test]
+    #[cfg(target_arch = "riscv64")]
+    fn test_offset_stub_riscv_layout() {
+        let off: i64 = -86400; // one day back
+        let cg = offset_stub_clock_gettime(off);
+        // 16 instructions (64 bytes) + 8-byte embedded offset.
+        assert_eq!(cg.len(), 72);
+        assert_eq!(&cg[64..72], &off.to_le_bytes(), "offset stored at tail");
+        assert_eq!(&cg[12..16], &0x0000_0073u32.to_le_bytes(), "ecall");
+        assert_eq!(&cg[60..64], &0x0000_8067u32.to_le_bytes(), "ret");
+
+        let gtod = offset_stub_gettimeofday(off);
+        // 13 instructions (52 bytes) + 8-byte embedded offset.
+        assert_eq!(gtod.len(), 60);
+        assert_eq!(&gtod[52..60], &off.to_le_bytes(), "offset stored at tail");
+        assert_eq!(&gtod[48..52], &0x0000_8067u32.to_le_bytes(), "ret");
     }
 
     #[test]
