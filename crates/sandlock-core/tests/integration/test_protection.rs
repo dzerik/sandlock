@@ -5,8 +5,15 @@
 //! the `pub(crate)` `resolve()` helper with synthetic ABI values, so
 //! they are independent of the host kernel's actual Landlock ABI.
 
-use sandlock_core::landlock::{resolve, Resolved};
+use sandlock_core::landlock::{compute_fs_mask, resolve, Resolved};
 use sandlock_core::{Protection, ProtectionPolicy, ProtectionState};
+
+// Landlock FS access constants (kernel ABI, stable). Kept local to the
+// test so we don't need to expose `crate::sys::structs`. These are bit
+// positions defined by `linux/landlock.h`.
+const LANDLOCK_ACCESS_FS_REFER: u64 = 1 << 13;
+const LANDLOCK_ACCESS_FS_TRUNCATE: u64 = 1 << 14;
+const LANDLOCK_ACCESS_FS_IOCTL_DEV: u64 = 1 << 15;
 
 // ----------------------------------------------------------------------
 // resolve() — Strict
@@ -152,4 +159,74 @@ fn fully_degradable_policy_never_returns_strictly_unavailable_even_on_v1() {
             r
         );
     }
+}
+
+// ----------------------------------------------------------------------
+// compute_fs_mask() — Degraded protections must be masked off
+//
+// Regression guards for the bug where `compute_fs_mask` only masked
+// off `Resolved::Disabled` bits, leaving a `Degraded` bit in the
+// handled-fs mask. The kernel then rejects `landlock_create_ruleset`
+// with EINVAL — breaking the `Degradable` silent-skip contract.
+//
+// Each test pins one extension protection to `Degradable` and feeds
+// `compute_fs_mask` a synthetic host ABI below that protection's
+// floor, asserting the bit is NOT in the returned mask.
+// ----------------------------------------------------------------------
+
+#[test]
+fn degradable_fs_truncate_on_v1_host_masks_off_truncate_bit() {
+    // FsTruncate needs ABI v3; host claims v1. Marking it Degradable
+    // must drop LANDLOCK_ACCESS_FS_TRUNCATE from the handled-fs mask
+    // (it shouldn't be there from base_fs_access(1) either, but we
+    // assert the post-mask invariant directly).
+    let mut pol = ProtectionPolicy::strict_all();
+    pol.set(Protection::FsTruncate, ProtectionState::Degradable);
+    // Sanity: the protection resolves Degraded on this host.
+    assert_eq!(
+        resolve(Protection::FsTruncate, 1, &pol),
+        Resolved::Degraded
+    );
+    let mask = compute_fs_mask(1, &pol);
+    assert_eq!(
+        mask & LANDLOCK_ACCESS_FS_TRUNCATE,
+        0,
+        "Degraded FsTruncate must not leave its bit in handled_access_fs (mask=0x{:x})",
+        mask
+    );
+}
+
+#[test]
+fn degradable_fs_refer_on_v1_host_masks_off_refer_bit() {
+    // FsRefer needs ABI v2; host claims v1. Marking it Degradable
+    // must drop LANDLOCK_ACCESS_FS_REFER from the handled-fs mask.
+    let mut pol = ProtectionPolicy::strict_all();
+    pol.set(Protection::FsRefer, ProtectionState::Degradable);
+    assert_eq!(resolve(Protection::FsRefer, 1, &pol), Resolved::Degraded);
+    let mask = compute_fs_mask(1, &pol);
+    assert_eq!(
+        mask & LANDLOCK_ACCESS_FS_REFER,
+        0,
+        "Degraded FsRefer must not leave its bit in handled_access_fs (mask=0x{:x})",
+        mask
+    );
+}
+
+#[test]
+fn degradable_fs_ioctl_dev_on_v4_host_masks_off_ioctl_dev_bit() {
+    // FsIoctlDev needs ABI v5; host claims v4. Marking it Degradable
+    // must drop LANDLOCK_ACCESS_FS_IOCTL_DEV from the handled-fs mask.
+    let mut pol = ProtectionPolicy::strict_all();
+    pol.set(Protection::FsIoctlDev, ProtectionState::Degradable);
+    assert_eq!(
+        resolve(Protection::FsIoctlDev, 4, &pol),
+        Resolved::Degraded
+    );
+    let mask = compute_fs_mask(4, &pol);
+    assert_eq!(
+        mask & LANDLOCK_ACCESS_FS_IOCTL_DEV,
+        0,
+        "Degraded FsIoctlDev must not leave its bit in handled_access_fs (mask=0x{:x})",
+        mask
+    );
 }

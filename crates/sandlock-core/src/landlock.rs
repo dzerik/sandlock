@@ -241,49 +241,77 @@ pub(crate) fn compute_scope_mask(abi: u32, pol: &ProtectionPolicy) -> u64 {
 
 /// Compute the `handled_access_fs` mask. Starts from the ABI-cumulative
 /// base set and masks off bits whose corresponding `Protection` is
-/// `Disabled` in the policy.
-pub(crate) fn compute_fs_mask(abi: u32, pol: &ProtectionPolicy) -> u64 {
+/// `Disabled` or `Degraded` in the policy.
+///
+/// `Degraded` means a `Degradable` protection on a host that does not
+/// provide the underlying kernel hook — declaring the bit anyway would
+/// fail `landlock_create_ruleset` with EINVAL and break the silent-skip
+/// contract. `base_fs_access(abi)` already gates each extension bit on
+/// the host ABI, so on a real host the `Degraded` bit is not in the
+/// base mask in the first place. Masking it off here is defence in
+/// depth: the contract is uniformly expressed regardless of how
+/// `base_fs_access` evolves, and the synthetic-ABI integration tests
+/// can exercise this code path directly.
+pub fn compute_fs_mask(abi: u32, pol: &ProtectionPolicy) -> u64 {
     let mut mask = base_fs_access(abi);
-    if resolve(Protection::FsRefer, abi, pol) == Resolved::Disabled {
+    if matches!(
+        resolve(Protection::FsRefer, abi, pol),
+        Resolved::Disabled | Resolved::Degraded
+    ) {
         mask &= !LANDLOCK_ACCESS_FS_REFER;
     }
-    if resolve(Protection::FsTruncate, abi, pol) == Resolved::Disabled {
+    if matches!(
+        resolve(Protection::FsTruncate, abi, pol),
+        Resolved::Disabled | Resolved::Degraded
+    ) {
         mask &= !LANDLOCK_ACCESS_FS_TRUNCATE;
     }
-    if resolve(Protection::FsIoctlDev, abi, pol) == Resolved::Disabled {
+    if matches!(
+        resolve(Protection::FsIoctlDev, abi, pol),
+        Resolved::Disabled | Resolved::Degraded
+    ) {
         mask &= !LANDLOCK_ACCESS_FS_IOCTL_DEV;
     }
     mask
 }
 
-/// Compute the `handled_access_net` mask, preserving the wildcard
-/// behaviour: when any TCP `--net-allow` rule covers every port we
-/// drop `CONNECT_TCP` from the handled set (the on-behalf path is then
-/// the sole enforcer). Returns `0` when `Protection::NetTcp` is not
-/// `Active` (either disabled by policy or degraded on a kernel that
-/// does not provide TCP network hooks).
-pub(crate) fn compute_net_mask(
+/// Compute the `handled_access_net` mask AND the TCP wildcard flag,
+/// preserving the wildcard behaviour: when any TCP `--net-allow` rule
+/// covers every port we drop `CONNECT_TCP` from the handled set (the
+/// on-behalf path is then the sole enforcer).
+///
+/// Returns `(0, false)` when `Protection::NetTcp` is not `Active`
+/// (either disabled by policy or degraded on a kernel that does not
+/// provide TCP network hooks).
+///
+/// Returning both the mask and the wildcard flag keeps the rule-
+/// installation site in `confine_inner` in sync with the mask: the
+/// caller no longer recomputes the wildcard from `sandbox.net_allow`,
+/// so divergence between the two derivations is impossible by
+/// construction.
+pub fn compute_net_mask(
     abi: u32,
     pol: &ProtectionPolicy,
     sandbox: &Sandbox,
     handle_net: bool,
-) -> u64 {
+) -> (u64, bool) {
     if !handle_net {
-        return 0;
+        return (0, false);
     }
     if resolve(Protection::NetTcp, abi, pol) != Resolved::Active {
-        return 0;
+        return (0, false);
     }
     use crate::sandbox::Protocol;
     let net_wildcard = sandbox
         .net_allow
         .iter()
         .any(|r| r.protocol == Protocol::Tcp && r.all_ports);
-    if net_wildcard {
+    let mask = if net_wildcard {
         LANDLOCK_ACCESS_NET_BIND_TCP
     } else {
         LANDLOCK_ACCESS_NET_BIND_TCP | LANDLOCK_ACCESS_NET_CONNECT_TCP
-    }
+    };
+    (mask, net_wildcard)
 }
 
 // ============================================================
@@ -358,12 +386,13 @@ fn confine_inner(policy: &Sandbox, handle_net: bool) -> Result<(), SandlockError
     // on-behalf path), so they're filtered out here — feeding them to
     // Landlock would either be a no-op (for unhandled protocols) or
     // wrongly install TCP rules from a UDP wildcard.
+    //
+    // `compute_net_mask` is the single source of truth for both the
+    // handled-net mask and the TCP wildcard flag: the rule-installation
+    // block below uses the same `net_wildcard` value the mask was
+    // derived from, so the two cannot diverge.
     use crate::sandbox::Protocol;
-    let net_wildcard = policy
-        .net_allow
-        .iter()
-        .any(|r| r.protocol == Protocol::Tcp && r.all_ports);
-    let handled_access_net = compute_net_mask(abi, pol, policy, handle_net);
+    let (handled_access_net, net_wildcard) = compute_net_mask(abi, pol, policy, handle_net);
 
     // Scope: IPC + signal isolation, each gated on its protection's
     // resolved state.
