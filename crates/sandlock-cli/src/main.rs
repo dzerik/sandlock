@@ -221,6 +221,14 @@ async fn main() -> Result<()> {
                     println!("  Device ioctl:   {}", if v >= 5 { "supported (ABI v5+)" } else { "not supported" });
                     println!("  IPC scoping:    {}", if v >= 6 { "supported (ABI v6+)" } else { "not supported" });
                     println!("  Signal scoping: {}", if v >= 6 { "supported (ABI v6+)" } else { "not supported" });
+
+                    println!();
+                    println!("Per-protection availability (host Landlock ABI v{}):", v);
+                    for p in sandlock_core::Protection::all() {
+                        let available = v >= p.min_abi();
+                        let marker = if available { "available" } else { "unavailable" };
+                        println!("  {:<22} requires v{} — {}", format!("{:?}", p), p.min_abi(), marker);
+                    }
                 }
                 Err(e) => {
                     println!("  Landlock: unavailable ({})", e);
