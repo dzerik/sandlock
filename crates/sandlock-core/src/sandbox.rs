@@ -11,6 +11,7 @@ use crate::context;
 use crate::error::SandboxError;
 pub use crate::http::{http_acl_check, normalize_path, prefix_or_exact_match, HttpRule};
 pub use crate::network::{NetAllow, Protocol};
+use crate::protection::ProtectionPolicy;
 
 /// A byte size value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -224,6 +225,18 @@ pub struct Sandbox {
     pub extra_deny_syscalls: Vec<String>,
     pub extra_allow_syscalls: Vec<String>,
 
+    /// Per-protection enforcement policy. Default
+    /// (`ProtectionPolicy::strict_all()`) preserves the historical hard
+    /// `MIN_ABI = 6` behaviour. Builder methods to deviate from
+    /// strict-all are added in a follow-up.
+    ///
+    /// Not serialized — policy-file representation of per-protection
+    /// state arrives with the public builder API in a later change.
+    /// Deserialized sandboxes get `ProtectionPolicy::default()`, which
+    /// is identical to `strict_all()`.
+    #[serde(skip)]
+    pub protection_policy: ProtectionPolicy,
+
     // Network
     /// Outbound endpoint allowlist as a list of `(protocol, host?, ports)`
     /// rules. Each rule names a protocol (TCP/UDP/ICMP) and either a
@@ -365,6 +378,7 @@ impl Clone for Sandbox {
             fs_denied: self.fs_denied.clone(),
             extra_deny_syscalls: self.extra_deny_syscalls.clone(),
             extra_allow_syscalls: self.extra_allow_syscalls.clone(),
+            protection_policy: self.protection_policy.clone(),
             net_allow: self.net_allow.clone(),
             net_bind: self.net_bind.clone(),
             http_allow: self.http_allow.clone(),
@@ -2343,6 +2357,7 @@ impl SandboxBuilder {
             fs_denied: self.fs_denied,
             extra_deny_syscalls: self.extra_deny_syscalls,
             extra_allow_syscalls: self.extra_allow_syscalls,
+            protection_policy: ProtectionPolicy::strict_all(),
             net_allow,
             net_bind: self.net_bind,
             http_allow,
