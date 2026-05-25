@@ -11,7 +11,7 @@ use crate::context;
 use crate::error::SandboxError;
 pub use crate::http::{http_acl_check, normalize_path, prefix_or_exact_match, HttpRule};
 pub use crate::network::{NetAllow, Protocol};
-use crate::protection::ProtectionPolicy;
+use crate::protection::{Protection, ProtectionPolicy, ProtectionStatus};
 
 /// A byte size value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -447,6 +447,18 @@ impl Sandbox {
             return Err(SandboxError::FsIsolationRequiresWorkdir);
         }
         Ok(())
+    }
+
+    /// Resolve the per-protection state against the host's current
+    /// Landlock ABI. Returns one entry per `Protection`. Useful for
+    /// post-`build()` posture inspection.
+    pub fn active_protections(&self) -> Result<Vec<(Protection, ProtectionStatus)>, crate::error::SandlockError> {
+        let host_abi = crate::landlock::abi_version().map_err(|e| {
+            crate::error::SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(e))
+        })?;
+        Ok(Protection::all()
+            .map(|p| (p, ProtectionStatus::resolve(p, host_abi, &self.protection_policy)))
+            .collect())
     }
 
     // ================================================================
