@@ -31,7 +31,7 @@ pub(crate) mod http_acl;
 pub use error::SandlockError;
 pub use sys::structs::{SeccompData, SeccompNotif};
 pub use checkpoint::Checkpoint;
-pub use protection::{Protection, ProtectionState, ProtectionPolicy};
+pub use protection::{Protection, ProtectionState, ProtectionPolicy, ProtectionStatus};
 pub use sandbox::{Confinement, ConfinementBuilder, Sandbox, SandboxBuilder};
 pub use result::{RunResult, ExitStatus};
 pub use pipeline::{Stage, Pipeline, Gather};

@@ -6,7 +6,7 @@
 //! they are independent of the host kernel's actual Landlock ABI.
 
 use sandlock_core::landlock::{compute_fs_mask, resolve, Resolved};
-use sandlock_core::{Protection, ProtectionPolicy, ProtectionState};
+use sandlock_core::{Protection, ProtectionPolicy, ProtectionState, ProtectionStatus};
 
 // Landlock FS access constants (kernel ABI, stable). Kept local to the
 // test so we don't need to expose `crate::sys::structs`. These are bit
@@ -229,4 +229,27 @@ fn degradable_fs_ioctl_dev_on_v4_host_masks_off_ioctl_dev_bit() {
         "Degraded FsIoctlDev must not leave its bit in handled_access_fs (mask=0x{:x})",
         mask
     );
+}
+
+// ----------------------------------------------------------------------
+// Sandbox::active_protections() runtime accessor
+// ----------------------------------------------------------------------
+
+#[test]
+fn active_protections_returns_six_entries() {
+    // Construct a default Sandbox; we don't actually run it — just
+    // call the accessor. The dev host has Landlock available, so
+    // abi_version() should succeed.
+    let sb = sandlock_core::Sandbox::builder().build_unchecked().expect("build");
+    let result = sb.active_protections().expect("ABI detect");
+    assert_eq!(result.len(), 6);
+}
+
+#[test]
+fn active_protections_reports_disabled_for_explicitly_off() {
+    let mut sb = sandlock_core::Sandbox::builder().build_unchecked().expect("build");
+    sb.protection_policy.set(Protection::SignalScope, ProtectionState::Disabled);
+    let result = sb.active_protections().expect("ABI detect");
+    let signal = result.iter().find(|(p, _)| *p == Protection::SignalScope).unwrap();
+    assert_eq!(signal.1, ProtectionStatus::Disabled);
 }

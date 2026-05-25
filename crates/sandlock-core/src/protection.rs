@@ -143,6 +143,36 @@ impl ProtectionPolicy {
     }
 }
 
+/// Per-protection runtime status, resolved against the host's
+/// Landlock ABI and the `ProtectionPolicy`. Returned by
+/// `Sandbox::active_protections()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtectionStatus {
+    /// Enforced (policy is Strict or Degradable, host supports it).
+    Active,
+    /// Policy named the protection as Degradable, host does not
+    /// support it — silently skipped.
+    Degraded,
+    /// Policy explicitly disabled the protection.
+    Disabled,
+    /// Policy was Strict and host does not support it — would have
+    /// caused `build()` to fail.
+    Unavailable,
+}
+
+impl ProtectionStatus {
+    pub(crate) fn resolve(p: Protection, host_abi: u32, pol: &ProtectionPolicy) -> Self {
+        let available = host_abi >= p.min_abi();
+        match (pol.state(p), available) {
+            (ProtectionState::Disabled, _) => ProtectionStatus::Disabled,
+            (ProtectionState::Strict, true) => ProtectionStatus::Active,
+            (ProtectionState::Strict, false) => ProtectionStatus::Unavailable,
+            (ProtectionState::Degradable, true) => ProtectionStatus::Active,
+            (ProtectionState::Degradable, false) => ProtectionStatus::Degraded,
+        }
+    }
+}
+
 #[cfg(test)]
 mod policy_tests {
     use super::*;
