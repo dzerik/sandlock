@@ -56,6 +56,42 @@ sandlock_builder_t *sandlock_sandbox_builder_env_var(sandlock_builder_t *b, cons
 sandlock_builder_t *sandlock_sandbox_builder_no_randomize_memory(sandlock_builder_t *b, bool v);
 sandlock_builder_t *sandlock_sandbox_builder_no_huge_pages(sandlock_builder_t *b, bool v);
 
+/* Landlock protections */
+
+/** Per-protection Landlock feature identifier.
+ *
+ * Discriminant values mirror the Rust `Protection` enum in
+ * `sandlock_core::protection::Protection`. Stable across releases; new
+ * protections are appended at higher discriminants. */
+typedef enum {
+    SANDLOCK_PROTECTION_FS_REFER                    = 0,
+    SANDLOCK_PROTECTION_FS_TRUNCATE                 = 1,
+    SANDLOCK_PROTECTION_NET_TCP                     = 2,
+    SANDLOCK_PROTECTION_FS_IOCTL_DEV                = 3,
+    SANDLOCK_PROTECTION_SIGNAL_SCOPE                = 4,
+    SANDLOCK_PROTECTION_ABSTRACT_UNIX_SOCKET_SCOPE  = 5,
+} sandlock_protection_t;
+
+/** Minimum Landlock ABI version the host kernel must support for the
+ *  given protection to be available. */
+uint32_t sandlock_protection_min_abi(sandlock_protection_t protection);
+
+/** Mark `protection` as degradable on the builder: enforced when the
+ *  host kernel supports it, silently skipped otherwise. Returns the
+ *  (possibly relocated) builder pointer; mirrors the move-semantics
+ *  convention of the other builder setters. */
+sandlock_builder_t *sandlock_sandbox_builder_allow_degraded(
+    sandlock_builder_t *b,
+    sandlock_protection_t protection);
+
+/** Mark `protection` as disabled on the builder: never enforced, even
+ *  on a host kernel that supports it. Returns the (possibly
+ *  relocated) builder pointer; mirrors the move-semantics convention
+ *  of the other builder setters. */
+sandlock_builder_t *sandlock_sandbox_builder_disable(
+    sandlock_builder_t *b,
+    sandlock_protection_t protection);
+
 /* Build & free */
 /* On failure, *err is set to -1 and *err_msg (if non-null) is set to a
  * heap-allocated C string with the error description. Caller frees it
