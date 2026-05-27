@@ -1174,7 +1174,16 @@ impl Sandbox {
         let resolved_net_allow = network::resolve_net_allow(&self.net_allow)
             .await
             .map_err(SandboxRuntimeError::Io)?;
-        let virtual_etc_hosts = resolved_net_allow.etc_hosts.clone();
+        // In chroot/image mode, seed the synthetic /etc/hosts from the
+        // rootfs's own file so entries baked into the image (private
+        // registries, internal hostnames, etc.) survive virtualization.
+        // Without a chroot, the helper returns the fixed loopback base.
+        // Either way, concrete-host rules from `net_allow` are appended
+        // on top.
+        let virtual_etc_hosts = network::compose_virtual_etc_hosts(
+            self.chroot.as_deref(),
+            &resolved_net_allow.concrete_host_entries,
+        );
 
         if !self.http_allow.is_empty() || !self.http_deny.is_empty() {
             let handle = crate::http_acl::spawn_http_acl_proxy(

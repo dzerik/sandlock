@@ -1037,9 +1037,12 @@ pub struct ResolvedNetAllowSet {
     pub tcp: ResolvedNetAllow,
     pub udp: ResolvedNetAllow,
     pub icmp: ResolvedNetAllow,
-    /// Synthetic `/etc/hosts` content combining every concrete host
-    /// across all protocols. `None` when no concrete hostnames appear.
-    pub etc_hosts: Option<String>,
+    /// `<ip> <hostname>\n` lines from every concrete-host rule across
+    /// every protocol, in resolution order. Empty when no concrete-host
+    /// rules are present. Combined with the loopback base (or, in chroot
+    /// mode, the image's `/etc/hosts`) by [`compose_virtual_etc_hosts`]
+    /// to build the synthetic file served to the sandbox.
+    pub concrete_host_entries: String,
 }
 
 /// Resolve `--net-allow` rules into per-protocol runtime allowlists.
@@ -1053,18 +1056,12 @@ pub struct ResolvedNetAllowSet {
 pub async fn resolve_net_allow(
     rules: &[NetAllow],
 ) -> io::Result<ResolvedNetAllowSet> {
-    // Single shared etc_hosts for all protocols. Every concrete host
-    // (regardless of protocol) ends up resolvable in the sandbox.
-    let mut etc_hosts = String::from("127.0.0.1 localhost\n::1 localhost\n");
-    let mut has_concrete_host = false;
-
     let per_proto = |target: Protocol| async move {
         let mut per_ip: HashMap<IpAddr, HashSet<u16>> = HashMap::new();
         let mut per_ip_all_ports: HashSet<IpAddr> = HashSet::new();
         let mut any_ip_ports: HashSet<u16> = HashSet::new();
         let mut any_ip_all_ports = false;
         let mut local_etc_hosts = String::new();
-        let mut local_has_concrete = false;
 
         for rule in rules.iter().filter(|r| r.protocol == target) {
             match &rule.host {
@@ -1080,7 +1077,6 @@ pub async fn resolve_net_allow(
                     }
                 }
                 Some(host) => {
-                    local_has_concrete = true;
                     let addr = format!("{}:0", host);
                     let resolved = tokio::net::lookup_host(addr.as_str()).await.map_err(|e| {
                         io::Error::new(
@@ -1113,25 +1109,83 @@ pub async fn resolve_net_allow(
                 any_ip_all_ports,
             },
             local_etc_hosts,
-            local_has_concrete,
         ))
     };
 
-    let (tcp, tcp_eh, tcp_concrete) = per_proto(Protocol::Tcp).await?;
-    let (udp, udp_eh, udp_concrete) = per_proto(Protocol::Udp).await?;
-    let (icmp, icmp_eh, icmp_concrete) = per_proto(Protocol::Icmp).await?;
+    let (tcp, tcp_eh) = per_proto(Protocol::Tcp).await?;
+    let (udp, udp_eh) = per_proto(Protocol::Udp).await?;
+    let (icmp, icmp_eh) = per_proto(Protocol::Icmp).await?;
 
+    let mut concrete_host_entries = String::new();
     for chunk in [tcp_eh, udp_eh, icmp_eh] {
-        etc_hosts.push_str(&chunk);
+        concrete_host_entries.push_str(&chunk);
     }
-    has_concrete_host |= tcp_concrete || udp_concrete || icmp_concrete;
 
     Ok(ResolvedNetAllowSet {
         tcp,
         udp,
         icmp,
-        etc_hosts: if has_concrete_host { Some(etc_hosts) } else { None },
+        concrete_host_entries,
     })
+}
+
+/// Compose the synthetic `/etc/hosts` served to the sandbox.
+///
+/// - **No chroot**: emit the fixed loopback base
+///   (`127.0.0.1 localhost\n::1 localhost\n`) followed by the
+///   concrete-host entries from [`resolve_net_allow`]. The sandbox sees
+///   the same baseline regardless of what the host's on-disk file says.
+/// - **With chroot**: read `<chroot>/etc/hosts` and use it as the base
+///   (an image that bakes in private-registry entries or similar keeps
+///   them). Inject loopback entries only for any localhost family the
+///   image doesn't already cover — never both, so we don't duplicate
+///   what the image already has. Concrete-host entries are still
+///   appended on top.
+///
+/// If a chroot is set but `<chroot>/etc/hosts` is unreadable (absent,
+/// permission denied, etc.), fall back to the bare loopback base — the
+/// sandbox always sees a usable hosts file.
+pub fn compose_virtual_etc_hosts(
+    chroot_root: Option<&std::path::Path>,
+    concrete_host_entries: &str,
+) -> String {
+    let mut out = String::new();
+    let mut has_v4_localhost = false;
+    let mut has_v6_localhost = false;
+
+    if let Some(root) = chroot_root {
+        if let Ok(image) = std::fs::read_to_string(root.join("etc").join("hosts")) {
+            for line in image.lines() {
+                // Strip an inline `#` comment before tokenizing — the
+                // hosts(5) format treats everything after `#` as a comment.
+                let stripped = line.split('#').next().unwrap_or("");
+                let mut parts = stripped.split_whitespace();
+                let Some(ip) = parts.next() else { continue };
+                for name in parts {
+                    if name == "localhost" {
+                        if ip == "127.0.0.1" {
+                            has_v4_localhost = true;
+                        } else if ip == "::1" {
+                            has_v6_localhost = true;
+                        }
+                    }
+                }
+            }
+            out.push_str(&image);
+            if !out.is_empty() && !out.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+    }
+
+    if !has_v4_localhost {
+        out.push_str("127.0.0.1 localhost\n");
+    }
+    if !has_v6_localhost {
+        out.push_str("::1 localhost\n");
+    }
+    out.push_str(concrete_host_entries);
+    out
 }
 
 // ============================================================
@@ -1318,7 +1372,8 @@ mod tests {
         assert!(resolved.tcp.any_ip_ports.is_empty());
         assert!(resolved.udp.per_ip.is_empty());
         assert!(resolved.icmp.per_ip.is_empty());
-        assert!(resolved.etc_hosts.is_none());
+        // No concrete-host rules → no resolved-entry lines.
+        assert!(resolved.concrete_host_entries.is_empty());
     }
 
     #[tokio::test]
@@ -1339,7 +1394,8 @@ mod tests {
         }
         assert!(resolved.udp.per_ip.is_empty());
         assert!(resolved.icmp.per_ip.is_empty());
-        assert!(resolved.etc_hosts.as_deref().unwrap_or("").contains("localhost"));
+        // The resolved entry (`<ip> localhost`) surfaces in concrete_host_entries.
+        assert!(resolved.concrete_host_entries.contains("127.0.0.1 localhost"));
     }
 
     #[tokio::test]
@@ -1354,7 +1410,8 @@ mod tests {
         assert!(resolved.tcp.per_ip.is_empty());
         assert!(resolved.tcp.any_ip_ports.contains(&8080));
         assert!(!resolved.tcp.any_ip_all_ports);
-        assert!(resolved.etc_hosts.is_none());
+        // Any-IP rule has no concrete host, so no resolved-entry line.
+        assert!(resolved.concrete_host_entries.is_empty());
     }
 
     #[tokio::test]
@@ -1394,7 +1451,7 @@ mod tests {
         for ip in resolved.tcp.per_ip_all_ports.iter() {
             assert!(resolved.tcp.per_ip.contains_key(ip));
         }
-        assert!(resolved.etc_hosts.is_some());
+        assert!(resolved.concrete_host_entries.contains("localhost"));
     }
 
     #[tokio::test]
@@ -1498,5 +1555,109 @@ mod tests {
         let resolved = resolve_net_allow(&rules).await.unwrap();
         assert!(resolved.icmp.any_ip_all_ports);
         assert!(!resolved.tcp.any_ip_all_ports);
+    }
+
+    // ============================================================
+    // compose_virtual_etc_hosts — synthetic /etc/hosts assembly
+    // ============================================================
+
+    use std::io::Write;
+
+    fn temp_rootfs_with_hosts(name: &str, hosts_content: Option<&str>) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "sandlock-test-compose-hosts-{}-{}",
+            name, std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(dir.join("etc"));
+        if let Some(content) = hosts_content {
+            let mut f = std::fs::File::create(dir.join("etc").join("hosts")).unwrap();
+            f.write_all(content.as_bytes()).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn compose_no_chroot_emits_loopback_base() {
+        // Default path — no chroot, no concrete-host rules → the same
+        // fixed loopback view we promise every sandbox.
+        let out = compose_virtual_etc_hosts(None, "");
+        assert_eq!(out, "127.0.0.1 localhost\n::1 localhost\n");
+    }
+
+    #[test]
+    fn compose_no_chroot_appends_concrete_entries() {
+        let out = compose_virtual_etc_hosts(None, "10.0.0.1 api\n");
+        assert_eq!(out, "127.0.0.1 localhost\n::1 localhost\n10.0.0.1 api\n");
+    }
+
+    #[test]
+    fn compose_chroot_seeds_from_image_and_injects_missing_loopback() {
+        // Image ships an entry of its own but no localhost mapping; the
+        // shim must keep the image's content and inject both loopback
+        // entries on top so the always-on guarantee still holds.
+        let rootfs = temp_rootfs_with_hosts(
+            "no-localhost",
+            Some("10.0.0.5 myimage.local\n"),
+        );
+        let out = compose_virtual_etc_hosts(Some(&rootfs), "");
+        assert!(out.contains("10.0.0.5 myimage.local"), "image entry missing: {out}");
+        assert!(out.contains("127.0.0.1 localhost"), "v4 loopback missing: {out}");
+        assert!(out.contains("::1 localhost"), "v6 loopback missing: {out}");
+        let _ = std::fs::remove_dir_all(&rootfs);
+    }
+
+    #[test]
+    fn compose_chroot_does_not_duplicate_existing_loopback() {
+        // Image already has both loopback entries — don't append duplicates.
+        let rootfs = temp_rootfs_with_hosts(
+            "both-localhost",
+            Some("127.0.0.1 localhost\n::1 localhost\n10.0.0.5 myimage.local\n"),
+        );
+        let out = compose_virtual_etc_hosts(Some(&rootfs), "");
+        assert_eq!(out.matches("127.0.0.1 localhost").count(), 1, "v4 dup'd: {out}");
+        assert_eq!(out.matches("::1 localhost").count(), 1, "v6 dup'd: {out}");
+        assert!(out.contains("10.0.0.5 myimage.local"));
+        let _ = std::fs::remove_dir_all(&rootfs);
+    }
+
+    #[test]
+    fn compose_chroot_injects_only_missing_family() {
+        // Image has v4 but no v6 localhost — inject only v6, leave v4 alone.
+        let rootfs = temp_rootfs_with_hosts(
+            "only-v4-localhost",
+            Some("127.0.0.1 localhost myimage\n"),
+        );
+        let out = compose_virtual_etc_hosts(Some(&rootfs), "");
+        assert_eq!(out.matches("127.0.0.1 localhost").count(), 1);
+        assert!(out.contains("::1 localhost"), "v6 loopback should be injected: {out}");
+        let _ = std::fs::remove_dir_all(&rootfs);
+    }
+
+    #[test]
+    fn compose_chroot_missing_file_falls_back_to_loopback() {
+        // Chroot exists but has no /etc/hosts — fall back to the bare
+        // loopback base so the sandbox always sees a usable file.
+        let rootfs = temp_rootfs_with_hosts("no-file", None);
+        let out = compose_virtual_etc_hosts(Some(&rootfs), "10.0.0.1 api\n");
+        assert_eq!(out, "127.0.0.1 localhost\n::1 localhost\n10.0.0.1 api\n");
+        let _ = std::fs::remove_dir_all(&rootfs);
+    }
+
+    #[test]
+    fn compose_chroot_strips_inline_comments_when_detecting_loopback() {
+        // hosts(5) treats `#` as a comment-start; the loopback-presence
+        // check must respect it (otherwise an image line like
+        // `127.0.0.1 # localhost` would be falsely treated as covering v4).
+        let rootfs = temp_rootfs_with_hosts(
+            "with-comments",
+            Some("127.0.0.1 # localhost is a comment here\n"),
+        );
+        let out = compose_virtual_etc_hosts(Some(&rootfs), "");
+        // Real `127.0.0.1 localhost` line must still be injected.
+        assert!(
+            out.lines().any(|l| l.trim() == "127.0.0.1 localhost"),
+            "v4 loopback should still be injected: {out}"
+        );
+        let _ = std::fs::remove_dir_all(&rootfs);
     }
 }

@@ -8,6 +8,7 @@ mod imp {
     pub const SYS_MEMFD_CREATE: i64 = 319;
     pub const SYS_PIDFD_OPEN: i64 = 434;
     pub const SYS_PIDFD_GETFD: i64 = 438;
+    pub const SYS_OPENAT2: i64 = 437;
 
     pub const SYS_OPEN: Option<i64> = Some(libc::SYS_open);
     pub const SYS_STAT: Option<i64> = Some(libc::SYS_stat);
@@ -51,6 +52,7 @@ mod imp {
     pub const SYS_MEMFD_CREATE: i64 = 279;
     pub const SYS_PIDFD_OPEN: i64 = 434;
     pub const SYS_PIDFD_GETFD: i64 = 438;
+    pub const SYS_OPENAT2: i64 = 437;
 
     pub const SYS_OPEN: Option<i64> = None;
     pub const SYS_STAT: Option<i64> = None;
