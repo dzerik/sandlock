@@ -61,8 +61,15 @@ sandlock_builder_t *sandlock_sandbox_builder_no_huge_pages(sandlock_builder_t *b
 /** Per-protection Landlock feature identifier.
  *
  * Discriminant values mirror the Rust `Protection` enum in
- * `sandlock_core::protection::Protection`. Stable across releases; new
- * protections are appended at higher discriminants. */
+ * `sandlock_core::protection::Protection`. Stable across releases;
+ * new protections are appended at higher discriminants. Old
+ * discriminants are never reused.
+ *
+ * Functions below take the discriminant as `uint32_t` (not the enum
+ * type) so an out-of-range value from a C caller is rejected at the
+ * Rust boundary instead of triggering undefined behaviour. Callers
+ * should pass one of the constants below; any other value is treated
+ * as documented for each function. */
 typedef enum {
     SANDLOCK_PROTECTION_FS_REFER                    = 0,
     SANDLOCK_PROTECTION_FS_TRUNCATE                 = 1,
@@ -73,24 +80,30 @@ typedef enum {
 } sandlock_protection_t;
 
 /** Minimum Landlock ABI version the host kernel must support for the
- *  given protection to be available. */
-uint32_t sandlock_protection_min_abi(sandlock_protection_t protection);
+ *  given protection to be available.
+ *
+ *  Returns 0 for any `protection` value that is not a known
+ *  discriminant. (0 is below every real `min_abi` — those start at
+ *  2 — so 0 functions as an unambiguous "unknown protection" sentinel.) */
+uint32_t sandlock_protection_min_abi(uint32_t protection);
 
 /** Mark `protection` as degradable on the builder: enforced when the
  *  host kernel supports it, silently skipped otherwise. Returns the
  *  (possibly relocated) builder pointer; mirrors the move-semantics
- *  convention of the other builder setters. */
+ *  convention of the other builder setters. An unknown `protection`
+ *  value is treated as a no-op (the builder is returned unchanged). */
 sandlock_builder_t *sandlock_sandbox_builder_allow_degraded(
     sandlock_builder_t *b,
-    sandlock_protection_t protection);
+    uint32_t protection);
 
 /** Mark `protection` as disabled on the builder: never enforced, even
  *  on a host kernel that supports it. Returns the (possibly
  *  relocated) builder pointer; mirrors the move-semantics convention
- *  of the other builder setters. */
+ *  of the other builder setters. An unknown `protection` value is
+ *  treated as a no-op. */
 sandlock_builder_t *sandlock_sandbox_builder_disable(
     sandlock_builder_t *b,
-    sandlock_protection_t protection);
+    uint32_t protection);
 
 /* Build & free */
 /* On failure, *err is set to -1 and *err_msg (if non-null) is set to a
