@@ -687,7 +687,7 @@ let sb = Sandbox::builder()
     .fs_read("/data")
     .fs_write("/tmp")
     .allow_degraded(Protection::SignalScope)
-    .allow_degraded(Protection::AbstractUnixScope)
+    .allow_degraded(Protection::AbstractUnixSocketScope)
     .build()?;
 ```
 
