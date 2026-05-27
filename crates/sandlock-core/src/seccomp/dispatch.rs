@@ -412,6 +412,38 @@ pub(crate) fn build_dispatch_table(
     }
 
     // ------------------------------------------------------------------
+    // /etc/hosts virtualization: always on. The synthetic file contains
+    // the loopback base (or, in chroot/image mode, the image's own
+    // `/etc/hosts` merged with a loopback fallback) plus any concrete
+    // hostnames resolved from `net_allow`, so the host's on-disk
+    // `/etc/hosts` never leaks in and image-baked entries are preserved.
+    //
+    // Registered for every open-family syscall (see `open_family_syscalls`).
+    // Must run *before* the chroot handler so that in chroot mode the
+    // synthetic memfd wins over a direct open of `<chroot>/etc/hosts` —
+    // the chroot handler always intercepts opens within the chroot and
+    // would otherwise serve the raw image file, defeating the merge.
+    // ------------------------------------------------------------------
+    {
+        let etc_hosts = policy.virtual_etc_hosts.clone();
+        for nr in open_family_syscalls() {
+            let etc_hosts = etc_hosts.clone();
+            table.register(nr, move |cx: &HandlerCtx| {
+                let notif = cx.notif;
+                let notif_fd = cx.notif_fd;
+                let etc_hosts = etc_hosts.clone();
+                async move {
+                    if let Some(action) = crate::procfs::handle_etc_hosts_open(&notif, &etc_hosts, notif_fd) {
+                        action
+                    } else {
+                        NotifAction::Continue
+                    }
+                }
+            });
+        }
+    }
+
+    // ------------------------------------------------------------------
     // Chroot path interception (before COW)
     // ------------------------------------------------------------------
     if policy.chroot_root.is_some() {
@@ -512,30 +544,7 @@ pub(crate) fn build_dispatch_table(
         }
     }
 
-    // ------------------------------------------------------------------
-    // /etc/hosts virtualization: always on. The synthetic file contains
-    // the loopback base plus any concrete hostnames resolved from
-    // `net_allow`, so the host's on-disk `/etc/hosts` never leaks in.
-    // Registered for every open-family syscall (see `open_family_syscalls`).
-    // ------------------------------------------------------------------
-    {
-        let etc_hosts = policy.virtual_etc_hosts.clone();
-        for nr in open_family_syscalls() {
-            let etc_hosts = etc_hosts.clone();
-            table.register(nr, move |cx: &HandlerCtx| {
-                let notif = cx.notif;
-                let notif_fd = cx.notif_fd;
-                let etc_hosts = etc_hosts.clone();
-                async move {
-                    if let Some(action) = crate::procfs::handle_etc_hosts_open(&notif, &etc_hosts, notif_fd) {
-                        action
-                    } else {
-                        NotifAction::Continue
-                    }
-                }
-            });
-        }
-    }
+    // /etc/hosts is registered above the chroot block — see the comment there.
 
     // ------------------------------------------------------------------
     // Deterministic directory listing
