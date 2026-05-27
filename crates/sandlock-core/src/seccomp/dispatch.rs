@@ -152,6 +152,20 @@ pub enum HandlerError {
 /// The blocklist is whatever [`crate::context::blocklist_syscall_numbers`]
 /// resolves from Sandlock's default syscall blocklist plus policy extras.
 ///
+/// Every open-family syscall a path-keyed handler must intercept to be
+/// leak-proof: `open` (legacy), `openat`, and `openat2`. A handler that
+/// only registers `openat` is bypassed by any libc that picks one of
+/// the others. The corresponding BPF notif list (in `context::notif_syscalls`)
+/// must register the same set so the kernel actually produces a
+/// notification — otherwise `RET_ALLOW` makes the handler unreachable.
+fn open_family_syscalls() -> Vec<i64> {
+    let mut v = vec![libc::SYS_openat, arch::SYS_OPENAT2];
+    if let Some(legacy_open) = arch::SYS_OPEN {
+        v.push(legacy_open);
+    }
+    v
+}
+
 /// Takes only the syscall numbers because that's all it needs to check.
 /// Called from the `run_with_handlers` entry points before any
 /// handler is registered against the dispatch table.
@@ -352,24 +366,29 @@ pub(crate) fn build_dispatch_table(
     }
 
     // ------------------------------------------------------------------
-    // Deterministic random — /dev/urandom opens (openat)
+    // Deterministic random — /dev/urandom and /dev/random opens.
+    // Registered for every open-family syscall so dirfd-relative and
+    // legacy `open` spellings can't slip past the seed and read the
+    // kernel's real entropy.
     // ------------------------------------------------------------------
     if policy.has_random_seed {
-        let __sup = Arc::clone(ctx);
-        table.register(libc::SYS_openat, move |cx: &HandlerCtx| {
-            let notif = cx.notif;
-            let sup = Arc::clone(&__sup);
-            let notif_fd = cx.notif_fd;
-            async move {
-                let mut tr = sup.time_random.lock().await;
-                if let Some(ref mut rng) = tr.random_state {
-                    if let Some(action) = crate::random::handle_random_open(&notif, rng, notif_fd) {
-                        return action;
+        for nr in open_family_syscalls() {
+            let __sup = Arc::clone(ctx);
+            table.register(nr, move |cx: &HandlerCtx| {
+                let notif = cx.notif;
+                let sup = Arc::clone(&__sup);
+                let notif_fd = cx.notif_fd;
+                async move {
+                    let mut tr = sup.time_random.lock().await;
+                    if let Some(ref mut rng) = tr.random_state {
+                        if let Some(action) = crate::random::handle_random_open(&notif, rng, notif_fd) {
+                            return action;
+                        }
                     }
+                    NotifAction::Continue
                 }
-                NotifAction::Continue
-            }
-        });
+            });
+        }
     }
 
     // ------------------------------------------------------------------
@@ -407,13 +426,15 @@ pub(crate) fn build_dispatch_table(
     }
 
     // ------------------------------------------------------------------
-    // /proc virtualization (always on)
+    // /proc virtualization (always on). The handler does both
+    // sensitive-path blocking and per-PID filtering, both of which are
+    // security boundaries, so it has to catch every open-family spelling.
     // ------------------------------------------------------------------
-    {
+    for nr in open_family_syscalls() {
         let policy_for_proc_open = Arc::clone(policy);
         let resource_for_proc_open = Arc::clone(resource);
         let __sup = Arc::clone(ctx);
-        table.register(libc::SYS_openat, move |cx: &HandlerCtx| {
+        table.register(nr, move |cx: &HandlerCtx| {
             let notif = cx.notif;
             let sup = Arc::clone(&__sup);
             let notif_fd = cx.notif_fd;
@@ -459,7 +480,9 @@ pub(crate) fn build_dispatch_table(
     }
 
     // ------------------------------------------------------------------
-    // Hostname virtualization
+    // Hostname virtualization. The `/etc/hostname` shim is registered
+    // for every open-family syscall so dirfd-relative and legacy `open`
+    // spellings can't leak the host's real hostname.
     // ------------------------------------------------------------------
     if let Some(ref hostname) = policy.virtual_hostname {
         let hostname_for_uname = hostname.clone();
@@ -472,38 +495,32 @@ pub(crate) fn build_dispatch_table(
                 crate::procfs::handle_uname(&notif, &hostname, notif_fd)
             }
         });
-        table.register(libc::SYS_openat, move |cx: &HandlerCtx| {
-            let notif = cx.notif;
-            let notif_fd = cx.notif_fd;
+        for nr in open_family_syscalls() {
             let hostname = hostname_for_open.clone();
-            async move {
-                if let Some(action) = crate::procfs::handle_hostname_open(&notif, &hostname, notif_fd) {
-                    action
-                } else {
-                    NotifAction::Continue
+            table.register(nr, move |cx: &HandlerCtx| {
+                let notif = cx.notif;
+                let notif_fd = cx.notif_fd;
+                let hostname = hostname.clone();
+                async move {
+                    if let Some(action) = crate::procfs::handle_hostname_open(&notif, &hostname, notif_fd) {
+                        action
+                    } else {
+                        NotifAction::Continue
+                    }
                 }
-            }
-        });
+            });
+        }
     }
 
     // ------------------------------------------------------------------
     // /etc/hosts virtualization: always on. The synthetic file contains
     // the loopback base plus any concrete hostnames resolved from
     // `net_allow`, so the host's on-disk `/etc/hosts` never leaks in.
-    //
-    // Registered for `open`, `openat`, and `openat2` so the simple literal
-    // spelling, dirfd-relative spelling, and openat2 callers (some Go and
-    // hand-rolled runtimes) all funnel through the same path normalization
-    // in `handle_etc_hosts_open`. The handler itself reads
-    // `notif.data.nr` to extract the right argument slots.
+    // Registered for every open-family syscall (see `open_family_syscalls`).
     // ------------------------------------------------------------------
     {
         let etc_hosts = policy.virtual_etc_hosts.clone();
-        let mut open_syscalls: Vec<i64> = vec![libc::SYS_openat, arch::SYS_OPENAT2];
-        if let Some(legacy_open) = arch::SYS_OPEN {
-            open_syscalls.push(legacy_open);
-        }
-        for nr in open_syscalls {
+        for nr in open_family_syscalls() {
             let etc_hosts = etc_hosts.clone();
             table.register(nr, move |cx: &HandlerCtx| {
                 let notif = cx.notif;
