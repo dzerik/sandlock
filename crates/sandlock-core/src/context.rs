@@ -308,8 +308,18 @@ pub fn notif_syscalls(policy: &Sandbox, sandbox_name: Option<&str>) -> Vec<u32> 
         nrs.push(libc::SYS_openat as u32);
     }
 
-    // /proc virtualization (always on: PID filtering, sensitive path blocking)
+    // /proc virtualization + /etc/hosts virtualization (always on).
+    //
+    // `openat` carries the simple `(AT_FDCWD, "/proc/...")` and
+    // `(AT_FDCWD, "/etc/hosts")` spellings; `openat2` is the same shape
+    // on newer libcs; legacy `open(path, ...)` is the same path without a
+    // dirfd. The handlers normalize all three into a single absolute path
+    // check, so we have to put every variant on the notif list — otherwise
+    // a caller that picks `open` or `openat2` slips past virtualization
+    // and reads the real on-disk file.
     nrs.push(libc::SYS_openat as u32);
+    nrs.push(arch::SYS_OPENAT2 as u32);
+    arch::push_optional_syscall(&mut nrs, arch::SYS_OPEN);
     nrs.push(libc::SYS_getdents64 as u32);
     arch::push_optional_syscall(&mut nrs, arch::SYS_GETDENTS);
 

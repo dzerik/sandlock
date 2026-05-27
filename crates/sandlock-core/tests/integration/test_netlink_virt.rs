@@ -368,3 +368,45 @@ async fn etc_hosts_virtualized_with_loopback_base() {
     );
     assert!(result.success());
 }
+
+/// The literal-path match used to be the only check, so any spelling
+/// other than `"/etc/hosts"` reached the host's on-disk file. Hit each
+/// known bypass and assert we see the synthetic content instead.
+#[tokio::test]
+async fn etc_hosts_virtualization_resists_path_bypasses() {
+    let out = temp_out("etc-hosts-bypass");
+    // Python's builtin `open` goes through libc → `openat(AT_FDCWD, ...)`,
+    // so we cover the dirfd-relative case via os.open + os.openat-style
+    // file-descriptor reuse, and the non-canonical case directly.
+    let script = format!(concat!(
+        "import os\n",
+        "results = {{}}\n",
+        // 1. Dirfd-relative: open /etc, then read 'hosts' relative to it.
+        "etcfd = os.open('/etc', os.O_DIRECTORY | os.O_RDONLY)\n",
+        "fd = os.open('hosts', os.O_RDONLY, dir_fd=etcfd)\n",
+        "results['dirfd_relative'] = os.read(fd, 4096).decode()\n",
+        "os.close(fd); os.close(etcfd)\n",
+        // 2. Non-canonical absolute via redundant components.
+        "results['dotdot']  = open('/etc/../etc/hosts').read()\n",
+        "results['slash2']  = open('//etc/hosts').read()\n",
+        "results['curdir']  = open('/etc/./hosts').read()\n",
+        "open('{out}', 'w').write(repr(results))\n",
+    ), out = out.display());
+
+    let policy = base_policy().build().unwrap();
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
+        .await.unwrap();
+
+    let contents = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    // Every spelling must hit the synthetic memfd, not the host file.
+    let expected = "127.0.0.1 localhost\\n::1 localhost\\n";
+    for label in ["dirfd_relative", "dotdot", "slash2", "curdir"] {
+        let needle = format!("'{label}': '{expected}'");
+        assert!(
+            contents.contains(&needle),
+            "{label}: host /etc/hosts leaked. got: {contents}"
+        );
+    }
+    assert!(result.success());
+}

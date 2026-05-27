@@ -603,25 +603,98 @@ pub(crate) fn handle_hostname_open(
     Some(inject_memfd(content.as_bytes()))
 }
 
-/// Intercept `openat("/etc/hosts")` and return a memfd with virtual content.
+/// Intercept any `open`/`openat`/`openat2` of `/etc/hosts` and return a memfd
+/// with virtual content.
 ///
 /// Every sandbox gets a fixed loopback view (`127.0.0.1 localhost` /
 /// `::1 localhost`) plus any concrete hostnames pre-resolved from
 /// `net_allow`, so the host's on-disk `/etc/hosts` never leaks in and
 /// glibc's `files` NSS backend resolves allowed hostnames without DNS.
+///
+/// Coverage notes (the simple literal-path match used to miss these):
+/// - Legacy `open(path, ...)`: dispatched by syscall number; no `dirfd`.
+/// - `openat2(dirfd, path, struct open_how *, size)`: dispatched the same
+///   way as `openat`; the trailing `open_how` argument is irrelevant for
+///   the file-name match.
+/// - Relative paths via `dirfd` (e.g. `openat(open("/etc"), "hosts")`):
+///   the `dirfd` is resolved via `/proc/<pid>/fd/<fd>`.
+/// - Non-canonical absolutes (`/etc/../etc/hosts`, `//etc/hosts`,
+///   `/etc/./hosts`): collapsed by lexical normalization before comparison.
 pub(crate) fn handle_etc_hosts_open(
     notif: &SeccompNotif,
     etc_hosts_content: &str,
     notif_fd: RawFd,
 ) -> Option<NotifAction> {
-    let path_ptr = notif.data.args[1];
-    let path = read_path(notif, path_ptr, notif_fd)?;
+    let nr = notif.data.nr as i64;
+    let (dirfd, path_ptr): (i64, u64) = if Some(nr) == crate::arch::SYS_OPEN {
+        // open(path, flags, mode) — no dirfd, behaves as AT_FDCWD.
+        (libc::AT_FDCWD as i64, notif.data.args[0])
+    } else if nr == libc::SYS_openat || nr == crate::arch::SYS_OPENAT2 {
+        // openat(dirfd, path, ...) and openat2(dirfd, path, ...) share
+        // the same first two argument slots.
+        (notif.data.args[0] as i64, notif.data.args[1])
+    } else {
+        return None;
+    };
 
-    if path != "/etc/hosts" {
+    let path = read_path(notif, path_ptr, notif_fd)?;
+    let resolved = resolve_to_normalized_absolute(notif.pid, dirfd, &path)?;
+    if resolved != std::path::Path::new("/etc/hosts") {
         return None;
     }
 
     Some(inject_memfd(etc_hosts_content.as_bytes()))
+}
+
+/// Resolve `(pid, dirfd, path)` to a lexically-normalized absolute path.
+///
+/// - Absolute `path`: used as-is.
+/// - Relative `path` with `dirfd == AT_FDCWD`: prefixed with the child's
+///   cwd from `/proc/<pid>/cwd`.
+/// - Relative `path` with explicit `dirfd`: prefixed with the symlink
+///   target of `/proc/<pid>/fd/<dirfd>` (the host kernel's view of the
+///   directory the dirfd points to).
+///
+/// Returns `None` if the dirfd cannot be resolved, or if the path walks
+/// above the root via `..`.
+fn resolve_to_normalized_absolute(
+    pid: u32,
+    dirfd: i64,
+    path: &str,
+) -> Option<std::path::PathBuf> {
+    use std::path::{Component, Path, PathBuf};
+
+    let joined: PathBuf = if Path::new(path).is_absolute() {
+        PathBuf::from(path)
+    } else {
+        let base = if dirfd as i32 == libc::AT_FDCWD {
+            std::fs::read_link(format!("/proc/{}/cwd", pid)).ok()?
+        } else {
+            std::fs::read_link(format!("/proc/{}/fd/{}", pid, dirfd as i32)).ok()?
+        };
+        base.join(path)
+    };
+
+    let mut out = PathBuf::new();
+    for comp in joined.components() {
+        match comp {
+            Component::Prefix(p) => out.push(p.as_os_str()),
+            Component::RootDir => out.push("/"),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // pop the last regular component; refuse to walk above
+                // the root (out becomes empty after popping "/").
+                if !out.pop() {
+                    return None;
+                }
+                if out.as_os_str().is_empty() {
+                    return None;
+                }
+            }
+            Component::Normal(c) => out.push(c),
+        }
+    }
+    Some(out)
 }
 
 // ============================================================

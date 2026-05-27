@@ -490,21 +490,34 @@ pub(crate) fn build_dispatch_table(
     // /etc/hosts virtualization: always on. The synthetic file contains
     // the loopback base plus any concrete hostnames resolved from
     // `net_allow`, so the host's on-disk `/etc/hosts` never leaks in.
+    //
+    // Registered for `open`, `openat`, and `openat2` so the simple literal
+    // spelling, dirfd-relative spelling, and openat2 callers (some Go and
+    // hand-rolled runtimes) all funnel through the same path normalization
+    // in `handle_etc_hosts_open`. The handler itself reads
+    // `notif.data.nr` to extract the right argument slots.
     // ------------------------------------------------------------------
     {
-        let etc_hosts_for_open = policy.virtual_etc_hosts.clone();
-        table.register(libc::SYS_openat, move |cx: &HandlerCtx| {
-            let notif = cx.notif;
-            let notif_fd = cx.notif_fd;
-            let etc_hosts = etc_hosts_for_open.clone();
-            async move {
-                if let Some(action) = crate::procfs::handle_etc_hosts_open(&notif, &etc_hosts, notif_fd) {
-                    action
-                } else {
-                    NotifAction::Continue
+        let etc_hosts = policy.virtual_etc_hosts.clone();
+        let mut open_syscalls: Vec<i64> = vec![libc::SYS_openat, arch::SYS_OPENAT2];
+        if let Some(legacy_open) = arch::SYS_OPEN {
+            open_syscalls.push(legacy_open);
+        }
+        for nr in open_syscalls {
+            let etc_hosts = etc_hosts.clone();
+            table.register(nr, move |cx: &HandlerCtx| {
+                let notif = cx.notif;
+                let notif_fd = cx.notif_fd;
+                let etc_hosts = etc_hosts.clone();
+                async move {
+                    if let Some(action) = crate::procfs::handle_etc_hosts_open(&notif, &etc_hosts, notif_fd) {
+                        action
+                    } else {
+                        NotifAction::Continue
+                    }
                 }
-            }
-        });
+            });
+        }
     }
 
     // ------------------------------------------------------------------
