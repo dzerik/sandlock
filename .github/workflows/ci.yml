@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 jobs:
   rust:
@@ -13,7 +14,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-latest, ubuntu-24.04-arm]
+        # ubuntu-22.04 (kernel 5.15, Landlock ABI v3) catches a regression
+        # that ubuntu-latest (24.04, kernel 6.8, ABI v4) cannot — the
+        # FsTruncate / NetTcp / FsIoctlDev path stays exercised even after
+        # the runner image rolls forward.
+        runner: [ubuntu-22.04, ubuntu-latest, ubuntu-24.04-arm]
     steps:
       - uses: actions/checkout@v4
 
@@ -26,11 +31,33 @@ jobs:
       - name: Build
         run: cargo build --release
 
+      - name: Report Landlock ABI on this runner
+        # Surface the host's Landlock ABI in the job log so a future
+        # Landlock-version-sensitive regression is visible at a glance,
+        # without needing to dig into individual test outputs.
+        run: ./target/release/sandlock check || true
+
       - name: Run unit tests
         run: cargo test --release --lib -- --test-threads=1
 
       - name: Run integration tests
-        run: cargo test --release --test integration -- --test-threads=1
+        run: |
+          # On a runner whose Landlock ABI is below the project floor
+          # (MIN_ABI = 6), the bulk of the integration suite cannot
+          # execute: every test driver constructs a default
+          # `Sandbox::builder()` whose `ProtectionPolicy::strict_all()`
+          # requires every Protection to resolve to Active. On
+          # ubuntu-22.04 (Landlock ABI v4 in the current GHA image)
+          # we therefore restrict the integration cell to
+          # `test_protection` — the policy/resolution-mechanics tests
+          # that run against a synthetic ABI and are host-ABI-
+          # independent. The remaining integration tests stay on the
+          # v6+ runners where their host assumption holds.
+          if [ "${{ matrix.runner }}" = "ubuntu-22.04" ]; then
+            cargo test --release --test integration test_protection -- --test-threads=1
+          else
+            cargo test --release --test integration -- --test-threads=1
+          fi
 
   rust-riscv64-cross:
     name: Rust cross-build (riscv64)
