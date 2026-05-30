@@ -296,6 +296,21 @@ sandlock_handler_t *sandlock_handler_new(sandlock_handler_fn_t handler_fn,
 /** Free a handler container that has not been handed to the supervisor. */
 void sandlock_handler_free(sandlock_handler_t *h);
 
+/** Mark a handler as deferred. The supervisor then runs its callback off the
+ *  notification loop, so a slow callback (network round-trip, blocking
+ *  syscall) does not stall every other trapped syscall. Call before
+ *  registering the handler with a run.
+ *
+ *  A deferred handler makes a *terminal* decision: deferral short-circuits
+ *  the handler chain, so if it would continue and other user handlers are
+ *  registered on the same syscall, those later handlers do not run.
+ *  Builtins always run first regardless. Deferral is refused at dispatch
+ *  time for syscalls whose continue path needs the execve argv-safety freeze
+ *  (`execve`/`execveat`) or fork creation-tracking; such a call is denied
+ *  with EPERM. If more than an internal cap of deferrals are in flight at
+ *  once, further ones are failed with EAGAIN rather than queued. */
+void sandlock_handler_set_deferred(sandlock_handler_t *h, bool deferred);
+
 typedef struct sandlock_handler_registration_t {
     int64_t syscall_nr;
     sandlock_handler_t *handler; /* ownership transferred on a successful run */

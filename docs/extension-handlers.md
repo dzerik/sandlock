@@ -377,6 +377,7 @@ The contract is exercised at two layers:
 | `InjectFd { srcfd, targetfd }` | Inject `srcfd` into the guest at slot `targetfd`, then continue. |
 | `InjectFdSendTracked { srcfd, newfd_flags, on_success }` | Inject `srcfd`; `on_success` callback runs synchronously when the kernel returns the slot, so downstream tracking cannot race with the guest seeing the new fd. |
 | `Kill { sig, pgid }` | Send `sig` to the guest's process group. |
+| `Defer(Deferred)` | Run the carried future off the supervisor loop; its terminal action is sent later, keyed by `notif.id`. Non-`Continue`, so it ends the chain. See [Deferred handlers](#deferred-handlers). |
 
 ### Continue-site safety
 
@@ -391,12 +392,80 @@ handler-owned state on `&self`: a `tokio::sync::Mutex<T>` or `RwLock<T>` field o
 must not be held across an `.await` point. If the guard is alive when control returns to the
 supervisor loop, the next notification that needs the same lock parks, the response for the
 current notification is not sent, and the child stays trapped in the syscall. Acquire, mutate,
-drop — `await` only after the guard is out of scope.
+drop, and `await` only after the guard is out of scope. For work that is genuinely slow (a network
+round-trip, a blocking syscall) rather than a short critical section, do not block the loop at
+all: return [`NotifAction::Defer`](#deferred-handlers) and let the supervisor run it off-loop.
 
 See [issue #27][i27] for the underlying supervisor-loop contract that this convention extends to
 user handlers.
 
 [i27]: https://github.com/multikernel/sandlock/issues/27
+
+### Deferred handlers
+
+Continue-site safety exists because the supervisor processes notifications sequentially: a handler
+that blocks (a network round-trip, a blocking syscall, a slow lock) stalls every other trapped
+syscall until it returns. `NotifAction::Defer` is the escape hatch. A handler that returns `Defer`
+hands the supervisor an owned, `'static` future; the supervisor moves it onto a worker task, lets
+the notification loop proceed immediately, and sends the response (keyed by `notif.id`) when the
+future resolves. The trapped child stays parked in the syscall until then, so `notif.id` stays
+valid and the child-memory helpers keep working inside the deferred future.
+
+```rust
+use std::future::Future;
+use std::pin::Pin;
+use sandlock_core::{Handler, HandlerCtx};
+use sandlock_core::seccomp::notif::{read_child_cstr, NotifAction};
+
+fn handle<'a>(
+    &'a self,
+    cx: &'a HandlerCtx,
+) -> Pin<Box<dyn Future<Output = NotifAction> + Send + 'a>> {
+    // Copy out what the deferred future needs: `notif` is `Copy`, `notif_fd`
+    // is a `RawFd`, and `Arc` state is cloned. Never borrow `&self`/`cx`:
+    // the deferred future is `'static` and outlives this call.
+    let (fd, id, pid) = (cx.notif_fd, cx.notif.id, cx.notif.pid);
+    let key = read_child_cstr(fd, id, pid, cx.notif.data.args[1], 4096);
+    let backend = self.backend.clone();
+    Box::pin(async move {
+        let Some(key) = key else { return NotifAction::Continue };
+        NotifAction::defer(async move {
+            // Runs on a worker, off the supervisor loop. The child is still
+            // parked, so child-memory helpers and `id` are valid here.
+            match backend.get(&key).await {
+                Ok(_data) => NotifAction::ReturnValue(0), // e.g. inject a memfd of `_data`
+                Err(_) => NotifAction::Errno(libc::EIO),
+            }
+        })
+    })
+}
+```
+
+The deferred future must be `Send + 'static`: `Send` so the supervisor can move it onto a worker,
+and `'static` so it can outlive the borrowed `HandlerCtx`. It does **not** need to be `Sync` (the
+supervisor moves it, never shares it by reference). Capture owned data only: copy `notif` (it is
+`Copy`), clone an `Arc` for shared state, and never borrow `&self`/`cx`.
+
+Contract:
+
+- **Terminal decision.** `Defer` is non-`Continue`, so it short-circuits the handler chain exactly
+  like `Errno`/`ReturnValue`: later handlers on the same syscall do not run. A deferring handler
+  decides the outcome.
+- **No deferral on freeze/fork syscalls.** Deferral is refused (with `EPERM`) on
+  `execve`/`execveat` and fork-creating syscalls, because moving the response off-loop would skip
+  the argv-safety freeze (see [issue #27][i27]) and process creation-tracking that those paths
+  require before `Continue`.
+- **Bounded fan-out.** At most `DEFER_MAX_INFLIGHT` deferred futures run concurrently; beyond that,
+  further deferrals fail fast with `EAGAIN` rather than queuing. The cap also bounds the resources
+  workers hold (memfds, sockets).
+- **No nesting.** A deferred future that itself resolves to `Defer` is a bug; the supervisor
+  collapses it to `EIO` so the child is never left wedged.
+- **Stale id.** If the child exits mid-defer, the eventual `send_response` is a no-op and the
+  child-memory helpers fail safe (they are `id_valid`-bracketed), matching the inline path's
+  "child may have exited" tolerance.
+
+Do not defer trivial fast handlers: the worker hop adds latency. Defer only when the work would
+otherwise block the loop.
 
 ## Security boundary
 
@@ -505,6 +574,11 @@ than collecting them after exit) needs interceptors on `openat(O_CREAT)`, `write
 translate filesystem operations into multipart-upload calls. Those interceptors must live inside
 the same supervisor task as sandlock's builtins — `SECCOMP_FILTER_FLAG_NEW_LISTENER` allows only
 one listener per process.
+
+Because the multipart-upload calls are slow network operations, return
+[`NotifAction::Defer`](#deferred-handlers) from those handlers so the uploads run off the
+notification loop. Otherwise each upload blocks the single supervisor task and stalls every other
+trapped syscall for the duration of the round-trip.
 
 Wrap each handler in `Box<dyn Handler>` so the iterator's `H` parameter is uniform across
 heterogeneous handler types:

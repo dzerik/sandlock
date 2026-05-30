@@ -136,12 +136,30 @@ class Handler:
     inside the supervisor's dispatch path while holding the GIL; a
     handler that blocks (a long sleep, a blocking I/O call, an infinite
     loop) stalls the supervisor and can wedge the entire run.
+
+    Deferral: define ``handle`` as ``async def`` to run it off the
+    supervisor's notification loop, so a slow handler (a network round-trip,
+    a blocking call) does not stall every other trapped syscall. The
+    coroutine is driven to completion on a worker thread, and for I/O-bound
+    work multiple async handlers overlap (the GIL is released during
+    blocking I/O). Trade-offs: an async handler makes a *terminal*
+    decision: deferral short-circuits the handler chain, so if it returns
+    ``continue_()`` and other handlers are registered on the same syscall,
+    those later handlers do not run. Deferral is refused for
+    ``execve``/``execveat`` and fork-creating syscalls (the response cannot
+    be moved off-loop without skipping argv-safety work); such a call is
+    denied with EPERM.
     """
 
     on_exception: ExceptionPolicy = ExceptionPolicy.KILL
 
     def handle(self, ctx: HandlerCtx) -> NotifAction:
         """Override in a subclass to inspect ``ctx`` and return a NotifAction.
+
+        May be defined as ``async def`` to run off the supervisor loop: its
+        coroutine is driven to completion on a worker thread, so it may
+        ``await`` slow work (network I/O, etc.) without stalling other
+        trapped syscalls, and concurrent async handlers overlap during I/O.
 
         Raising an exception triggers the configured ``on_exception``
         policy. Returning a non-NotifAction value is treated as an

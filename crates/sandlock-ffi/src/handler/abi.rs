@@ -376,6 +376,12 @@ pub struct sandlock_handler_t {
     pub(super) ud: *mut std::ffi::c_void,
     pub(super) ud_drop: Option<sandlock_handler_ud_drop_t>,
     pub(super) on_exception: sandlock_exception_policy_t,
+    /// When true, the supervisor runs this handler's callback off the
+    /// notification loop (as a deferred future) instead of inline, so a
+    /// slow callback (network round-trip, blocking syscall) does not stall
+    /// every other trapped syscall. The container is an opaque box — C
+    /// never sees this field's layout — so adding it is not a C ABI break.
+    pub(super) deferred: bool,
 }
 
 // Safety:
@@ -448,8 +454,32 @@ pub unsafe extern "C" fn sandlock_handler_new(
         ud,
         ud_drop,
         on_exception,
+        deferred: false,
     });
     Box::into_raw(h)
+}
+
+/// Mark a handler as deferred: the supervisor will run its callback off the
+/// notification loop so a slow callback does not block other trapped
+/// syscalls. Must be called before the handler is registered with a run.
+///
+/// A deferred handler makes a *terminal* decision: deferral short-circuits
+/// the handler chain, so if a deferred handler would `Continue` and other
+/// user handlers are registered on the same syscall, those later handlers do
+/// not run. Builtins always run first regardless. Deferral is refused at
+/// dispatch time for syscalls whose Continue path needs the execve
+/// argv-safety freeze (`execve`/`execveat`) or fork creation-tracking.
+///
+/// # Safety
+/// `h` must be a non-null pointer returned by `sandlock_handler_new` that has
+/// not yet been registered with a run or freed.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_handler_set_deferred(
+    h: *mut sandlock_handler_t,
+    deferred: bool,
+) {
+    if h.is_null() { return; }
+    (*h).deferred = deferred;
 }
 
 /// Free a handler container that has *not* been registered with a
