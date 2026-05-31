@@ -1164,6 +1164,30 @@ async fn emit_policy_event(
 /// sockets) so a burst of deferrals cannot exhaust the supervisor process.
 const DEFER_MAX_INFLIGHT: usize = 64;
 
+/// Maximum time a deferred handler future may run before the supervisor gives
+/// up and fails the trapped syscall closed. Bounds the worst case so a hung
+/// future (e.g. a stalled network fetch in a token-injection handler) cannot
+/// park the child forever or permanently leak its `DEFER_MAX_INFLIGHT` slot.
+const DEFER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Drive a deferred future to its terminal action, bounded by `limit`.
+///
+/// On timeout, fail closed with `EIO` so the trapped child gets a definite
+/// response instead of parking forever; `finalize_deferred` still guards a
+/// future that resolves to a nested `Defer`.
+async fn run_deferred_within(deferred: Deferred, limit: std::time::Duration) -> NotifAction {
+    match tokio::time::timeout(limit, deferred.run()).await {
+        Ok(action) => finalize_deferred(action),
+        Err(_) => {
+            eprintln!(
+                "sandlock: deferred handler exceeded {:?}; failing syscall with EIO",
+                limit
+            );
+            NotifAction::Errno(libc::EIO)
+        }
+    }
+}
+
 /// Spawn a worker task that drives a deferred handler future to its terminal
 /// action and sends the seccomp response, keyed by `id`. The `permit` is
 /// held for the worker's lifetime, releasing its `DEFER_MAX_INFLIGHT` slot on
@@ -1177,7 +1201,7 @@ fn spawn_deferred(
 ) {
     tokio::spawn(async move {
         let _permit = permit; // released when the worker finishes
-        let action = finalize_deferred(deferred.run().await);
+        let action = run_deferred_within(deferred, DEFER_TIMEOUT).await;
         let _ = send_response(fd, id, action);
     });
 }
@@ -1677,6 +1701,27 @@ mod tests {
             panic!("defer() must construct a NotifAction::Defer");
         };
         assert!(matches!(deferred.run().await, NotifAction::ReturnValue(7)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deferred_times_out_to_eio() {
+        // A deferred future that exceeds its limit must fail closed (EIO) so
+        // the trapped child gets a definite response instead of parking
+        // forever (and leaking its DEFER_MAX_INFLIGHT slot).
+        let slow = Deferred::new(async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            NotifAction::ReturnValue(7)
+        });
+        let action = run_deferred_within(slow, std::time::Duration::from_secs(1)).await;
+        assert!(matches!(action, NotifAction::Errno(e) if e == libc::EIO));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deferred_within_limit_passes_through() {
+        // A future that resolves within the limit returns its terminal action.
+        let fast = Deferred::new(async { NotifAction::ReturnValue(7) });
+        let action = run_deferred_within(fast, std::time::Duration::from_secs(1)).await;
+        assert!(matches!(action, NotifAction::ReturnValue(7)));
     }
 
     #[test]
