@@ -1,12 +1,15 @@
-//! Architecture-specific syscall and seccomp helpers.
+//! Architecture-specific seccomp helpers.
+//!
+//! Syscall numbers come from the `syscalls` crate (generated from the kernel
+//! ABI tables). The only genuinely per-architecture datum that the crate does
+//! not provide is `AUDIT_ARCH` (a `linux/audit.h` token, not a syscall
+//! number), so that is the sole hand-maintained per-arch constant here.
 
 use syscalls::Sysno;
 
-// Syscall numbers sourced from the `syscalls` crate (generated from the kernel
-// ABI tables), replacing hand-maintained per-architecture magic numbers. Each
-// of these syscalls exists on every architecture Sandlock targets, so a single
-// definition resolves to the correct per-arch number at compile time. The
-// `tests` module below pins the resolved values to the historical constants.
+// Numbers for syscalls that exist on every architecture Sandlock targets, so a
+// single definition resolves to the correct per-arch number at compile time.
+// The `tests` module pins the resolved values to the historical constants.
 pub const SYS_FACCESSAT2: i64 = Sysno::faccessat2 as i64;
 pub const SYS_OPENAT2: i64 = Sysno::openat2 as i64;
 pub const SYS_SECCOMP: i64 = Sysno::seccomp as i64;
@@ -17,100 +20,71 @@ pub const SYS_PIDFD_GETFD: i64 = Sysno::pidfd_getfd as i64;
 #[cfg(target_arch = "x86_64")]
 mod imp {
     pub const AUDIT_ARCH: u32 = 0xC000_003E;
-
-    pub const SYS_OPEN: Option<i64> = Some(libc::SYS_open);
-    pub const SYS_STAT: Option<i64> = Some(libc::SYS_stat);
-    pub const SYS_LSTAT: Option<i64> = Some(libc::SYS_lstat);
-    pub const SYS_ACCESS: Option<i64> = Some(libc::SYS_access);
-    pub const SYS_READLINK: Option<i64> = Some(libc::SYS_readlink);
-    pub const SYS_GETDENTS: Option<i64> = Some(libc::SYS_getdents);
-    pub const SYS_UNLINK: Option<i64> = Some(libc::SYS_unlink);
-    pub const SYS_RMDIR: Option<i64> = Some(libc::SYS_rmdir);
-    pub const SYS_MKDIR: Option<i64> = Some(libc::SYS_mkdir);
-    pub const SYS_RENAME: Option<i64> = Some(libc::SYS_rename);
-    pub const SYS_SYMLINK: Option<i64> = Some(libc::SYS_symlink);
-    pub const SYS_LINK: Option<i64> = Some(libc::SYS_link);
-    pub const SYS_CHMOD: Option<i64> = Some(libc::SYS_chmod);
-    pub const SYS_CHOWN: Option<i64> = Some(libc::SYS_chown);
-    pub const SYS_LCHOWN: Option<i64> = Some(libc::SYS_lchown);
-    pub const SYS_VFORK: Option<i64> = Some(libc::SYS_vfork);
-    pub const SYS_FORK: Option<i64> = Some(libc::SYS_fork);
-
-    /// Every syscall the kernel will dispatch through `handle_fork`.
-    /// Single source of truth for callers that enumerate fork-class
-    /// syscalls (BPF notif registration in `seccomp::dispatch`,
-    /// classification in `resource::is_process_creation_notif`).
-    pub const FORK_LIKE_SYSCALLS: &[i64] = &[
-        libc::SYS_clone,
-        libc::SYS_clone3,
-        libc::SYS_vfork,
-        libc::SYS_fork,
-    ];
 }
 
 #[cfg(target_arch = "aarch64")]
 mod imp {
     pub const AUDIT_ARCH: u32 = 0xC000_00B7;
-
-    pub const SYS_OPEN: Option<i64> = None;
-    pub const SYS_STAT: Option<i64> = None;
-    pub const SYS_LSTAT: Option<i64> = None;
-    pub const SYS_ACCESS: Option<i64> = None;
-    pub const SYS_READLINK: Option<i64> = None;
-    pub const SYS_GETDENTS: Option<i64> = None;
-    pub const SYS_UNLINK: Option<i64> = None;
-    pub const SYS_RMDIR: Option<i64> = None;
-    pub const SYS_MKDIR: Option<i64> = None;
-    pub const SYS_RENAME: Option<i64> = None;
-    pub const SYS_SYMLINK: Option<i64> = None;
-    pub const SYS_LINK: Option<i64> = None;
-    pub const SYS_CHMOD: Option<i64> = None;
-    pub const SYS_CHOWN: Option<i64> = None;
-    pub const SYS_LCHOWN: Option<i64> = None;
-    pub const SYS_VFORK: Option<i64> = None;
-    pub const SYS_FORK: Option<i64> = None;
-
-    /// Every syscall the kernel will dispatch through `handle_fork`.
-    /// aarch64 has no `fork`/`vfork` (glibc emulates via `clone`).
-    pub const FORK_LIKE_SYSCALLS: &[i64] = &[
-        libc::SYS_clone,
-        libc::SYS_clone3,
-    ];
 }
 
 #[cfg(target_arch = "riscv64")]
 mod imp {
     // AUDIT_ARCH_RISCV64 = EM_RISCV(243) | __AUDIT_ARCH_64BIT | __AUDIT_ARCH_LE.
     pub const AUDIT_ARCH: u32 = 0xC000_00F3;
-
-    // riscv64 uses the generic syscall ABI: no legacy open/stat/fork/etc.
-    pub const SYS_OPEN: Option<i64> = None;
-    pub const SYS_STAT: Option<i64> = None;
-    pub const SYS_LSTAT: Option<i64> = None;
-    pub const SYS_ACCESS: Option<i64> = None;
-    pub const SYS_READLINK: Option<i64> = None;
-    pub const SYS_GETDENTS: Option<i64> = None;
-    pub const SYS_UNLINK: Option<i64> = None;
-    pub const SYS_RMDIR: Option<i64> = None;
-    pub const SYS_MKDIR: Option<i64> = None;
-    pub const SYS_RENAME: Option<i64> = None;
-    pub const SYS_SYMLINK: Option<i64> = None;
-    pub const SYS_LINK: Option<i64> = None;
-    pub const SYS_CHMOD: Option<i64> = None;
-    pub const SYS_CHOWN: Option<i64> = None;
-    pub const SYS_LCHOWN: Option<i64> = None;
-    pub const SYS_VFORK: Option<i64> = None;
-    pub const SYS_FORK: Option<i64> = None;
-
-    /// Every syscall the kernel will dispatch through `handle_fork`.
-    /// riscv64 has no `fork`/`vfork` (glibc emulates via `clone`).
-    pub const FORK_LIKE_SYSCALLS: &[i64] = &[
-        libc::SYS_clone,
-        libc::SYS_clone3,
-    ];
 }
 
 pub use imp::*;
+
+/// Resolve a syscall name to its number on the current architecture, or `None`
+/// if this architecture's ABI does not provide it.
+fn sysno(name: &str) -> Option<i64> {
+    name.parse::<Sysno>().ok().map(|s| s.id() as i64)
+}
+
+macro_rules! legacy_syscall {
+    ($fn:ident, $name:literal) => {
+        #[doc = concat!(
+            "`", $name, "` syscall number on this architecture, or `None` if ",
+            "the generic syscall ABI (aarch64, riscv64) omits it."
+        )]
+        pub fn $fn() -> Option<i64> {
+            sysno($name)
+        }
+    };
+}
+
+// Legacy (pre-generic-ABI) syscalls: present on x86_64, absent on the
+// generic-ABI architectures. Presence is derived from the crate's per-arch
+// tables rather than hand-maintained.
+legacy_syscall!(sys_open, "open");
+legacy_syscall!(sys_stat, "stat");
+legacy_syscall!(sys_lstat, "lstat");
+legacy_syscall!(sys_access, "access");
+legacy_syscall!(sys_readlink, "readlink");
+legacy_syscall!(sys_getdents, "getdents");
+legacy_syscall!(sys_unlink, "unlink");
+legacy_syscall!(sys_rmdir, "rmdir");
+legacy_syscall!(sys_mkdir, "mkdir");
+legacy_syscall!(sys_rename, "rename");
+legacy_syscall!(sys_symlink, "symlink");
+legacy_syscall!(sys_link, "link");
+legacy_syscall!(sys_chmod, "chmod");
+legacy_syscall!(sys_chown, "chown");
+legacy_syscall!(sys_lchown, "lchown");
+legacy_syscall!(sys_vfork, "vfork");
+legacy_syscall!(sys_fork, "fork");
+
+/// Fork-class syscalls present on this architecture: `clone`/`clone3` always,
+/// plus `fork`/`vfork` only where the legacy ABI provides them. Single source
+/// of truth for callers enumerating fork-class syscalls (BPF notif
+/// registration in `seccomp::dispatch`, classification in
+/// `resource::is_process_creation_notif`).
+pub fn fork_like_syscalls() -> Vec<i64> {
+    ["clone", "clone3", "vfork", "fork"]
+        .into_iter()
+        .filter_map(sysno)
+        .collect()
+}
 
 /// True if `nr` is a real syscall number on the current architecture.
 /// Used by [`crate::seccomp::syscall::Syscall::checked`] to reject foot-gun
@@ -155,6 +129,34 @@ mod tests {
             assert_eq!(SYS_PIDFD_GETFD, 438);
             assert_eq!(SYS_OPENAT2, 437);
             assert_eq!(SYS_FACCESSAT2, 439);
+        }
+    }
+
+    /// The legacy-syscall accessors must reflect this arch's ABI: present on
+    /// x86_64, absent on the generic-ABI arches.
+    #[test]
+    fn legacy_accessors_match_arch() {
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert_eq!(sys_open(), Some(libc::SYS_open));
+            assert_eq!(sys_fork(), Some(libc::SYS_fork));
+            assert_eq!(sys_vfork(), Some(libc::SYS_vfork));
+            assert_eq!(
+                fork_like_syscalls(),
+                vec![
+                    libc::SYS_clone,
+                    libc::SYS_clone3,
+                    libc::SYS_vfork,
+                    libc::SYS_fork
+                ]
+            );
+        }
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        {
+            assert_eq!(sys_open(), None);
+            assert_eq!(sys_fork(), None);
+            assert_eq!(sys_vfork(), None);
+            assert_eq!(fork_like_syscalls(), vec![libc::SYS_clone, libc::SYS_clone3]);
         }
     }
 
