@@ -202,16 +202,10 @@ const TIME_NOTIF_SYSCALLS: &[i64] = &[
 // check, so we have to put every variant on the notif list -- otherwise
 // a caller that picks `open` or `openat2` slips past virtualization
 // and reads the real on-disk file.
-const PROCFS_HOSTS_NOTIF_SYSCALLS: &[i64] = &[
-    libc::SYS_openat,
-    arch::SYS_OPENAT2,
-    libc::SYS_getdents64,
-];
-fn procfs_hosts_optional_syscalls() -> Vec<i64> {
-    [arch::sys_open(), arch::sys_getdents()]
-        .into_iter()
-        .flatten()
-        .collect()
+fn procfs_hosts_notif_syscalls() -> Vec<i64> {
+    let mut v = vec![libc::SYS_openat, arch::SYS_OPENAT2, libc::SYS_getdents64];
+    v.extend([arch::sys_open(), arch::sys_getdents()].into_iter().flatten());
+    v
 }
 
 // Netlink virtualization (always on):
@@ -231,115 +225,121 @@ const NETLINK_NOTIF_SYSCALLS: &[i64] = &[
     libc::SYS_close,
 ];
 
-const COW_PATH_SYSCALLS: &[i64] = &[
-    libc::SYS_openat,
-    libc::SYS_execve,
-    libc::SYS_execveat,
-    libc::SYS_unlinkat,
-    libc::SYS_mkdirat,
-    libc::SYS_renameat2,
-    libc::SYS_symlinkat,
-    libc::SYS_linkat,
-    libc::SYS_fchmodat,
-    libc::SYS_fchownat,
-    libc::SYS_truncate,
-    libc::SYS_utimensat,
-    libc::SYS_newfstatat,
-    libc::SYS_statx,
-    libc::SYS_faccessat,
-    arch::SYS_FACCESSAT2,
-    libc::SYS_readlinkat,
-    libc::SYS_getdents64,
-    libc::SYS_chdir,
-    libc::SYS_getcwd,
-];
-fn cow_legacy_path_syscalls() -> Vec<i64> {
-    [
-        arch::sys_open(),
-        arch::sys_unlink(),
-        arch::sys_rmdir(),
-        arch::sys_mkdir(),
-        arch::sys_rename(),
-        arch::sys_symlink(),
-        arch::sys_link(),
-        arch::sys_chmod(),
-        arch::sys_chown(),
-        arch::sys_lchown(),
-        arch::sys_stat(),
-        arch::sys_lstat(),
-        arch::sys_access(),
-        arch::sys_readlink(),
-        arch::sys_getdents(),
-    ]
-    .into_iter()
-    .flatten()
-    .collect()
+fn cow_path_syscalls() -> Vec<i64> {
+    let mut v = vec![
+        libc::SYS_openat,
+        libc::SYS_execve,
+        libc::SYS_execveat,
+        libc::SYS_unlinkat,
+        libc::SYS_mkdirat,
+        libc::SYS_renameat2,
+        libc::SYS_symlinkat,
+        libc::SYS_linkat,
+        libc::SYS_fchmodat,
+        libc::SYS_fchownat,
+        libc::SYS_truncate,
+        libc::SYS_utimensat,
+        libc::SYS_newfstatat,
+        libc::SYS_statx,
+        libc::SYS_faccessat,
+        arch::SYS_FACCESSAT2,
+        libc::SYS_readlinkat,
+        libc::SYS_getdents64,
+        libc::SYS_chdir,
+        libc::SYS_getcwd,
+    ];
+    v.extend(
+        [
+            arch::sys_open(),
+            arch::sys_unlink(),
+            arch::sys_rmdir(),
+            arch::sys_mkdir(),
+            arch::sys_rename(),
+            arch::sys_symlink(),
+            arch::sys_link(),
+            arch::sys_chmod(),
+            arch::sys_chown(),
+            arch::sys_lchown(),
+            arch::sys_stat(),
+            arch::sys_lstat(),
+            arch::sys_access(),
+            arch::sys_readlink(),
+            arch::sys_getdents(),
+        ]
+        .into_iter()
+        .flatten(),
+    );
+    v
 }
 
-const CHROOT_PATH_SYSCALLS: &[i64] = &[
-    libc::SYS_openat,
-    libc::SYS_execve,
-    libc::SYS_execveat,
-    libc::SYS_unlinkat,
-    libc::SYS_mkdirat,
-    libc::SYS_renameat2,
-    libc::SYS_symlinkat,
-    libc::SYS_linkat,
-    libc::SYS_fchmodat,
-    libc::SYS_fchownat,
-    libc::SYS_truncate,
-    libc::SYS_newfstatat,
-    libc::SYS_statx,
-    libc::SYS_faccessat,
-    arch::SYS_FACCESSAT2,
-    libc::SYS_readlinkat,
-    libc::SYS_getdents64,
-    libc::SYS_chdir,
-    libc::SYS_getcwd,
-    libc::SYS_statfs,
-    libc::SYS_utimensat,
-];
-fn chroot_legacy_path_syscalls() -> Vec<i64> {
-    [
-        arch::sys_open(),
-        arch::sys_stat(),
-        arch::sys_lstat(),
-        arch::sys_access(),
-        arch::sys_readlink(),
-        arch::sys_getdents(),
-        arch::sys_unlink(),
-        arch::sys_rmdir(),
-        arch::sys_mkdir(),
-        arch::sys_rename(),
-        arch::sys_symlink(),
-        arch::sys_link(),
-        arch::sys_chmod(),
-        arch::sys_chown(),
-        arch::sys_lchown(),
-    ]
-    .into_iter()
-    .flatten()
-    .collect()
+fn chroot_path_syscalls() -> Vec<i64> {
+    let mut v = vec![
+        libc::SYS_openat,
+        libc::SYS_execve,
+        libc::SYS_execveat,
+        libc::SYS_unlinkat,
+        libc::SYS_mkdirat,
+        libc::SYS_renameat2,
+        libc::SYS_symlinkat,
+        libc::SYS_linkat,
+        libc::SYS_fchmodat,
+        libc::SYS_fchownat,
+        libc::SYS_truncate,
+        libc::SYS_newfstatat,
+        libc::SYS_statx,
+        libc::SYS_faccessat,
+        arch::SYS_FACCESSAT2,
+        libc::SYS_readlinkat,
+        libc::SYS_getdents64,
+        libc::SYS_chdir,
+        libc::SYS_getcwd,
+        libc::SYS_statfs,
+        libc::SYS_utimensat,
+    ];
+    v.extend(
+        [
+            arch::sys_open(),
+            arch::sys_stat(),
+            arch::sys_lstat(),
+            arch::sys_access(),
+            arch::sys_readlink(),
+            arch::sys_getdents(),
+            arch::sys_unlink(),
+            arch::sys_rmdir(),
+            arch::sys_mkdir(),
+            arch::sys_rename(),
+            arch::sys_symlink(),
+            arch::sys_link(),
+            arch::sys_chmod(),
+            arch::sys_chown(),
+            arch::sys_lchown(),
+        ]
+        .into_iter()
+        .flatten(),
+    );
+    v
 }
 
-const FS_DENIED_PATH_SYSCALLS: &[i64] = &[
-    libc::SYS_openat,
-    libc::SYS_execve,
-    libc::SYS_execveat,
-    libc::SYS_linkat,
-    libc::SYS_renameat2,
-    libc::SYS_symlinkat,
-];
-fn fs_denied_legacy_path_syscalls() -> Vec<i64> {
-    [
-        arch::sys_open(),
-        arch::sys_link(),
-        arch::sys_rename(),
-        arch::sys_symlink(),
-    ]
-    .into_iter()
-    .flatten()
-    .collect()
+fn fs_denied_path_syscalls() -> Vec<i64> {
+    let mut v = vec![
+        libc::SYS_openat,
+        libc::SYS_execve,
+        libc::SYS_execveat,
+        libc::SYS_linkat,
+        libc::SYS_renameat2,
+        libc::SYS_symlinkat,
+    ];
+    v.extend(
+        [
+            arch::sys_open(),
+            arch::sys_link(),
+            arch::sys_rename(),
+            arch::sys_symlink(),
+        ]
+        .into_iter()
+        .flatten(),
+    );
+    v
 }
 
 const POLICY_EVENT_SYSCALLS: &[i64] = &[
@@ -402,8 +402,7 @@ pub fn notif_syscalls(policy: &Sandbox, sandbox_name: Option<&str>) -> Vec<u32> 
         nrs.extend(TIME_NOTIF_SYSCALLS);
     }
 
-    nrs.extend(PROCFS_HOSTS_NOTIF_SYSCALLS);
-    nrs.extend(&procfs_hosts_optional_syscalls());
+    nrs.extend(&procfs_hosts_notif_syscalls());
     nrs.extend(NETLINK_NOTIF_SYSCALLS);
 
     // Virtualize sched_getaffinity so nproc/sysconf agree with /proc/cpuinfo
@@ -416,20 +415,17 @@ pub fn notif_syscalls(policy: &Sandbox, sandbox_name: Option<&str>) -> Vec<u32> 
 
     // COW filesystem interception (seccomp-based, unprivileged)
     if policy.workdir.is_some() {
-        nrs.extend(COW_PATH_SYSCALLS);
-        nrs.extend(&cow_legacy_path_syscalls());
+        nrs.extend(&cow_path_syscalls());
     }
 
     // Chroot path interception
     if policy.chroot.is_some() {
-        nrs.extend(CHROOT_PATH_SYSCALLS);
-        nrs.extend(&chroot_legacy_path_syscalls());
+        nrs.extend(&chroot_path_syscalls());
     }
 
     // Explicit deny-paths need path-bearing syscalls intercepted.
     if !policy.fs_denied.is_empty() {
-        nrs.extend(FS_DENIED_PATH_SYSCALLS);
-        nrs.extend(&fs_denied_legacy_path_syscalls());
+        nrs.extend(&fs_denied_path_syscalls());
     }
 
     // Dynamic policy callback — intercept key syscalls for event emission.
