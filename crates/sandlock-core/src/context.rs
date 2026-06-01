@@ -5,6 +5,8 @@ use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
+use syscalls::{Sysno, SysnoSet};
+
 use crate::arch;
 use crate::sandbox::Sandbox;
 use crate::seccomp::bpf::{self, stmt, jump};
@@ -119,6 +121,7 @@ pub(crate) fn read_u32_fd(fd: RawFd) -> io::Result<u32> {
     Ok(u32::from_le_bytes(buf))
 }
 
+#[cfg(test)]
 use crate::seccomp::syscall::syscall_name_to_nr;
 
 // ============================================================
@@ -441,28 +444,36 @@ pub fn notif_syscalls(policy: &Sandbox, sandbox_name: Option<&str>) -> Vec<u32> 
     nrs.finish()
 }
 
+/// Resolve `base` syscall names plus policy extras (and SysV IPC syscalls when
+/// `policy.allows_sysv_ipc()` is false) to a deduplicated, ascending list of
+/// numbers for the current architecture.
+///
+/// A `SysnoSet` accumulates the membership: it dedups inherently (so SysV IPC
+/// folds in with a plain `insert`) and iterates in ascending syscall order.
+/// Names that do not exist on this architecture resolve to nothing and are
+/// skipped, so the result stays arch-correct.
+fn resolve_blocklist(base: &[&str], policy: &Sandbox) -> Vec<u32> {
+    let mut set: SysnoSet = base
+        .iter()
+        .copied()
+        .chain(policy.extra_deny_syscalls.iter().map(String::as_str))
+        .filter_map(|n| n.parse::<Sysno>().ok())
+        .collect();
+    if !policy.allows_sysv_ipc() {
+        for name in SYSV_IPC_BLOCKLIST_SYSCALLS {
+            if let Ok(sysno) = name.parse::<Sysno>() {
+                set.insert(sysno);
+            }
+        }
+    }
+    set.iter().map(|s| s.id() as u32).collect()
+}
+
 /// Resolve `NO_SUPERVISOR_BLOCKLIST_SYSCALLS` names to numbers, plus
 /// SysV IPC syscalls when `policy.allows_sysv_ipc()` is false.
 pub fn no_supervisor_blocklist_syscall_numbers(policy: &Sandbox) -> Vec<u32> {
     use crate::sys::structs::NO_SUPERVISOR_BLOCKLIST_SYSCALLS;
-    let mut nrs: Vec<u32> = NO_SUPERVISOR_BLOCKLIST_SYSCALLS
-        .iter()
-        .copied()
-        .chain(policy.extra_deny_syscalls.iter().map(String::as_str))
-        .filter_map(|n| syscall_name_to_nr(n))
-        .collect();
-    if !policy.allows_sysv_ipc() {
-        for name in SYSV_IPC_BLOCKLIST_SYSCALLS {
-            if let Some(nr) = syscall_name_to_nr(name) {
-                if !nrs.contains(&nr) {
-                    nrs.push(nr);
-                }
-            }
-        }
-    }
-    nrs.sort_unstable();
-    nrs.dedup();
-    nrs
+    resolve_blocklist(NO_SUPERVISOR_BLOCKLIST_SYSCALLS, policy)
 }
 
 /// Resolve the default syscall blocklist plus policy extras to numbers.
@@ -470,24 +481,7 @@ pub fn no_supervisor_blocklist_syscall_numbers(policy: &Sandbox) -> Vec<u32> {
 /// SysV IPC syscalls are appended to the resolved blocklist when
 /// `policy.allows_sysv_ipc()` is false.
 pub fn blocklist_syscall_numbers(policy: &Sandbox) -> Vec<u32> {
-    let mut nrs: Vec<u32> = DEFAULT_BLOCKLIST_SYSCALLS
-        .iter()
-        .copied()
-        .chain(policy.extra_deny_syscalls.iter().map(String::as_str))
-        .filter_map(|n| syscall_name_to_nr(n))
-        .collect();
-    if !policy.allows_sysv_ipc() {
-        for name in SYSV_IPC_BLOCKLIST_SYSCALLS {
-            if let Some(nr) = syscall_name_to_nr(name) {
-                if !nrs.contains(&nr) {
-                    nrs.push(nr);
-                }
-            }
-        }
-    }
-    nrs.sort_unstable();
-    nrs.dedup();
-    nrs
+    resolve_blocklist(DEFAULT_BLOCKLIST_SYSCALLS, policy)
 }
 
 /// Build argument-level seccomp filter instructions matching the Python
