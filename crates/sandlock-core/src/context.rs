@@ -5,6 +5,8 @@ use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
+use syscalls::{Sysno, SysnoSet};
+
 use crate::arch;
 use crate::sandbox::Sandbox;
 use crate::seccomp::bpf::{self, stmt, jump};
@@ -119,7 +121,8 @@ pub(crate) fn read_u32_fd(fd: RawFd) -> io::Result<u32> {
     Ok(u32::from_le_bytes(buf))
 }
 
-use crate::seccomp::syscall_names::syscall_name_to_nr;
+#[cfg(test)]
+use crate::seccomp::syscall::syscall_name_to_nr;
 
 // ============================================================
 // Sandbox → syscall lists
@@ -151,11 +154,6 @@ impl SyscallList {
         }
     }
 
-    fn extend_optional(&mut self, syscalls: &[Option<i64>]) {
-        for &nr in syscalls {
-            self.push_optional(nr);
-        }
-    }
 
     fn finish(mut self) -> Vec<u32> {
         self.nrs.sort_unstable();
@@ -207,15 +205,11 @@ const TIME_NOTIF_SYSCALLS: &[i64] = &[
 // check, so we have to put every variant on the notif list -- otherwise
 // a caller that picks `open` or `openat2` slips past virtualization
 // and reads the real on-disk file.
-const PROCFS_HOSTS_NOTIF_SYSCALLS: &[i64] = &[
-    libc::SYS_openat,
-    arch::SYS_OPENAT2,
-    libc::SYS_getdents64,
-];
-const PROCFS_HOSTS_OPTIONAL_SYSCALLS: &[Option<i64>] = &[
-    arch::SYS_OPEN,
-    arch::SYS_GETDENTS,
-];
+fn procfs_hosts_notif_syscalls() -> Vec<i64> {
+    let mut v = vec![libc::SYS_openat, arch::SYS_OPENAT2, libc::SYS_getdents64];
+    v.extend([arch::sys_open(), arch::sys_getdents()].into_iter().flatten());
+    v
+}
 
 // Netlink virtualization (always on):
 //   socket, bind, getsockname -- swap in a unix socketpair for AF_NETLINK
@@ -234,101 +228,122 @@ const NETLINK_NOTIF_SYSCALLS: &[i64] = &[
     libc::SYS_close,
 ];
 
-const COW_PATH_SYSCALLS: &[i64] = &[
-    libc::SYS_openat,
-    libc::SYS_execve,
-    libc::SYS_execveat,
-    libc::SYS_unlinkat,
-    libc::SYS_mkdirat,
-    libc::SYS_renameat2,
-    libc::SYS_symlinkat,
-    libc::SYS_linkat,
-    libc::SYS_fchmodat,
-    libc::SYS_fchownat,
-    libc::SYS_truncate,
-    libc::SYS_utimensat,
-    libc::SYS_newfstatat,
-    libc::SYS_statx,
-    libc::SYS_faccessat,
-    arch::SYS_FACCESSAT2,
-    libc::SYS_readlinkat,
-    libc::SYS_getdents64,
-    libc::SYS_chdir,
-    libc::SYS_getcwd,
-];
-const COW_LEGACY_PATH_SYSCALLS: &[Option<i64>] = &[
-    arch::SYS_OPEN,
-    arch::SYS_UNLINK,
-    arch::SYS_RMDIR,
-    arch::SYS_MKDIR,
-    arch::SYS_RENAME,
-    arch::SYS_SYMLINK,
-    arch::SYS_LINK,
-    arch::SYS_CHMOD,
-    arch::SYS_CHOWN,
-    arch::SYS_LCHOWN,
-    arch::SYS_STAT,
-    arch::SYS_LSTAT,
-    arch::SYS_ACCESS,
-    arch::SYS_READLINK,
-    arch::SYS_GETDENTS,
-];
+fn cow_path_syscalls() -> Vec<i64> {
+    let mut v = vec![
+        libc::SYS_openat,
+        libc::SYS_execve,
+        libc::SYS_execveat,
+        libc::SYS_unlinkat,
+        libc::SYS_mkdirat,
+        libc::SYS_renameat2,
+        libc::SYS_symlinkat,
+        libc::SYS_linkat,
+        libc::SYS_fchmodat,
+        libc::SYS_fchownat,
+        libc::SYS_truncate,
+        libc::SYS_utimensat,
+        libc::SYS_newfstatat,
+        libc::SYS_statx,
+        libc::SYS_faccessat,
+        arch::SYS_FACCESSAT2,
+        libc::SYS_readlinkat,
+        libc::SYS_getdents64,
+        libc::SYS_chdir,
+        libc::SYS_getcwd,
+    ];
+    v.extend(
+        [
+            arch::sys_open(),
+            arch::sys_unlink(),
+            arch::sys_rmdir(),
+            arch::sys_mkdir(),
+            arch::sys_rename(),
+            arch::sys_symlink(),
+            arch::sys_link(),
+            arch::sys_chmod(),
+            arch::sys_chown(),
+            arch::sys_lchown(),
+            arch::sys_stat(),
+            arch::sys_lstat(),
+            arch::sys_access(),
+            arch::sys_readlink(),
+            arch::sys_getdents(),
+        ]
+        .into_iter()
+        .flatten(),
+    );
+    v
+}
 
-const CHROOT_PATH_SYSCALLS: &[i64] = &[
-    libc::SYS_openat,
-    libc::SYS_execve,
-    libc::SYS_execveat,
-    libc::SYS_unlinkat,
-    libc::SYS_mkdirat,
-    libc::SYS_renameat2,
-    libc::SYS_symlinkat,
-    libc::SYS_linkat,
-    libc::SYS_fchmodat,
-    libc::SYS_fchownat,
-    libc::SYS_truncate,
-    libc::SYS_newfstatat,
-    libc::SYS_statx,
-    libc::SYS_faccessat,
-    arch::SYS_FACCESSAT2,
-    libc::SYS_readlinkat,
-    libc::SYS_getdents64,
-    libc::SYS_chdir,
-    libc::SYS_getcwd,
-    libc::SYS_statfs,
-    libc::SYS_utimensat,
-];
-const CHROOT_LEGACY_PATH_SYSCALLS: &[Option<i64>] = &[
-    arch::SYS_OPEN,
-    arch::SYS_STAT,
-    arch::SYS_LSTAT,
-    arch::SYS_ACCESS,
-    arch::SYS_READLINK,
-    arch::SYS_GETDENTS,
-    arch::SYS_UNLINK,
-    arch::SYS_RMDIR,
-    arch::SYS_MKDIR,
-    arch::SYS_RENAME,
-    arch::SYS_SYMLINK,
-    arch::SYS_LINK,
-    arch::SYS_CHMOD,
-    arch::SYS_CHOWN,
-    arch::SYS_LCHOWN,
-];
+fn chroot_path_syscalls() -> Vec<i64> {
+    let mut v = vec![
+        libc::SYS_openat,
+        libc::SYS_execve,
+        libc::SYS_execveat,
+        libc::SYS_unlinkat,
+        libc::SYS_mkdirat,
+        libc::SYS_renameat2,
+        libc::SYS_symlinkat,
+        libc::SYS_linkat,
+        libc::SYS_fchmodat,
+        libc::SYS_fchownat,
+        libc::SYS_truncate,
+        libc::SYS_newfstatat,
+        libc::SYS_statx,
+        libc::SYS_faccessat,
+        arch::SYS_FACCESSAT2,
+        libc::SYS_readlinkat,
+        libc::SYS_getdents64,
+        libc::SYS_chdir,
+        libc::SYS_getcwd,
+        libc::SYS_statfs,
+        libc::SYS_utimensat,
+    ];
+    v.extend(
+        [
+            arch::sys_open(),
+            arch::sys_stat(),
+            arch::sys_lstat(),
+            arch::sys_access(),
+            arch::sys_readlink(),
+            arch::sys_getdents(),
+            arch::sys_unlink(),
+            arch::sys_rmdir(),
+            arch::sys_mkdir(),
+            arch::sys_rename(),
+            arch::sys_symlink(),
+            arch::sys_link(),
+            arch::sys_chmod(),
+            arch::sys_chown(),
+            arch::sys_lchown(),
+        ]
+        .into_iter()
+        .flatten(),
+    );
+    v
+}
 
-const FS_DENIED_PATH_SYSCALLS: &[i64] = &[
-    libc::SYS_openat,
-    libc::SYS_execve,
-    libc::SYS_execveat,
-    libc::SYS_linkat,
-    libc::SYS_renameat2,
-    libc::SYS_symlinkat,
-];
-const FS_DENIED_LEGACY_PATH_SYSCALLS: &[Option<i64>] = &[
-    arch::SYS_OPEN,
-    arch::SYS_LINK,
-    arch::SYS_RENAME,
-    arch::SYS_SYMLINK,
-];
+fn fs_denied_path_syscalls() -> Vec<i64> {
+    let mut v = vec![
+        libc::SYS_openat,
+        libc::SYS_execve,
+        libc::SYS_execveat,
+        libc::SYS_linkat,
+        libc::SYS_renameat2,
+        libc::SYS_symlinkat,
+    ];
+    v.extend(
+        [
+            arch::sys_open(),
+            arch::sys_link(),
+            arch::sys_rename(),
+            arch::sys_symlink(),
+        ]
+        .into_iter()
+        .flatten(),
+    );
+    v
+}
 
 const POLICY_EVENT_SYSCALLS: &[i64] = &[
     libc::SYS_openat,
@@ -354,7 +369,7 @@ fn needs_network_supervision(policy: &Sandbox) -> bool {
 /// Determine which syscalls need `SECCOMP_RET_USER_NOTIF`.
 pub fn notif_syscalls(policy: &Sandbox, sandbox_name: Option<&str>) -> Vec<u32> {
     let mut nrs = SyscallList::with(BASE_NOTIF_SYSCALLS);
-    nrs.push_optional(arch::SYS_VFORK);
+    nrs.push_optional(arch::sys_vfork());
 
     // Bare fork(2) carries none of the namespace/process-limit risk of
     // clone/clone3 and was historically left out of the BPF filter so
@@ -363,7 +378,7 @@ pub fn notif_syscalls(policy: &Sandbox, sandbox_name: Option<&str>) -> Vec<u32> 
     // supervisor can register the new child via ptrace fork events
     // before it can run user code (argv-safety invariant).
     if policy.policy_fn.is_some() {
-        nrs.push_optional(arch::SYS_FORK);
+        nrs.push_optional(arch::sys_fork());
     }
 
     if policy.max_memory.is_some() {
@@ -390,8 +405,7 @@ pub fn notif_syscalls(policy: &Sandbox, sandbox_name: Option<&str>) -> Vec<u32> 
         nrs.extend(TIME_NOTIF_SYSCALLS);
     }
 
-    nrs.extend(PROCFS_HOSTS_NOTIF_SYSCALLS);
-    nrs.extend_optional(PROCFS_HOSTS_OPTIONAL_SYSCALLS);
+    nrs.extend(&procfs_hosts_notif_syscalls());
     nrs.extend(NETLINK_NOTIF_SYSCALLS);
 
     // Virtualize sched_getaffinity so nproc/sysconf agree with /proc/cpuinfo
@@ -404,20 +418,17 @@ pub fn notif_syscalls(policy: &Sandbox, sandbox_name: Option<&str>) -> Vec<u32> 
 
     // COW filesystem interception (seccomp-based, unprivileged)
     if policy.workdir.is_some() {
-        nrs.extend(COW_PATH_SYSCALLS);
-        nrs.extend_optional(COW_LEGACY_PATH_SYSCALLS);
+        nrs.extend(&cow_path_syscalls());
     }
 
     // Chroot path interception
     if policy.chroot.is_some() {
-        nrs.extend(CHROOT_PATH_SYSCALLS);
-        nrs.extend_optional(CHROOT_LEGACY_PATH_SYSCALLS);
+        nrs.extend(&chroot_path_syscalls());
     }
 
     // Explicit deny-paths need path-bearing syscalls intercepted.
     if !policy.fs_denied.is_empty() {
-        nrs.extend(FS_DENIED_PATH_SYSCALLS);
-        nrs.extend_optional(FS_DENIED_LEGACY_PATH_SYSCALLS);
+        nrs.extend(&fs_denied_path_syscalls());
     }
 
     // Dynamic policy callback — intercept key syscalls for event emission.
@@ -433,28 +444,36 @@ pub fn notif_syscalls(policy: &Sandbox, sandbox_name: Option<&str>) -> Vec<u32> 
     nrs.finish()
 }
 
+/// Resolve `base` syscall names plus policy extras (and SysV IPC syscalls when
+/// `policy.allows_sysv_ipc()` is false) to a deduplicated, ascending list of
+/// numbers for the current architecture.
+///
+/// A `SysnoSet` accumulates the membership: it dedups inherently (so SysV IPC
+/// folds in with a plain `insert`) and iterates in ascending syscall order.
+/// Names that do not exist on this architecture resolve to nothing and are
+/// skipped, so the result stays arch-correct.
+fn resolve_blocklist(base: &[&str], policy: &Sandbox) -> Vec<u32> {
+    let mut set: SysnoSet = base
+        .iter()
+        .copied()
+        .chain(policy.extra_deny_syscalls.iter().map(String::as_str))
+        .filter_map(|n| n.parse::<Sysno>().ok())
+        .collect();
+    if !policy.allows_sysv_ipc() {
+        for name in SYSV_IPC_BLOCKLIST_SYSCALLS {
+            if let Ok(sysno) = name.parse::<Sysno>() {
+                set.insert(sysno);
+            }
+        }
+    }
+    set.iter().map(|s| s.id() as u32).collect()
+}
+
 /// Resolve `NO_SUPERVISOR_BLOCKLIST_SYSCALLS` names to numbers, plus
 /// SysV IPC syscalls when `policy.allows_sysv_ipc()` is false.
 pub fn no_supervisor_blocklist_syscall_numbers(policy: &Sandbox) -> Vec<u32> {
     use crate::sys::structs::NO_SUPERVISOR_BLOCKLIST_SYSCALLS;
-    let mut nrs: Vec<u32> = NO_SUPERVISOR_BLOCKLIST_SYSCALLS
-        .iter()
-        .copied()
-        .chain(policy.extra_deny_syscalls.iter().map(String::as_str))
-        .filter_map(|n| syscall_name_to_nr(n))
-        .collect();
-    if !policy.allows_sysv_ipc() {
-        for name in SYSV_IPC_BLOCKLIST_SYSCALLS {
-            if let Some(nr) = syscall_name_to_nr(name) {
-                if !nrs.contains(&nr) {
-                    nrs.push(nr);
-                }
-            }
-        }
-    }
-    nrs.sort_unstable();
-    nrs.dedup();
-    nrs
+    resolve_blocklist(NO_SUPERVISOR_BLOCKLIST_SYSCALLS, policy)
 }
 
 /// Resolve the default syscall blocklist plus policy extras to numbers.
@@ -462,24 +481,7 @@ pub fn no_supervisor_blocklist_syscall_numbers(policy: &Sandbox) -> Vec<u32> {
 /// SysV IPC syscalls are appended to the resolved blocklist when
 /// `policy.allows_sysv_ipc()` is false.
 pub fn blocklist_syscall_numbers(policy: &Sandbox) -> Vec<u32> {
-    let mut nrs: Vec<u32> = DEFAULT_BLOCKLIST_SYSCALLS
-        .iter()
-        .copied()
-        .chain(policy.extra_deny_syscalls.iter().map(String::as_str))
-        .filter_map(|n| syscall_name_to_nr(n))
-        .collect();
-    if !policy.allows_sysv_ipc() {
-        for name in SYSV_IPC_BLOCKLIST_SYSCALLS {
-            if let Some(nr) = syscall_name_to_nr(name) {
-                if !nrs.contains(&nr) {
-                    nrs.push(nr);
-                }
-            }
-        }
-    }
-    nrs.sort_unstable();
-    nrs.dedup();
-    nrs
+    resolve_blocklist(DEFAULT_BLOCKLIST_SYSCALLS, policy)
 }
 
 /// Build argument-level seccomp filter instructions matching the Python
@@ -928,7 +930,7 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
             n == libc::SYS_execve as u32 || n == libc::SYS_execveat as u32
         });
         if exec_extra {
-            arch::push_optional_syscall(&mut notif, arch::SYS_FORK);
+            arch::push_optional_syscall(&mut notif, arch::sys_fork());
         }
         notif.sort_unstable();
         notif.dedup();
@@ -1084,21 +1086,21 @@ mod tests {
         let nrs = notif_syscalls(&policy, None);
         assert!(nrs.contains(&(libc::SYS_clone as u32)));
         assert!(nrs.contains(&(libc::SYS_clone3 as u32)));
-        if let Some(vfork) = arch::SYS_VFORK {
+        if let Some(vfork) = arch::sys_vfork() {
             assert!(nrs.contains(&(vfork as u32)));
         }
         // Bare fork(2) is intercepted only when policy_fn is active —
         // see notif_syscalls. The default policy has no policy_fn, so
         // fork stays out of the BPF filter and hot fork-loops keep
         // bypassing the supervisor.
-        if let Some(fork) = arch::SYS_FORK {
+        if let Some(fork) = arch::sys_fork() {
             assert!(!nrs.contains(&(fork as u32)));
         }
     }
 
     #[test]
     fn test_notif_syscalls_fork_gated_on_policy_fn() {
-        let Some(fork) = arch::SYS_FORK else { return };
+        let Some(fork) = arch::sys_fork() else { return };
         let policy = Sandbox::builder()
             .policy_fn(|_event, _ctx| crate::policy_fn::Verdict::Allow)
             .build()
@@ -1338,8 +1340,10 @@ mod tests {
     fn test_syscall_name_to_nr_covers_defaults() {
         // Every name in DEFAULT_BLOCKLIST_SYSCALLS should resolve unless the
         // running architecture does not expose that syscall.
+        // `nfsservctl` now resolves: the syscalls crate carries it (kernel
+        // returns ENOSYS, but the ABI number exists), so it is enforced in the
+        // blocklist rather than silently dropped. `ioperm`/`iopl` are x86-only.
         let expected_unresolved: &[&str] = &[
-            "nfsservctl",
             #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
             "ioperm",
             #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
