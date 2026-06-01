@@ -4,4 +4,3 @@ pub mod dispatch;
 pub mod notif;
 pub(crate) mod state;
 pub mod syscall;
-pub mod syscall_names;

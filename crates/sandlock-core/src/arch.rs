@@ -1,21 +1,22 @@
 //! Architecture-specific syscall and seccomp helpers.
 
-/// `faccessat2(2)` syscall number on Sandlock's supported Linux architectures.
-///
-/// The `libc` crate does not expose this constant on all supported build
-/// targets yet, but the seccomp filters and path virtualization handlers need
-/// to intercept it because glibc 2.33+ may prefer it over `faccessat`.
-pub const SYS_FACCESSAT2: i64 = 439;
+use syscalls::Sysno;
+
+// Syscall numbers sourced from the `syscalls` crate (generated from the kernel
+// ABI tables), replacing hand-maintained per-architecture magic numbers. Each
+// of these syscalls exists on every architecture Sandlock targets, so a single
+// definition resolves to the correct per-arch number at compile time. The
+// `tests` module below pins the resolved values to the historical constants.
+pub const SYS_FACCESSAT2: i64 = Sysno::faccessat2 as i64;
+pub const SYS_OPENAT2: i64 = Sysno::openat2 as i64;
+pub const SYS_SECCOMP: i64 = Sysno::seccomp as i64;
+pub const SYS_MEMFD_CREATE: i64 = Sysno::memfd_create as i64;
+pub const SYS_PIDFD_OPEN: i64 = Sysno::pidfd_open as i64;
+pub const SYS_PIDFD_GETFD: i64 = Sysno::pidfd_getfd as i64;
 
 #[cfg(target_arch = "x86_64")]
 mod imp {
     pub const AUDIT_ARCH: u32 = 0xC000_003E;
-    pub const MAX_SYSCALL_NR: i64 = 462;
-    pub const SYS_SECCOMP: i64 = 317;
-    pub const SYS_MEMFD_CREATE: i64 = 319;
-    pub const SYS_PIDFD_OPEN: i64 = 434;
-    pub const SYS_PIDFD_GETFD: i64 = 438;
-    pub const SYS_OPENAT2: i64 = 437;
 
     pub const SYS_OPEN: Option<i64> = Some(libc::SYS_open);
     pub const SYS_STAT: Option<i64> = Some(libc::SYS_stat);
@@ -33,11 +34,7 @@ mod imp {
     pub const SYS_CHOWN: Option<i64> = Some(libc::SYS_chown);
     pub const SYS_LCHOWN: Option<i64> = Some(libc::SYS_lchown);
     pub const SYS_VFORK: Option<i64> = Some(libc::SYS_vfork);
-    pub const SYS_FUTIMESAT: Option<i64> = Some(libc::SYS_futimesat);
     pub const SYS_FORK: Option<i64> = Some(libc::SYS_fork);
-    pub const SYS_IOPERM: Option<i64> = Some(libc::SYS_ioperm);
-    pub const SYS_IOPL: Option<i64> = Some(libc::SYS_iopl);
-    pub const SYS_TIME: Option<i64> = Some(libc::SYS_time);
 
     /// Every syscall the kernel will dispatch through `handle_fork`.
     /// Single source of truth for callers that enumerate fork-class
@@ -54,12 +51,6 @@ mod imp {
 #[cfg(target_arch = "aarch64")]
 mod imp {
     pub const AUDIT_ARCH: u32 = 0xC000_00B7;
-    pub const MAX_SYSCALL_NR: i64 = 463;
-    pub const SYS_SECCOMP: i64 = 277;
-    pub const SYS_MEMFD_CREATE: i64 = 279;
-    pub const SYS_PIDFD_OPEN: i64 = 434;
-    pub const SYS_PIDFD_GETFD: i64 = 438;
-    pub const SYS_OPENAT2: i64 = 437;
 
     pub const SYS_OPEN: Option<i64> = None;
     pub const SYS_STAT: Option<i64> = None;
@@ -77,11 +68,7 @@ mod imp {
     pub const SYS_CHOWN: Option<i64> = None;
     pub const SYS_LCHOWN: Option<i64> = None;
     pub const SYS_VFORK: Option<i64> = None;
-    pub const SYS_FUTIMESAT: Option<i64> = None;
     pub const SYS_FORK: Option<i64> = None;
-    pub const SYS_IOPERM: Option<i64> = None;
-    pub const SYS_IOPL: Option<i64> = None;
-    pub const SYS_TIME: Option<i64> = None;
 
     /// Every syscall the kernel will dispatch through `handle_fork`.
     /// aarch64 has no `fork`/`vfork` (glibc emulates via `clone`).
@@ -95,12 +82,6 @@ mod imp {
 mod imp {
     // AUDIT_ARCH_RISCV64 = EM_RISCV(243) | __AUDIT_ARCH_64BIT | __AUDIT_ARCH_LE.
     pub const AUDIT_ARCH: u32 = 0xC000_00F3;
-    pub const MAX_SYSCALL_NR: i64 = 463;
-    pub const SYS_SECCOMP: i64 = 277;
-    pub const SYS_MEMFD_CREATE: i64 = 279;
-    pub const SYS_PIDFD_OPEN: i64 = 434;
-    pub const SYS_PIDFD_GETFD: i64 = 438;
-    pub const SYS_OPENAT2: i64 = 437;
 
     // riscv64 uses the generic syscall ABI: no legacy open/stat/fork/etc.
     pub const SYS_OPEN: Option<i64> = None;
@@ -119,11 +100,7 @@ mod imp {
     pub const SYS_CHOWN: Option<i64> = None;
     pub const SYS_LCHOWN: Option<i64> = None;
     pub const SYS_VFORK: Option<i64> = None;
-    pub const SYS_FUTIMESAT: Option<i64> = None;
     pub const SYS_FORK: Option<i64> = None;
-    pub const SYS_IOPERM: Option<i64> = None;
-    pub const SYS_IOPL: Option<i64> = None;
-    pub const SYS_TIME: Option<i64> = None;
 
     /// Every syscall the kernel will dispatch through `handle_fork`.
     /// riscv64 has no `fork`/`vfork` (glibc emulates via `clone`).
@@ -135,18 +112,57 @@ mod imp {
 
 pub use imp::*;
 
-/// True if `nr` is plausibly a syscall number on the current architecture.
+/// True if `nr` is a real syscall number on the current architecture.
 /// Used by [`crate::seccomp::syscall::Syscall::checked`] to reject foot-gun
 /// cases like negative or arch-mismatched numbers.
 ///
-/// Conservative: validates `0 <= nr <= MAX_SYSCALL_NR`. Doesn't enumerate
-/// every nr — kernel's seccomp filter rejects unknowns at JEQ stage anyway.
+/// Exact: backed by the `syscalls` crate's per-arch table, so unassigned
+/// numbers within the table's range are rejected too (unlike a bare range
+/// check against the highest known number).
 pub fn is_known_syscall(nr: i64) -> bool {
-    nr >= 0 && nr <= imp::MAX_SYSCALL_NR
+    nr >= 0 && Sysno::new(nr as usize).is_some()
 }
 
 pub fn push_optional_syscall(v: &mut Vec<u32>, nr: Option<i64>) {
     if let Some(nr) = nr {
         v.push(nr as u32);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pin the crate-sourced syscall numbers to the values Sandlock used
+    /// before adopting the crate, per architecture. A divergence here means a
+    /// crate upgrade changed an ABI number out from under the seccomp filters.
+    #[test]
+    fn crate_sourced_consts_match_historical_values() {
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert_eq!(SYS_SECCOMP, 317);
+            assert_eq!(SYS_MEMFD_CREATE, 319);
+            assert_eq!(SYS_PIDFD_OPEN, 434);
+            assert_eq!(SYS_PIDFD_GETFD, 438);
+            assert_eq!(SYS_OPENAT2, 437);
+            assert_eq!(SYS_FACCESSAT2, 439);
+        }
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        {
+            assert_eq!(SYS_SECCOMP, 277);
+            assert_eq!(SYS_MEMFD_CREATE, 279);
+            assert_eq!(SYS_PIDFD_OPEN, 434);
+            assert_eq!(SYS_PIDFD_GETFD, 438);
+            assert_eq!(SYS_OPENAT2, 437);
+            assert_eq!(SYS_FACCESSAT2, 439);
+        }
+    }
+
+    #[test]
+    fn is_known_syscall_accepts_real_and_rejects_bogus() {
+        assert!(is_known_syscall(libc::SYS_openat));
+        assert!(is_known_syscall(libc::SYS_clone));
+        assert!(!is_known_syscall(-1));
+        assert!(!is_known_syscall(99_999));
     }
 }

@@ -119,7 +119,7 @@ pub(crate) fn read_u32_fd(fd: RawFd) -> io::Result<u32> {
     Ok(u32::from_le_bytes(buf))
 }
 
-use crate::seccomp::syscall_names::syscall_name_to_nr;
+use crate::seccomp::syscall::syscall_name_to_nr;
 
 // ============================================================
 // Sandbox → syscall lists
@@ -1338,8 +1338,10 @@ mod tests {
     fn test_syscall_name_to_nr_covers_defaults() {
         // Every name in DEFAULT_BLOCKLIST_SYSCALLS should resolve unless the
         // running architecture does not expose that syscall.
+        // `nfsservctl` now resolves: the syscalls crate carries it (kernel
+        // returns ENOSYS, but the ABI number exists), so it is enforced in the
+        // blocklist rather than silently dropped. `ioperm`/`iopl` are x86-only.
         let expected_unresolved: &[&str] = &[
-            "nfsservctl",
             #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
             "ioperm",
             #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
