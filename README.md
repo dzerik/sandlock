@@ -69,7 +69,7 @@ Sandlock is implemented in **Rust** for performance and safety:
 | Landlock IPC scoping | 6.12 (ABI v6) |
 
 Protections can be selectively waived per-policy when needed — see
-[`docs/extension-handlers.md#protection-opt-out`](docs/extension-handlers.md#protection-opt-out).
+[`docs/sandbox-reference.md#protection-opt-out`](docs/sandbox-reference.md#protection-opt-out).
 
 ## Install
 
