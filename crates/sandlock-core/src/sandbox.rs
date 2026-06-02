@@ -116,6 +116,8 @@ impl TryFrom<&Sandbox> for Confinement {
         if !sandbox.http_ports.is_empty() { unsupported.push("http_ports"); }
         if sandbox.http_ca.is_some() { unsupported.push("http_ca"); }
         if sandbox.http_key.is_some() { unsupported.push("http_key"); }
+        if !sandbox.http_inject_ca.is_empty() { unsupported.push("http_inject_ca"); }
+        if sandbox.http_ca_out.is_some() { unsupported.push("http_ca_out"); }
         if sandbox.max_memory.is_some() { unsupported.push("max_memory"); }
         if sandbox.max_processes != 64 { unsupported.push("max_processes"); }
         if sandbox.max_open_files.is_some() { unsupported.push("max_open_files"); }
@@ -261,6 +263,11 @@ pub struct Sandbox {
     pub http_ca: Option<PathBuf>,
     /// PEM CA key for HTTPS MITM. Required when http_ca is set.
     pub http_key: Option<PathBuf>,
+    /// Trust-bundle paths to splice the MITM CA into (zero-config HTTPS).
+    pub http_inject_ca: Vec<PathBuf>,
+    /// Path to write the active MITM CA public cert (PEM) for external trust
+    /// wiring (e.g. NODE_EXTRA_CA_CERTS). Never writes the private key.
+    pub http_ca_out: Option<PathBuf>,
 
     // Resource limits
     pub max_memory: Option<ByteSize>,
@@ -374,6 +381,8 @@ impl Clone for Sandbox {
             http_ports: self.http_ports.clone(),
             http_ca: self.http_ca.clone(),
             http_key: self.http_key.clone(),
+            http_inject_ca: self.http_inject_ca.clone(),
+            http_ca_out: self.http_ca_out.clone(),
             max_memory: self.max_memory,
             max_processes: self.max_processes,
             max_open_files: self.max_open_files,
@@ -1765,6 +1774,15 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", arg(long = "http-key", value_name = "PATH"))]
     pub http_key: Option<PathBuf>,
 
+    /// Inject the MITM CA into these trust bundle paths (repeatable). Without
+    /// --http-ca this generates an ephemeral CA and intercepts port 443.
+    #[cfg_attr(feature = "cli", arg(long = "http-inject-ca", value_name = "PATH"))]
+    pub http_inject_ca: Vec<PathBuf>,
+
+    /// Write the active MITM CA public certificate (PEM) to this path.
+    #[cfg_attr(feature = "cli", arg(long = "http-ca-out", value_name = "PATH"))]
+    pub http_ca_out: Option<PathBuf>,
+
     // max_memory uses a string in the CLI (e.g. "512M"); not directly clap-friendly as ByteSize.
     #[cfg_attr(feature = "cli", clap(skip))]
     pub max_memory: Option<ByteSize>,
@@ -1911,6 +1929,8 @@ impl Clone for SandboxBuilder {
             http_ports: self.http_ports.clone(),
             http_ca: self.http_ca.clone(),
             http_key: self.http_key.clone(),
+            http_inject_ca: self.http_inject_ca.clone(),
+            http_ca_out: self.http_ca_out.clone(),
             max_memory: self.max_memory,
             max_processes: self.max_processes,
             max_open_files: self.max_open_files,
@@ -2046,6 +2066,16 @@ impl SandboxBuilder {
 
     pub fn http_key(mut self, path: impl Into<PathBuf>) -> Self {
         self.http_key = Some(path.into());
+        self
+    }
+
+    pub fn http_inject_ca(mut self, path: impl Into<PathBuf>) -> Self {
+        self.http_inject_ca.push(path.into());
+        self
+    }
+
+    pub fn http_ca_out(mut self, path: impl Into<PathBuf>) -> Self {
+        self.http_ca_out = Some(path.into());
         self
     }
 
@@ -2242,6 +2272,24 @@ impl SandboxBuilder {
             ));
         }
 
+        // --http-inject-ca / --http-ca-out are meaningless without an HTTP ACL
+        // proxy to do MITM, which only spawns when http rules exist.
+        let has_http_rules = !self.http_allow.is_empty() || !self.http_deny.is_empty();
+        if !self.http_inject_ca.is_empty() && !has_http_rules {
+            return Err(SandboxError::Invalid(
+                "--http-inject-ca requires --http-allow or --http-deny".into(),
+            ));
+        }
+        // --http-ca-out needs an actual CA to export (BYO or generated).
+        if self.http_ca_out.is_some()
+            && self.http_ca.is_none()
+            && self.http_inject_ca.is_empty()
+        {
+            return Err(SandboxError::Invalid(
+                "--http-ca-out requires --http-ca or --http-inject-ca".into(),
+            ));
+        }
+
         // Parse HTTP rules (deferred from builder methods to propagate errors)
         let http_allow: Vec<HttpRule> = self
             .http_allow
@@ -2257,7 +2305,7 @@ impl SandboxBuilder {
         // Default HTTP intercept ports: 80 always, 443 when HTTPS CA is configured.
         let http_ports = if self.http_ports.is_empty() && (!http_allow.is_empty() || !http_deny.is_empty()) {
             let mut ports = vec![80];
-            if self.http_ca.is_some() {
+            if self.http_ca.is_some() || !self.http_inject_ca.is_empty() {
                 ports.push(443);
             }
             ports
@@ -2293,6 +2341,8 @@ impl SandboxBuilder {
             http_ports,
             http_ca: self.http_ca,
             http_key: self.http_key,
+            http_inject_ca: self.http_inject_ca,
+            http_ca_out: self.http_ca_out,
             max_memory: self.max_memory,
             max_processes: self.max_processes.unwrap_or(64),
             max_open_files: self.max_open_files,
@@ -2396,6 +2446,40 @@ mod tests {
             .unwrap();
         assert!(policy.http_ca.is_some());
         assert!(policy.http_key.is_some());
+    }
+
+    #[test]
+    fn inject_ca_adds_443_and_requires_http_rule() {
+        // No http rule -> error.
+        let err = Sandbox::builder()
+            .http_inject_ca("/etc/ssl/certs/ca-certificates.crt")
+            .build();
+        assert!(err.is_err());
+
+        // With an http rule -> ok, and 443 is intercepted.
+        let policy = Sandbox::builder()
+            .http_allow("GET example.com/*")
+            .http_inject_ca("/etc/ssl/certs/ca-certificates.crt")
+            .build()
+            .unwrap();
+        assert!(policy.http_ports.contains(&443));
+        assert_eq!(policy.http_inject_ca.len(), 1);
+    }
+
+    #[test]
+    fn http_ca_out_requires_trigger() {
+        let err = Sandbox::builder()
+            .http_allow("GET example.com/*")
+            .http_ca_out("/tmp/out.pem")
+            .build();
+        assert!(err.is_err());
+
+        let ok = Sandbox::builder()
+            .http_allow("GET example.com/*")
+            .http_inject_ca("/etc/ssl/certs/ca-certificates.crt")
+            .http_ca_out("/tmp/out.pem")
+            .build();
+        assert!(ok.is_ok());
     }
 
     #[test]
