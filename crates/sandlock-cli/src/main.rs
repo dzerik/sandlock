@@ -123,7 +123,7 @@ struct RunArgs {
 
     /// Allow the named protection to degrade silently if the host kernel ABI lacks support.
     /// Repeatable. Accepted values: fs-refer, fs-truncate, net-tcp, fs-ioctl-dev,
-    /// signal-scope, abstract-unix-scope-socket.
+    /// signal-scope, abstract-unix-socket-scope.
     #[arg(long = "allow-degraded", value_name = "PROTECTION")]
     allow_degraded: Vec<String>,
 
@@ -142,7 +142,7 @@ struct RunArgs {
 /// (`LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET` → `abstract-unix-socket-scope`,
 /// etc.) and are case-insensitive. Accepted: `fs-refer`, `fs-truncate`,
 /// `net-tcp`, `fs-ioctl-dev`, `signal-scope`,
-/// `abstract-unix-socket-scope` (alias: `abstract-unix-scope-socket`).
+/// `abstract-unix-socket-scope`.
 fn parse_protection(s: &str) -> Result<sandlock_core::Protection, String> {
     use sandlock_core::Protection;
     match s.to_ascii_lowercase().as_str() {
@@ -151,9 +151,7 @@ fn parse_protection(s: &str) -> Result<sandlock_core::Protection, String> {
         "net-tcp" => Ok(Protection::NetTcp),
         "fs-ioctl-dev" => Ok(Protection::FsIoctlDev),
         "signal-scope" => Ok(Protection::SignalScope),
-        "abstract-unix-socket-scope" | "abstract-unix-scope-socket" => {
-            Ok(Protection::AbstractUnixSocketScope)
-        }
+        "abstract-unix-socket-scope" => Ok(Protection::AbstractUnixSocketScope),
         other => Err(format!(
             "unknown protection: {} (valid: fs-refer, fs-truncate, net-tcp, fs-ioctl-dev, signal-scope, abstract-unix-socket-scope)",
             other,
