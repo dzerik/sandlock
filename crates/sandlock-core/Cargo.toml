@@ -45,3 +45,4 @@ cli = ["dep:clap"]
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
 tempfile = "3"
+rustls-pemfile = "2"

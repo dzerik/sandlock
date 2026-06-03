@@ -1735,6 +1735,7 @@ dependencies = [
  "rand_chacha",
  "rcgen",
  "rustls",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "syscalls",

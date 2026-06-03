@@ -149,4 +149,77 @@ mod tests {
         assert!(!is_tls_client_hello(b'G')); // "GET ..."
         assert!(!is_tls_client_hello(b'P')); // "POST ..."
     }
+
+    // Extract the first certificate DER from a PEM string.
+    fn first_cert_der(pem: &str) -> rustls::pki_types::CertificateDer<'static> {
+        let mut rd = std::io::BufReader::new(pem.as_bytes());
+        let der = rustls_pemfile::certs(&mut rd)
+            .next()
+            .expect("at least one CERTIFICATE block")
+            .expect("valid certificate");
+        der
+    }
+
+    // Hermetic proof of the MITM path, no upstream network:
+    //   1. the proxy terminates TLS,
+    //   2. a client trusting the generated CA completes the handshake against
+    //      the proxy's per-SNI minted leaf,
+    //   3. a request that does not match the ACL gets HTTP 403 with the
+    //      sandlock body (the deny path never contacts an upstream).
+    #[tokio::test]
+    async fn https_mitm_denies_disallowed_request() {
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+        use tokio_rustls::TlsConnector;
+
+        // Ephemeral CA, plus an allow rule that will NOT match our request.
+        let ca = crate::http_acl::resolve_ca(None, None, true)
+            .expect("resolve_ca ok")
+            .expect("ephemeral CA generated");
+        let allow = vec![crate::http::HttpRule::parse("GET allowed.test/*").expect("rule parses")];
+        let handle = super::spawn_transparent_proxy(allow, vec![], Some(&ca.cert_pem), Some(&ca.key_pem))
+            .await
+            .expect("proxy spawns");
+        let addr = handle.addr;
+
+        // rustls client that trusts only the generated CA.
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(first_cert_der(&ca.cert_pem)).expect("add CA root");
+        let client_cfg = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(client_cfg));
+
+        // Connect and complete the TLS handshake with SNI "denied.test". A
+        // successful handshake proves termination plus trust of the minted leaf.
+        let tcp = TcpStream::connect(addr).await.expect("tcp connect");
+        let server_name = rustls::pki_types::ServerName::try_from("denied.test")
+            .expect("valid server name");
+        let mut tls = connector
+            .connect(server_name, tcp)
+            .await
+            .expect("TLS handshake against minted leaf");
+
+        // A disallowed request: GET denied.test/secret.
+        tls.write_all(
+            b"GET /secret HTTP/1.1\r\nHost: denied.test\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .expect("write request");
+
+        let mut buf = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), tls.read_to_end(&mut buf))
+            .await
+            .expect("response within timeout")
+            .expect("read response");
+        let resp = String::from_utf8_lossy(&buf);
+
+        assert!(resp.starts_with("HTTP/1.1 403"), "expected 403, got: {resp}");
+        assert!(
+            resp.contains("Blocked by sandlock HTTP ACL policy"),
+            "body: {resp}"
+        );
+    }
 }
