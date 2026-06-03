@@ -28,6 +28,7 @@ pub(crate) mod ca_inject;
 pub(crate) mod chroot;
 pub mod dry_run;
 pub(crate) mod http_acl;
+mod transparent_proxy;
 
 pub use error::SandlockError;
 pub use sys::structs::{SeccompData, SeccompNotif};
