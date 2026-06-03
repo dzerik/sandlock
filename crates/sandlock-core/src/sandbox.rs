@@ -189,7 +189,7 @@ struct Runtime {
     stdout_pipe: Option<std::os::fd::OwnedFd>,
     io_overrides: Option<(Option<i32>, Option<i32>, Option<i32>)>,
     extra_fds: Vec<(i32, i32)>,
-    http_acl_handle: Option<crate::http_acl::HttpAclProxyHandle>,
+    http_acl_handle: Option<crate::transparent_proxy::HttpAclProxyHandle>,
     #[allow(clippy::type_complexity)]
     on_bind: Option<Box<dyn Fn(&HashMap<u16, u16>) + Send + Sync>>,
     handlers: Vec<(i64, Arc<dyn crate::seccomp::dispatch::Handler>)>,
@@ -1202,7 +1202,7 @@ impl Sandbox {
                 None => (None, None),
             };
 
-            let handle = crate::http_acl::spawn_http_acl_proxy(
+            let handle = crate::transparent_proxy::spawn_transparent_proxy(
                 self.http_allow.clone(),
                 self.http_deny.clone(),
                 cert_pem,
