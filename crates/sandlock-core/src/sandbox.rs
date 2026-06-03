@@ -1151,6 +1151,27 @@ impl Sandbox {
         // drop to "no confinement".
         let chroot_root = crate::chroot::resolve::resolve_chroot_root(self.chroot.as_deref())?;
 
+        // Each --http-inject-ca target must exist in the sandbox's view, or the
+        // CA cannot be spliced into it and TLS interception silently fails. A
+        // configured-but-missing trust bundle is a hard error, resolved through
+        // --fs-mount and chroot so the check matches the workload's view.
+        if !self.http_inject_ca.is_empty() {
+            let mounts = crate::chroot::resolve::resolve_chroot_mounts(&self.fs_mount);
+            for p in &self.http_inject_ca {
+                let host = resolve_sandbox_path_to_host(p, chroot_root.as_deref(), &mounts);
+                if !host.exists() {
+                    return Err(SandboxRuntimeError::Child(format!(
+                        "--http-inject-ca {:?} not found in the sandbox view (resolved to {:?}); \
+                         the CA cannot be injected into it. Point it at the trust bundle the \
+                         workload actually reads (e.g. /etc/ssl/certs/ca-certificates.crt, or \
+                         certifi's cacert.pem).",
+                        p, host
+                    ))
+                    .into());
+                }
+            }
+        }
+
         let c_cmd: Vec<CString> = cmd
             .iter()
             .map(|s| CString::new(*s).map_err(|_| SandboxRuntimeError::Child("invalid command string".into())))
@@ -2417,9 +2438,72 @@ impl SandboxBuilder {
     }
 }
 
+/// Resolve a path as seen inside the sandbox to its host-side location, so its
+/// existence can be checked before spawn. Honors `--fs-mount` (virtual:host)
+/// mappings (which take precedence) and chroot. Used to validate
+/// `--http-inject-ca` targets.
+fn resolve_sandbox_path_to_host(
+    child_path: &std::path::Path,
+    chroot_root: Option<&std::path::Path>,
+    mounts: &[(std::path::PathBuf, std::path::PathBuf)],
+) -> std::path::PathBuf {
+    for (virt, host) in mounts {
+        if let Ok(rest) = child_path.strip_prefix(virt) {
+            return host.join(rest);
+        }
+    }
+    if let Some(root) = chroot_root {
+        if let Ok(rest) = child_path.strip_prefix("/") {
+            return root.join(rest);
+        }
+    }
+    child_path.to_path_buf()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn resolve_sandbox_path_plain() {
+        let r = resolve_sandbox_path_to_host(Path::new("/etc/ssl/x.pem"), None, &[]);
+        assert_eq!(r, PathBuf::from("/etc/ssl/x.pem"));
+    }
+
+    #[test]
+    fn resolve_sandbox_path_under_chroot() {
+        let r = resolve_sandbox_path_to_host(
+            Path::new("/etc/ssl/x.pem"),
+            Some(Path::new("/srv/root")),
+            &[],
+        );
+        assert_eq!(r, PathBuf::from("/srv/root/etc/ssl/x.pem"));
+    }
+
+    #[test]
+    fn resolve_sandbox_path_mount_takes_precedence() {
+        let mounts = vec![(PathBuf::from("/etc/ssl"), PathBuf::from("/host/ssl"))];
+        let r = resolve_sandbox_path_to_host(
+            Path::new("/etc/ssl/x.pem"),
+            Some(Path::new("/srv/root")),
+            &mounts,
+        );
+        assert_eq!(r, PathBuf::from("/host/ssl/x.pem"));
+    }
+
+    #[tokio::test]
+    async fn inject_ca_nonexistent_path_errors_at_run() {
+        // Wildcard host rule avoids DNS; the missing inject path must error
+        // before any fork or network work.
+        let mut policy = Sandbox::builder()
+            .http_allow("GET */*")
+            .http_inject_ca("/definitely/not/here/sandlock-bundle.pem")
+            .build()
+            .unwrap();
+        let res = policy.run(&["true"]).await;
+        assert!(res.is_err(), "expected error for missing --http-inject-ca path");
+    }
 
     // --- SandboxBuilder integration ---
 
