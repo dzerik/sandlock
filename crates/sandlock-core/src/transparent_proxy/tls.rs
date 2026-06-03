@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use rcgen::{Certificate, CertificateParams, KeyPair};
+use rcgen::{Certificate, CertificateParams, DnType, KeyPair};
 use rustls::pki_types::PrivateKeyDer;
 use rustls::ServerConfig;
 
@@ -41,16 +41,20 @@ impl CertSigner {
             std::io::Error::new(std::io::ErrorKind::Other, format!("leaf keygen: {e}"))
         })?;
         // new(vec![sni]) sets subject_alt_names to a single DnsName(sni) entry.
-        let params = CertificateParams::new(vec![sni.to_string()]).map_err(|e| {
+        let mut params = CertificateParams::new(vec![sni.to_string()]).map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("leaf params: {e}"))
         })?;
+        // Give the leaf a subject CN distinct from the CA's subject, so the leaf
+        // is not mistaken for self-signed (subject == issuer) by clients.
+        params.distinguished_name.push(DnType::CommonName, sni);
         // signed_by(public_key, issuer_cert, issuer_key): leaf public key is the
         // leaf KeyPair (impl PublicKeyData), signed by the CA cert + CA key.
         let leaf = params.signed_by(&leaf_key, &self.ca_cert, &self.ca_key).map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::Other, format!("leaf sign: {e}"))
         })?;
 
-        let chain = vec![leaf.der().clone(), self.ca_cert.der().clone()];
+        // Present only the leaf; the CA is the trust anchor in the client's store.
+        let chain = vec![leaf.der().clone()];
         // rcgen serialize_der() returns PKCS#8 DER.
         let key_der = PrivateKeyDer::Pkcs8(leaf_key.serialize_der().into());
 

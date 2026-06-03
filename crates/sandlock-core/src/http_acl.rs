@@ -193,13 +193,17 @@ impl Drop for HttpAclProxyHandle {
 
 /// Pre-generated dummy CA for HTTP-only mode, avoiding per-spawn keygen cost.
 fn dummy_ca() -> std::io::Result<(KeyPair, hudsucker::rcgen::Certificate)> {
-    use hudsucker::rcgen::{BasicConstraints, IsCa};
+    use hudsucker::rcgen::{BasicConstraints, DnType, IsCa};
 
     let kp = KeyPair::generate().map_err(|e| {
         std::io::Error::new(std::io::ErrorKind::Other, format!("keygen failed: {e}"))
     })?;
     let mut params = CertificateParams::default();
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    // A distinct subject DN is required: leaf certs minted under this CA must
+    // have a subject that differs from their issuer, otherwise an empty-DN leaf
+    // looks self-signed (subject == issuer) and clients reject it.
+    params.distinguished_name.push(DnType::CommonName, "sandlock MITM CA");
     let cert = params.self_signed(&kp).map_err(|e| {
         std::io::Error::new(std::io::ErrorKind::Other, format!("self-sign failed: {e}"))
     })?;
