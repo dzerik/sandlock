@@ -21,14 +21,6 @@ fn dummy_ca() -> std::io::Result<(KeyPair, rcgen::Certificate)> {
     Ok((kp, cert))
 }
 
-// Kept for HTTP-only mode reuse; the transparent proxy does not read it yet.
-#[allow(dead_code)]
-static DUMMY_CA: std::sync::LazyLock<std::io::Result<(Vec<u8>, Vec<u8>)>> =
-    std::sync::LazyLock::new(|| {
-        let (kp, cert) = dummy_ca()?;
-        Ok((kp.serialize_pem().into_bytes(), cert.pem().into_bytes()))
-    });
-
 /// In-memory CA material (public cert + private key, PEM-encoded).
 pub struct CaMaterial {
     pub cert_pem: String,
@@ -40,7 +32,8 @@ pub struct CaMaterial {
 /// - Both `ca_cert` and `ca_key` set: load them from disk (bring-your-own).
 /// - Neither set but `generate` is true: generate an ephemeral in-memory CA.
 ///   The private key never touches disk.
-/// - Otherwise: `None` (HTTP-only; the proxy uses its internal dummy CA).
+/// - Otherwise: `None` (HTTP-only; the proxy serves plaintext and does not
+///   intercept TLS).
 pub fn resolve_ca(
     ca_cert: Option<&Path>,
     ca_key: Option<&Path>,
