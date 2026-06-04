@@ -1394,6 +1394,7 @@ impl Sandbox {
                 max_processes: self.max_processes,
                 has_memory_limit: self.max_memory.is_some(),
                 has_net_allowlist: !self.net_allow.is_empty()
+                    || !self.net_deny.is_empty()
                     || self.policy_fn.is_some()
                     || !self.http_allow.is_empty()
                     || !self.http_deny.is_empty(),
@@ -1429,33 +1430,40 @@ impl Sandbox {
             let time_random_state = TimeRandomState::new(time_offset, random_state);
 
             let mut net_state = NetworkState::new();
-            let no_rules = self.net_allow.is_empty();
-            let policy_from = |resolved: &network::ResolvedNetAllow| {
-                if no_rules || resolved.any_ip_all_ports {
-                    crate::seccomp::notif::NetworkPolicy::Unrestricted
-                } else {
-                    use crate::seccomp::notif::PortAllow;
-                    let per_ip = resolved
-                        .per_ip
-                        .iter()
-                        .map(|(ip, ports)| {
-                            let allow = if resolved.per_ip_all_ports.contains(ip) {
-                                PortAllow::Any
-                            } else {
-                                PortAllow::Specific(ports.clone())
-                            };
-                            (*ip, allow)
-                        })
-                        .collect();
-                    crate::seccomp::notif::NetworkPolicy::AllowList {
-                        per_ip,
-                        any_ip_ports: resolved.any_ip_ports.clone(),
+            if !self.net_deny.is_empty() {
+                let resolved_deny = network::resolve_net_deny(&self.net_deny);
+                net_state.tcp_policy = resolved_deny.tcp;
+                net_state.udp_policy = resolved_deny.udp;
+                net_state.icmp_policy = resolved_deny.icmp;
+            } else {
+                let no_rules = self.net_allow.is_empty();
+                let policy_from = |resolved: &network::ResolvedNetAllow| {
+                    if no_rules || resolved.any_ip_all_ports {
+                        crate::seccomp::notif::NetworkPolicy::Unrestricted
+                    } else {
+                        use crate::seccomp::notif::PortAllow;
+                        let per_ip = resolved
+                            .per_ip
+                            .iter()
+                            .map(|(ip, ports)| {
+                                let allow = if resolved.per_ip_all_ports.contains(ip) {
+                                    PortAllow::Any
+                                } else {
+                                    PortAllow::Specific(ports.clone())
+                                };
+                                (*ip, allow)
+                            })
+                            .collect();
+                        crate::seccomp::notif::NetworkPolicy::AllowList {
+                            per_ip,
+                            any_ip_ports: resolved.any_ip_ports.clone(),
+                        }
                     }
-                }
-            };
-            net_state.tcp_policy = policy_from(&resolved_net_allow.tcp);
-            net_state.udp_policy = policy_from(&resolved_net_allow.udp);
-            net_state.icmp_policy = policy_from(&resolved_net_allow.icmp);
+                };
+                net_state.tcp_policy = policy_from(&resolved_net_allow.tcp);
+                net_state.udp_policy = policy_from(&resolved_net_allow.udp);
+                net_state.icmp_policy = policy_from(&resolved_net_allow.icmp);
+            }
             net_state.http_acl_addr = self.rt().http_acl_handle.as_ref().map(|h| h.addr);
             net_state.http_acl_ports = self.http_ports.iter().copied().collect();
             net_state.http_acl_orig_dest = self.rt().http_acl_handle.as_ref().map(|h| h.orig_dest.clone());
@@ -2681,6 +2689,14 @@ mod tests {
     fn builder_net_deny_rejects_hostname() {
         let err = Sandbox::builder().net_deny("evil.com:443").build();
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn net_deny_resolves_to_denylist_policies() {
+        let policy = Sandbox::builder().net_deny("10.0.0.0/8").build().unwrap();
+        let set = crate::network::resolve_net_deny(&policy.net_deny);
+        assert!(!set.tcp.allows("10.0.0.5".parse().unwrap(), 443));
+        assert!(set.tcp.allows("8.8.8.8".parse().unwrap(), 443));
     }
 
 }
