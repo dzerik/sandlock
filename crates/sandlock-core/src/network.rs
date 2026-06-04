@@ -91,6 +91,183 @@ impl IpCidr {
     }
 }
 
+/// What a deny rule targets at the IP layer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DenyTarget {
+    /// Any destination IP (the `:port` / `*:port` form).
+    AnyIp,
+    /// A specific IP or CIDR range.
+    Cidr(IpCidr),
+}
+
+/// A single `--net-deny` rule. Unlike `NetAllow`, the target is always
+/// a literal IP/CIDR (or any-IP) resolved at parse time, never a
+/// hostname, so no DNS is involved and matching is rebinding-safe.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NetDeny {
+    pub protocol: Protocol,
+    pub target: DenyTarget,
+    pub ports: Vec<u16>,
+    /// "Any port" (bare target with no `:port`, or the `*` port token).
+    pub all_ports: bool,
+}
+
+/// Curated internal/private ranges expanded by the `private` token.
+/// Covers loopback, RFC1918, link-local (incl. the cloud metadata
+/// endpoint 169.254.169.254), IPv6 loopback, ULA, and IPv6 link-local.
+pub const PRIVATE_CIDRS: &[&str] = &[
+    "127.0.0.0/8",
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "169.254.0.0/16",
+    "::1/128",
+    "fc00::/7",
+    "fe80::/10",
+];
+
+impl NetDeny {
+    /// Parse a `--net-deny` spec into one or more rules. Returns a `Vec`
+    /// because the `private` token expands to many rules. Forms:
+    ///
+    /// - `private` -- the curated internal-range set, all protocols.
+    /// - `<ip>` / `<cidr>` -- all ports (TCP default scheme).
+    /// - `<ip>:<port[,port,...]>` / `<cidr>:<port>` / `<cidr>:*`.
+    /// - `[<ipv6|ipv6cidr>]:<port>` -- bracketed IPv6 with a port.
+    /// - `:<port>` / `*:<port>` -- any IP, that port.
+    /// - `tcp://...` / `udp://...` / `icmp://...` schemes (icmp: no port).
+    ///
+    /// Hostnames are rejected (use `--http-deny` for domain blocking).
+    pub fn parse(spec: &str) -> Result<Vec<NetDeny>, SandboxError> {
+        if spec == "private" {
+            let mut out = Vec::new();
+            for proto in [Protocol::Tcp, Protocol::Udp, Protocol::Icmp] {
+                for c in PRIVATE_CIDRS {
+                    out.push(NetDeny {
+                        protocol: proto,
+                        target: DenyTarget::Cidr(IpCidr::parse(c)?),
+                        ports: Vec::new(),
+                        all_ports: true,
+                    });
+                }
+            }
+            return Ok(out);
+        }
+
+        let (protocol, rest) = match spec.split_once("://") {
+            Some((scheme, body)) => {
+                let proto = Protocol::parse(scheme).ok_or_else(|| {
+                    SandboxError::Invalid(format!(
+                        "--net-deny: unknown scheme `{}://` in `{}` (expected tcp, udp, icmp)",
+                        scheme, spec
+                    ))
+                })?;
+                (proto, body)
+            }
+            None => (Protocol::Tcp, spec),
+        };
+
+        // ICMP carries no port: the whole body is the target.
+        if protocol == Protocol::Icmp {
+            return Ok(vec![NetDeny {
+                protocol,
+                target: parse_deny_target(rest, spec)?,
+                ports: Vec::new(),
+                all_ports: true,
+            }]);
+        }
+
+        // 1. Bracketed IPv6 with a port: `[addr]:ports`.
+        if let Some(stripped) = rest.strip_prefix('[') {
+            let (inside, port_part) = stripped.rsplit_once("]:").ok_or_else(|| {
+                SandboxError::Invalid(format!(
+                    "--net-deny: malformed bracketed address in `{}`",
+                    spec
+                ))
+            })?;
+            let (ports, all_ports) = parse_deny_ports(port_part, spec)?;
+            return Ok(vec![NetDeny {
+                protocol,
+                target: DenyTarget::Cidr(IpCidr::parse(inside)?),
+                ports,
+                all_ports,
+            }]);
+        }
+
+        // 2. Whole body is an IP/CIDR with no port -> all ports. This
+        //    is what makes bare `10.0.0.0/8` and IPv6 `fc00::/7` work.
+        if let Ok(cidr) = IpCidr::parse(rest) {
+            return Ok(vec![NetDeny {
+                protocol,
+                target: DenyTarget::Cidr(cidr),
+                ports: Vec::new(),
+                all_ports: true,
+            }]);
+        }
+
+        // 3. `target:ports` where target is an IPv4/CIDR, `*`, or empty.
+        let (host_part, port_part) = rest.rsplit_once(':').ok_or_else(|| {
+            SandboxError::Invalid(format!(
+                "--net-deny: expected an IP, CIDR, or `:port` in `{}`",
+                spec
+            ))
+        })?;
+        let target = parse_deny_target(host_part, spec)?;
+        let (ports, all_ports) = parse_deny_ports(port_part, spec)?;
+        Ok(vec![NetDeny {
+            protocol,
+            target,
+            ports,
+            all_ports,
+        }])
+    }
+}
+
+/// Parse a deny target: `*` / empty -> any IP, otherwise an IP/CIDR.
+/// Hostnames fail here via `IpCidr::parse`.
+fn parse_deny_target(s: &str, _full: &str) -> Result<DenyTarget, SandboxError> {
+    match s {
+        "" | "*" => Ok(DenyTarget::AnyIp),
+        _ => Ok(DenyTarget::Cidr(IpCidr::parse(s)?)),
+    }
+}
+
+/// Parse the port suffix of a deny spec. `*` means all ports.
+fn parse_deny_ports(s: &str, full: &str) -> Result<(Vec<u16>, bool), SandboxError> {
+    let mut ports = Vec::new();
+    let mut saw_wildcard = false;
+    for p in s.split(',') {
+        let p = p.trim();
+        if p == "*" {
+            saw_wildcard = true;
+            continue;
+        }
+        let n: u16 = p.parse().map_err(|_| {
+            SandboxError::Invalid(format!("--net-deny: invalid port `{}` in `{}`", p, full))
+        })?;
+        if n == 0 {
+            return Err(SandboxError::Invalid(format!(
+                "--net-deny: port 0 is not valid in `{}`",
+                full
+            )));
+        }
+        ports.push(n);
+    }
+    if saw_wildcard && !ports.is_empty() {
+        return Err(SandboxError::Invalid(format!(
+            "--net-deny: cannot mix `*` with concrete ports in `{}`",
+            full
+        )));
+    }
+    if !saw_wildcard && ports.is_empty() {
+        return Err(SandboxError::Invalid(format!(
+            "--net-deny: at least one port required in `{}`",
+            full
+        )));
+    }
+    Ok((ports, saw_wildcard))
+}
+
 /// L4 protocol that a `NetAllow` rule applies to.
 ///
 /// `Tcp` is the default if a rule has no scheme (the bare `host:port`
@@ -1772,5 +1949,77 @@ mod tests {
     fn ipcidr_rejects_oversized_prefix() {
         assert!(IpCidr::parse("10.0.0.0/33").is_err());
         assert!(IpCidr::parse("fc00::/129").is_err());
+    }
+
+    // --- NetDeny::parse tests ---
+
+    #[test]
+    fn netdeny_bare_cidr_is_all_ports_tcp() {
+        let rules = NetDeny::parse("10.0.0.0/8").unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].protocol, Protocol::Tcp);
+        assert!(matches!(rules[0].target, DenyTarget::Cidr(_)));
+        assert!(rules[0].all_ports);
+    }
+
+    #[test]
+    fn netdeny_bare_ip_is_host_route_all_ports() {
+        let rules = NetDeny::parse("169.254.169.254").unwrap();
+        assert_eq!(rules.len(), 1);
+        match &rules[0].target {
+            DenyTarget::Cidr(c) => assert_eq!(c.prefix_len, 32),
+            _ => panic!("expected cidr"),
+        }
+        assert!(rules[0].all_ports);
+    }
+
+    #[test]
+    fn netdeny_cidr_with_port() {
+        let rules = NetDeny::parse("10.0.0.0/8:443").unwrap();
+        assert_eq!(rules[0].ports, vec![443]);
+        assert!(!rules[0].all_ports);
+    }
+
+    #[test]
+    fn netdeny_any_ip_port() {
+        let rules = NetDeny::parse(":25").unwrap();
+        assert!(matches!(rules[0].target, DenyTarget::AnyIp));
+        assert_eq!(rules[0].ports, vec![25]);
+    }
+
+    #[test]
+    fn netdeny_udp_scheme() {
+        let rules = NetDeny::parse("udp://192.168.0.0/16:53").unwrap();
+        assert_eq!(rules[0].protocol, Protocol::Udp);
+        assert_eq!(rules[0].ports, vec![53]);
+    }
+
+    #[test]
+    fn netdeny_ipv6_bracket_port() {
+        let rules = NetDeny::parse("[::1]:443").unwrap();
+        assert_eq!(rules[0].ports, vec![443]);
+        match &rules[0].target {
+            DenyTarget::Cidr(c) => assert_eq!(c.prefix_len, 128),
+            _ => panic!("expected cidr"),
+        }
+    }
+
+    #[test]
+    fn netdeny_rejects_hostname() {
+        assert!(NetDeny::parse("evil.com:443").is_err());
+        assert!(NetDeny::parse("evil.com").is_err());
+    }
+
+    #[test]
+    fn netdeny_private_token_expands_v4_and_v6() {
+        let rules = NetDeny::parse("private").unwrap();
+        // Each curated CIDR is emitted once per protocol (tcp, udp, icmp).
+        assert_eq!(rules.len(), PRIVATE_CIDRS.len() * 3);
+        // Metadata endpoint is covered.
+        let meta: IpAddr = "169.254.169.254".parse().unwrap();
+        assert!(rules.iter().any(|r| matches!(&r.target, DenyTarget::Cidr(c) if c.contains(meta))));
+        // IPv6 ULA is covered.
+        let ula: IpAddr = "fd00::1".parse().unwrap();
+        assert!(rules.iter().any(|r| matches!(&r.target, DenyTarget::Cidr(c) if c.contains(ula))));
     }
 }
