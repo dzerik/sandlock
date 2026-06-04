@@ -133,7 +133,9 @@ impl NetDeny {
     /// - `private` -- the curated internal-range set, all protocols.
     /// - `<ip>` / `<cidr>` -- all ports (TCP default scheme).
     /// - `<ip>:<port[,port,...]>` / `<cidr>:<port>` / `<cidr>:*`.
-    /// - `[<ipv6|ipv6cidr>]:<port>` -- bracketed IPv6 with a port.
+    /// - `[<ipv6|ipv6cidr>]:<port>` -- bracketed IPv6 with a port (IPv6
+    ///   combined with a port MUST use this bracket form because a bare
+    ///   `addr:port` string is itself a valid IPv6 address).
     /// - `:<port>` / `*:<port>` -- any IP, that port.
     /// - `tcp://...` / `udp://...` / `icmp://...` schemes (icmp: no port).
     ///
@@ -169,9 +171,15 @@ impl NetDeny {
 
         // ICMP carries no port: the whole body is the target.
         if protocol == Protocol::Icmp {
+            if rest.is_empty() {
+                return Err(SandboxError::Invalid(format!(
+                    "--net-deny: icmp rule needs an IP/CIDR or `*`, got `{}`",
+                    spec
+                )));
+            }
             return Ok(vec![NetDeny {
                 protocol,
-                target: parse_deny_target(rest, spec)?,
+                target: parse_deny_target(rest)?,
                 ports: Vec::new(),
                 all_ports: true,
             }]);
@@ -212,7 +220,7 @@ impl NetDeny {
                 spec
             ))
         })?;
-        let target = parse_deny_target(host_part, spec)?;
+        let target = parse_deny_target(host_part)?;
         let (ports, all_ports) = parse_deny_ports(port_part, spec)?;
         Ok(vec![NetDeny {
             protocol,
@@ -225,7 +233,7 @@ impl NetDeny {
 
 /// Parse a deny target: `*` / empty -> any IP, otherwise an IP/CIDR.
 /// Hostnames fail here via `IpCidr::parse`.
-fn parse_deny_target(s: &str, _full: &str) -> Result<DenyTarget, SandboxError> {
+fn parse_deny_target(s: &str) -> Result<DenyTarget, SandboxError> {
     match s {
         "" | "*" => Ok(DenyTarget::AnyIp),
         _ => Ok(DenyTarget::Cidr(IpCidr::parse(s)?)),
@@ -2021,5 +2029,30 @@ mod tests {
         // IPv6 ULA is covered.
         let ula: IpAddr = "fd00::1".parse().unwrap();
         assert!(rules.iter().any(|r| matches!(&r.target, DenyTarget::Cidr(c) if c.contains(ula))));
+    }
+
+    #[test]
+    fn netdeny_bare_ipv6_address_all_ports() {
+        let rules = NetDeny::parse("::1").unwrap();
+        assert_eq!(rules.len(), 1);
+        assert!(rules[0].all_ports);
+        match &rules[0].target {
+            DenyTarget::Cidr(c) => assert_eq!(c.prefix_len, 128),
+            _ => panic!("expected cidr"),
+        }
+    }
+
+    #[test]
+    fn netdeny_bare_ipv6_cidr_all_ports() {
+        let rules = NetDeny::parse("fc00::/7").unwrap();
+        assert_eq!(rules.len(), 1);
+        assert!(rules[0].all_ports);
+        let ula: std::net::IpAddr = "fd00::1".parse().unwrap();
+        assert!(matches!(&rules[0].target, DenyTarget::Cidr(c) if c.contains(ula)));
+    }
+
+    #[test]
+    fn netdeny_empty_icmp_body_is_rejected() {
+        assert!(NetDeny::parse("icmp://").is_err());
     }
 }
