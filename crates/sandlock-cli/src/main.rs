@@ -419,6 +419,7 @@ async fn run_command(args: RunArgs) -> Result<i32> {
     for p in &pb.fs_writable { builder = builder.fs_write(p); }
     if let Some(n) = pb.max_processes { builder = builder.max_processes(n); }
     for spec in &pb.net_allow { builder = builder.net_allow(spec); }
+    for spec in &pb.net_deny { builder = builder.net_deny(spec); }
     for p in &pb.net_bind { builder = builder.net_bind_port(*p); }
     if let Some(seed) = pb.random_seed { builder = builder.random_seed(seed); }
     if pb.clean_env { builder = builder.clean_env(true); }
