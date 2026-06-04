@@ -1385,6 +1385,65 @@ pub async fn resolve_net_allow(
     })
 }
 
+/// Per-protocol resolved deny policies, ready for `NetworkState`.
+pub struct ResolvedNetDenySet {
+    pub tcp: crate::seccomp::notif::NetworkPolicy,
+    pub udp: crate::seccomp::notif::NetworkPolicy,
+    pub icmp: crate::seccomp::notif::NetworkPolicy,
+}
+
+/// Resolve `--net-deny` rules into per-protocol `DenyList` policies.
+/// A protocol with no deny rules stays `Unrestricted` (allow-all).
+pub fn resolve_net_deny(rules: &[NetDeny]) -> ResolvedNetDenySet {
+    use crate::seccomp::notif::{NetworkPolicy, PortAllow};
+
+    let per_proto = |target: Protocol| -> NetworkPolicy {
+        let mut cidrs: Vec<(IpCidr, PortAllow)> = Vec::new();
+        let mut any_ip_ports: HashSet<u16> = HashSet::new();
+        let mut deny_all = false;
+        let mut saw_rule = false;
+
+        for rule in rules.iter().filter(|r| r.protocol == target) {
+            saw_rule = true;
+            match &rule.target {
+                DenyTarget::AnyIp => {
+                    if rule.all_ports || target == Protocol::Icmp {
+                        deny_all = true;
+                    } else {
+                        for &p in &rule.ports {
+                            any_ip_ports.insert(p);
+                        }
+                    }
+                }
+                DenyTarget::Cidr(c) => {
+                    let pa = if rule.all_ports || target == Protocol::Icmp {
+                        PortAllow::Any
+                    } else {
+                        PortAllow::Specific(rule.ports.iter().copied().collect())
+                    };
+                    cidrs.push((*c, pa));
+                }
+            }
+        }
+
+        if !saw_rule {
+            NetworkPolicy::Unrestricted
+        } else {
+            NetworkPolicy::DenyList {
+                cidrs,
+                any_ip_ports,
+                deny_all,
+            }
+        }
+    };
+
+    ResolvedNetDenySet {
+        tcp: per_proto(Protocol::Tcp),
+        udp: per_proto(Protocol::Udp),
+        icmp: per_proto(Protocol::Icmp),
+    }
+}
+
 /// Compose the synthetic `/etc/hosts` served to the sandbox.
 ///
 /// - **No chroot**: emit the fixed loopback base
@@ -2054,5 +2113,33 @@ mod tests {
     #[test]
     fn netdeny_empty_icmp_body_is_rejected() {
         assert!(NetDeny::parse("icmp://").is_err());
+    }
+
+    // --- resolve_net_deny tests ---
+
+    #[test]
+    fn resolve_net_deny_groups_per_protocol() {
+        let rules = NetDeny::parse("10.0.0.0/8").unwrap();
+        let set = resolve_net_deny(&rules);
+        // TCP policy denies 10.x, UDP/ICMP unaffected (still allow-all).
+        assert!(!set.tcp.allows("10.0.0.1".parse().unwrap(), 443));
+        assert!(set.udp.allows("10.0.0.1".parse().unwrap(), 443));
+    }
+
+    #[test]
+    fn resolve_net_deny_private_covers_metadata_all_protocols() {
+        let rules = NetDeny::parse("private").unwrap();
+        let set = resolve_net_deny(&rules);
+        let meta: std::net::IpAddr = "169.254.169.254".parse().unwrap();
+        assert!(!set.tcp.allows(meta, 80));
+        assert!(!set.udp.allows(meta, 80));
+    }
+
+    #[test]
+    fn resolve_net_deny_any_ip_port() {
+        let rules = NetDeny::parse(":25").unwrap();
+        let set = resolve_net_deny(&rules);
+        assert!(!set.tcp.allows("8.8.8.8".parse().unwrap(), 25));
+        assert!(set.tcp.allows("8.8.8.8".parse().unwrap(), 80));
     }
 }
