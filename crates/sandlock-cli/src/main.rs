@@ -667,6 +667,7 @@ fn validate_no_supervisor(args: &RunArgs) -> Result<()> {
     if pb.max_open_files.is_some() { bad.push("--max-open-files"); }
     if args.timeout.is_some() { bad.push("--timeout"); }
     if !pb.net_allow.is_empty() { bad.push("--net-allow"); }
+    if !pb.net_deny.is_empty() { bad.push("--net-deny"); }
     if !pb.net_bind.is_empty() { bad.push("--net-bind"); }
     if !pb.http_allow.is_empty() { bad.push("--http-allow"); }
     if !pb.http_deny.is_empty() { bad.push("--http-deny"); }
@@ -725,6 +726,7 @@ fn validate_no_supervisor_profile(profile: &Sandbox, source: &str) -> Result<()>
 
     if !profile.fs_denied.is_empty() { bad.push("[filesystem].deny"); }
     if !profile.net_allow.is_empty() { bad.push("[network].allow"); }
+    if !profile.net_deny.is_empty() { bad.push("[network].deny"); }
     if !profile.net_bind.is_empty() { bad.push("[network].bind"); }
     if profile.port_remap { bad.push("[network].port_remap"); }
     if !profile.http_allow.is_empty() { bad.push("[http].allow"); }
