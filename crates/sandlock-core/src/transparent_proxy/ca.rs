@@ -1,3 +1,7 @@
+// Resolves the root CA material used for HTTPS MITM termination. The per-SNI
+// leaf certs minted under this CA live in `tls.rs`; this module only obtains
+// the root (generated ephemerally or loaded from a bring-your-own pair).
+
 use std::path::Path;
 
 use rcgen::{CertificateParams, KeyPair};
@@ -22,9 +26,9 @@ fn dummy_ca() -> std::io::Result<(KeyPair, rcgen::Certificate)> {
 }
 
 /// In-memory CA material (public cert + private key, PEM-encoded).
-pub struct CaMaterial {
-    pub cert_pem: String,
-    pub key_pem: String,
+pub(crate) struct CaMaterial {
+    pub(crate) cert_pem: String,
+    pub(crate) key_pem: String,
 }
 
 /// Resolve the CA used for HTTPS MITM.
@@ -34,7 +38,7 @@ pub struct CaMaterial {
 ///   The private key never touches disk.
 /// - Otherwise: `None` (HTTP-only; the proxy serves plaintext and does not
 ///   intercept TLS).
-pub fn resolve_ca(
+pub(crate) fn resolve_ca(
     ca_cert: Option<&Path>,
     ca_key: Option<&Path>,
     generate: bool,

@@ -1199,7 +1199,7 @@ impl Sandbox {
         if !self.http_allow.is_empty() || !self.http_deny.is_empty() {
             // Generate an ephemeral CA when injection is requested without BYO.
             let generate = !self.http_inject_ca.is_empty();
-            let ca_material = crate::http_acl::resolve_ca(
+            let ca_material = crate::transparent_proxy::resolve_ca(
                 self.http_ca.as_deref(),
                 self.http_key.as_deref(),
                 generate,

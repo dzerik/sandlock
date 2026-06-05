@@ -1,3 +1,4 @@
+mod ca;
 mod service;
 mod tls;
 mod upstream;
@@ -17,6 +18,7 @@ use self::service::AclService;
 use self::tls::CertSigner;
 use self::upstream::Forwarder;
 
+pub(crate) use self::ca::resolve_ca;
 pub(crate) use self::service::OrigDestMap;
 
 /// Handle returned by [`spawn_transparent_proxy`]. Dropping it shuts the proxy down.
@@ -175,7 +177,7 @@ mod tests {
         use tokio_rustls::TlsConnector;
 
         // Ephemeral CA, plus an allow rule that will NOT match our request.
-        let ca = crate::http_acl::resolve_ca(None, None, true)
+        let ca = resolve_ca(None, None, true)
             .expect("resolve_ca ok")
             .expect("ephemeral CA generated");
         let allow = vec![crate::http::HttpRule::parse("GET allowed.test/*").expect("rule parses")];

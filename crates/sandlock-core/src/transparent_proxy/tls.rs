@@ -76,7 +76,7 @@ mod tests {
     fn test_ca() -> (String, String) {
         // rustls 0.22 ServerConfig::builder() uses crypto::ring::default_provider()
         // directly (no process-wide install needed, unlike rustls 0.23).
-        let m = crate::http_acl::resolve_ca(None, None, true).unwrap().unwrap();
+        let m = crate::transparent_proxy::resolve_ca(None, None, true).unwrap().unwrap();
         (m.cert_pem, m.key_pem)
     }
 
