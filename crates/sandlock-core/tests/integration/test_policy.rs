@@ -47,7 +47,10 @@ fn test_net_allow_parse_grammar() {
     assert!(NetAllow::parse("foo.com:22,443").is_ok());
     assert!(NetAllow::parse(":8080").is_ok());
     assert!(NetAllow::parse("*:8080").is_ok());
-    assert!(NetAllow::parse("foo.com").is_err()); // missing port
+    assert!(NetAllow::parse("foo.com").is_ok()); // no port -> all ports
+    assert!(NetAllow::parse("foo.com").unwrap().all_ports);
+    assert!(NetAllow::parse("*").is_ok()); // any host, all ports
+    assert!(NetAllow::parse("").is_err()); // empty rule
     assert!(NetAllow::parse("foo.com:abc").is_err()); // bad port
     assert!(NetAllow::parse("foo.com:0").is_err()); // port 0 reserved
     assert!(NetAllow::parse("foo.com:").is_err()); // empty port list

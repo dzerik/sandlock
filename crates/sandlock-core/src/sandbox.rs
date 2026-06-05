@@ -1818,10 +1818,12 @@ pub struct SandboxBuilder {
     pub net_allow: Vec<String>,
 
     /// `--net-deny`: default-allow networking, block these IPs/CIDRs/ports.
-    /// Accepts `<ip>`, `<cidr>`, `<cidr>:<port>`, `:<port>`, `[<ipv6>]:<port>`,
-    /// and the `private` token (all internal ranges). Hostnames are rejected;
-    /// use `--http-deny` for domains. Mutually exclusive with `--net-allow`.
-    #[cfg_attr(feature = "cli", arg(long = "net-deny", value_name = "SPEC", value_delimiter = ','))]
+    /// Accepts `<ip>`, `<cidr>`, `<cidr>:<port[,port]>`, `:<port>`, `*`,
+    /// `[<ipv6>]:<port>`, and the `private` token (all internal ranges).
+    /// The port is optional (no `:port` means all ports). Hostnames are
+    /// rejected; use `--http-deny` for domains. Repeat the flag for multiple
+    /// rules. Mutually exclusive with `--net-allow`.
+    #[cfg_attr(feature = "cli", arg(long = "net-deny", value_name = "SPEC"))]
     pub net_deny: Vec<String>,
 
     #[cfg_attr(feature = "cli", arg(long = "net-bind"))]

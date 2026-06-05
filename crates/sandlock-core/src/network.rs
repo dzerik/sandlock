@@ -131,7 +131,8 @@ impl NetDeny {
     /// because the `private` token expands to many rules. Forms:
     ///
     /// - `private` -- the curated internal-range set, all protocols.
-    /// - `<ip>` / `<cidr>` -- all ports (TCP default scheme).
+    /// - `<ip>` / `<cidr>` / `*` -- all ports (the port is optional; `*`
+    ///   targets any IP). TCP is the default scheme.
     /// - `<ip>:<port[,port,...]>` / `<cidr>:<port>` / `<cidr>:*`.
     /// - `[<ipv6|ipv6cidr>]:<port>` -- bracketed IPv6 with a port (IPv6
     ///   combined with a port MUST use this bracket form because a bare
@@ -202,6 +203,15 @@ impl NetDeny {
             }]);
         }
 
+        // An empty body must not silently mean "deny everything"; require
+        // an explicit `*` for the any-IP target.
+        if rest.is_empty() {
+            return Err(SandboxError::Invalid(format!(
+                "--net-deny: empty rule in `{}` (use `*` for any IP)",
+                spec
+            )));
+        }
+
         // 2. Whole body is an IP/CIDR with no port -> all ports. This
         //    is what makes bare `10.0.0.0/8` and IPv6 `fc00::/7` work.
         if let Ok(cidr) = IpCidr::parse(rest) {
@@ -213,15 +223,18 @@ impl NetDeny {
             }]);
         }
 
-        // 3. `target:ports` where target is an IPv4/CIDR, `*`, or empty.
-        let (host_part, port_part) = rest.rsplit_once(':').ok_or_else(|| {
-            SandboxError::Invalid(format!(
-                "--net-deny: expected an IP, CIDR, or `:port` in `{}`",
-                spec
-            ))
-        })?;
+        // 3. `target[:ports]` where target is an IPv4/CIDR, `*`, or empty.
+        //    The port suffix is optional: a bare `*` (or any target with no
+        //    `:port`) covers all ports, mirroring the bare IP/CIDR form above.
+        let (host_part, port_part) = match rest.rsplit_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (rest, None),
+        };
         let target = parse_deny_target(host_part)?;
-        let (ports, all_ports) = parse_deny_ports(port_part, spec)?;
+        let (ports, all_ports) = match port_part {
+            Some(p) => parse_deny_ports(p, spec)?,
+            None => (Vec::new(), true),
+        };
         Ok(vec![NetDeny {
             protocol,
             target,
@@ -344,6 +357,8 @@ impl NetAllow {
     ///
     /// - `host:port[,port,...]`, `:port`, `*:port`, `host:*`, `:*`, `*:*`
     ///   — TCP (the default scheme).
+    /// - `host` / `*` — no port suffix means all ports (the port is
+    ///   optional, `*` matches any host); equivalent to `host:*` / `*:*`.
     /// - `tcp://...` — explicit TCP, same suffix grammar as the bare form.
     /// - `udp://...` — UDP, same suffix grammar as the bare form.
     /// - `icmp://host` or `icmp://*` — ICMP echo (kernel ping socket).
@@ -371,15 +386,33 @@ impl NetAllow {
             return Self::parse_icmp(rest, s);
         }
 
-        let (host_part, port_part) = rest.rsplit_once(':').ok_or_else(|| {
-            SandboxError::Invalid(format!(
-                "--net-allow: expected `host:port` or `:port`, got `{}`",
+        if rest.is_empty() {
+            return Err(SandboxError::Invalid(format!(
+                "--net-allow: empty rule in `{}` (use `*` for any host)",
                 s
-            ))
-        })?;
+            )));
+        }
+
+        // The port suffix is optional: a host (or `*`) with no `:port`
+        // covers all ports, mirroring the `host:*` form.
+        let (host_part, port_part) = match rest.rsplit_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (rest, None),
+        };
         let host = match host_part {
             "" | "*" => None,
             h => Some(h.to_string()),
+        };
+        let port_part = match port_part {
+            Some(p) => p,
+            None => {
+                return Ok(NetAllow {
+                    protocol,
+                    host,
+                    ports: Vec::new(),
+                    all_ports: true,
+                });
+            }
         };
 
         // Detect the wildcard token. We split on ',' first so a
@@ -1590,9 +1623,27 @@ mod tests {
     }
 
     #[test]
-    fn netallow_parse_rejects_no_colon() {
-        let err = NetAllow::parse("example.com").unwrap_err();
-        assert!(format!("{}", err).contains("expected"));
+    fn netallow_bare_host_is_all_ports() {
+        // No port suffix means "all ports" (port optional), symmetric
+        // with the `host:*` form.
+        let r = NetAllow::parse("example.com").unwrap();
+        assert_eq!(r.host.as_deref(), Some("example.com"));
+        assert!(r.all_ports);
+        assert!(r.ports.is_empty());
+    }
+
+    #[test]
+    fn netallow_bare_star_is_any_host_all_ports() {
+        let r = NetAllow::parse("*").unwrap();
+        assert_eq!(r.host, None);
+        assert!(r.all_ports);
+        assert!(r.ports.is_empty());
+    }
+
+    #[test]
+    fn netallow_empty_spec_rejected() {
+        assert!(NetAllow::parse("").is_err());
+        assert!(NetAllow::parse("tcp://").is_err());
     }
 
     #[test]
@@ -2113,6 +2164,34 @@ mod tests {
     #[test]
     fn netdeny_empty_icmp_body_is_rejected() {
         assert!(NetDeny::parse("icmp://").is_err());
+    }
+
+    #[test]
+    fn netdeny_bare_star_is_any_ip_all_ports() {
+        // `*` with no port is the any-IP, all-ports form (port optional,
+        // symmetric with a bare IP/CIDR).
+        let rules = NetDeny::parse("*").unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].protocol, Protocol::Tcp);
+        assert!(matches!(rules[0].target, DenyTarget::AnyIp));
+        assert!(rules[0].all_ports);
+        assert!(rules[0].ports.is_empty());
+    }
+
+    #[test]
+    fn netdeny_udp_bare_star_all_ports() {
+        let rules = NetDeny::parse("udp://*").unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].protocol, Protocol::Udp);
+        assert!(matches!(rules[0].target, DenyTarget::AnyIp));
+        assert!(rules[0].all_ports);
+    }
+
+    #[test]
+    fn netdeny_empty_spec_rejected() {
+        // An empty body must not silently mean "deny everything".
+        assert!(NetDeny::parse("").is_err());
+        assert!(NetDeny::parse("udp://").is_err());
     }
 
     // --- resolve_net_deny tests ---

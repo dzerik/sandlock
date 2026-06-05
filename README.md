@@ -110,12 +110,12 @@ sandlock run --net-allow api.openai.com:443 -r /usr -r /lib -r /etc -- python3 a
 sandlock run --net-allow github.com:22,443 --net-allow :8080 \
   -r /usr -r /lib -r /etc -- python3 agent.py
 
-# Wildcard port — `host:*` permits every port to the host
-sandlock run --net-allow github.com:* -r /usr -r /lib -r /etc -- ssh user@github.com
+# Wildcard port (optional): a bare `host` (or `host:*`) permits every port
+sandlock run --net-allow github.com -r /usr -r /lib -r /etc -- ssh user@github.com
 
-# Unrestricted outbound — `:*` opens any host and any TCP port. For full
-# egress add a UDP wildcard via the `udp://*:*` scheme.
-sandlock run --net-allow :* --net-allow udp://*:* \
+# Unrestricted outbound: `*` opens any host and any TCP port (`:*` / `*:*`
+# are equivalent). For full egress add a UDP wildcard, `udp://*`.
+sandlock run --net-allow '*' --net-allow 'udp://*' \
   -r /usr -r /lib -r /etc -- ./client
 
 # UDP — scheme prefix gates the protocol and scopes the destination
@@ -125,6 +125,11 @@ sandlock run --net-allow udp://1.1.1.1:53 --net-allow :443 \
 
 # Ping — kernel ping socket (SOCK_DGRAM) gated by net.ipv4.ping_group_range
 sandlock run --net-allow icmp://github.com -r /usr -r /lib -r /etc -- ping github.com
+
+# Denylist: default-allow networking, block specific IPs/CIDRs/ports
+# (inverse of --net-allow; mutually exclusive with it). Port is optional.
+sandlock run --net-deny 169.254.169.254 --net-deny private \
+  -r /usr -r /lib -r /etc -- python3 agent.py
 
 # HTTP-level ACL (method + host + path rules via transparent proxy)
 # HTTP rules with concrete hosts auto-extend --net-allow with host:80,443
@@ -580,9 +585,10 @@ Outbound traffic is gated by a single endpoint allowlist that names
 
 ```
 --net-allow <spec>          repeatable; no rules = deny all outbound
-  bare form  host:port[,port,...] / :port / *:port / host:* / :* / *:*   (TCP)
+  bare form  host[:port[,port,...]] / :port / *:port / host:* / :* / *:*  (TCP)
+             the port is optional: `host` or `*` alone means all ports
   tcp://     same suffix grammar — explicit TCP
-  udp://     same suffix grammar — UDP (`udp://*:*` opens any UDP)
+  udp://     same suffix grammar — UDP (`udp://*` opens any UDP)
   icmp://    host or `*`, no port — kernel ping socket (SOCK_DGRAM)
 ```
 
@@ -606,20 +612,41 @@ and port (port is N/A for ICMP).
 denies every TCP `connect()`, UDP / ICMP / raw socket creation are
 denied at the seccomp layer, and there is no on-behalf path active.
 For unrestricted TCP egress, opt in explicitly with
-`--net-allow :*`; for any UDP, add `--net-allow udp://*:*`.
+`--net-allow '*'`; for any UDP, add `--net-allow 'udp://*'`.
+
+**Denylist (`--net-deny`).** The inverse model: networking is
+default-allow and the listed targets are blocked. Mutually exclusive
+with `--net-allow`. Targets are literal IPs or CIDRs (hostnames are
+rejected; use `--http-deny` for domains); the port is optional and
+`*` matches any IP. The same scheme grammar applies (`tcp://` default,
+`udp://`, `icmp://`), and the `private` token expands to all internal
+ranges across every protocol.
+
+```
+--net-deny 10.0.0.0/8               # all ports on a CIDR (all protocols)
+--net-deny 169.254.169.254:80      # one IP, one port
+--net-deny 169.254.169.254:80,443  # comma-separated ports in one rule
+--net-deny '*'                     # any IP, all ports (TCP)
+--net-deny 'udp://192.168.0.0/16'  # any UDP to a CIDR
+--net-deny private                 # all internal ranges
+```
+
+Repeat the flag for multiple rules.
 
 **Resolution.** Concrete hostnames are resolved once at sandbox start
 and pinned in a synthetic `/etc/hosts` (across all protocols). The
 synthetic file replaces the real one only when at least one rule has
-a concrete host; pure `:port` / `udp://*:*` / `icmp://*` rules leave
+a concrete host; pure `:port` / `udp://*` / `icmp://*` rules leave
 the real `/etc/hosts` and DNS visible.
 
 **Wildcards.** Hostnames are matched literally — `--net-allow
 *.example.com:443` is **not** supported, list each domain you need.
 The `*` token is allowed as the host (alias for empty: `*:port` ≡
-`:port`) and as the port for TCP/UDP rules (`host:*`, `:*`, `*:*`,
-`udp://*:*`). Mixing `*` with concrete ports (`host:80,*`) is
-rejected. When any TCP rule uses the all-ports wildcard, Landlock no
+`:port`) and as the port for TCP/UDP rules (`host:*`, `:*`, `*:*`).
+The port is optional: omitting it means all ports, so `host` ≡
+`host:*` and `*` ≡ `:*` ≡ `*:*` (and `udp://*` ≡ `udp://*:*`). Mixing
+`*` with concrete ports (`host:80,*`) is rejected. When any TCP rule
+uses the all-ports wildcard, Landlock no
 longer filters TCP connect at the kernel level (it cannot express
 "every port" without enumerating 65535 rules); the on-behalf path
 becomes the sole enforcer, and for `:*` it short-circuits to

@@ -341,21 +341,7 @@ async fn run_command(args: RunArgs) -> Result<i32> {
         for p in &base.fs_writable { b = b.fs_write(p); }
         for p in &base.fs_denied { b = b.fs_deny(p); }
         for rule in &base.net_allow {
-            let host_part = rule.host.as_deref().unwrap_or("*");
-            let spec = match rule.protocol {
-                sandlock_core::sandbox::Protocol::Tcp => {
-                    let ports = format_ports(&rule.ports, rule.all_ports);
-                    format!("tcp://{}:{}", host_part, ports)
-                }
-                sandlock_core::sandbox::Protocol::Udp => {
-                    let ports = format_ports(&rule.ports, rule.all_ports);
-                    format!("udp://{}:{}", host_part, ports)
-                }
-                sandlock_core::sandbox::Protocol::Icmp => {
-                    format!("icmp://{}", host_part)
-                }
-            };
-            b = b.net_allow(spec);
+            b = b.net_allow(format_net_allow(rule));
         }
         for rule in &base.net_deny {
             b = b.net_deny(format_net_deny(rule));
@@ -769,6 +755,27 @@ fn validate_no_supervisor_profile(profile: &Sandbox, source: &str) -> Result<()>
     Ok(())
 }
 
+/// Render a parsed NetAllow rule back into a --net-allow spec string, so a
+/// profile loaded via --profile-file round-trips through the builder. Mirrors
+/// `format_net_deny`: bare TCP, explicit `udp://`/`icmp://`, and the all-ports
+/// case drops the redundant `:*`.
+fn format_net_allow(rule: &sandlock_core::sandbox::NetAllow) -> String {
+    use sandlock_core::sandbox::Protocol;
+    let host = rule.host.as_deref().unwrap_or("*");
+    match rule.protocol {
+        Protocol::Icmp => format!("icmp://{}", host),
+        proto => {
+            let scheme = if matches!(proto, Protocol::Udp) { "udp://" } else { "" };
+            if rule.all_ports {
+                format!("{}{}", scheme, host)
+            } else {
+                let ports = format_ports(&rule.ports);
+                format!("{}{}:{}", scheme, host, ports)
+            }
+        }
+    }
+}
+
 /// Render a parsed NetDeny rule back into a --net-deny spec string, so a
 /// profile loaded via --profile-file round-trips through the builder.
 fn format_net_deny(rule: &sandlock_core::sandbox::NetDeny) -> String {
@@ -793,24 +800,21 @@ fn format_net_deny(rule: &sandlock_core::sandbox::NetDeny) -> String {
             if rule.all_ports {
                 format!("{}{}", scheme, target)
             } else {
-                let ports = format_ports(&rule.ports, false);
+                let ports = format_ports(&rule.ports);
                 format!("{}{}:{}", scheme, target, ports)
             }
         }
     }
 }
 
-/// Parse an ISO 8601 timestamp (e.g. "2000-01-01T00:00:00Z") into a SystemTime.
-/// Render a port list back into the `--net-allow` port-suffix form:
-/// concrete ports become `80,443`; the all-ports wildcard becomes `*`.
-fn format_ports(ports: &[u16], all_ports: bool) -> String {
-    if all_ports {
-        "*".to_string()
-    } else {
-        ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",")
-    }
+/// Render a concrete port list into the comma-separated port-suffix form
+/// (`80,443`). The all-ports case is handled by the callers, which drop the
+/// suffix entirely rather than emitting `:*`.
+fn format_ports(ports: &[u16]) -> String {
+    ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",")
 }
 
+/// Parse an ISO 8601 timestamp (e.g. "2000-01-01T00:00:00Z") into a SystemTime.
 fn parse_time_start(s: &str) -> Result<SystemTime> {
     let ts: jiff::Timestamp = s.parse()
         .map_err(|e| anyhow!("invalid --time-start '{}': {}", s, e))?;
@@ -823,5 +827,42 @@ fn parse_branch_action(flag: &str, s: &str) -> Result<BranchAction> {
         "abort"  => Ok(BranchAction::Abort),
         "keep"   => Ok(BranchAction::Keep),
         other    => Err(anyhow!("invalid {} value '{}': expected commit | abort | keep", flag, other)),
+    }
+}
+
+#[cfg(test)]
+mod render_tests {
+    use super::*;
+    use sandlock_core::sandbox::NetAllow;
+
+    #[test]
+    fn render_allow_drops_redundant_all_ports_star() {
+        let r = NetAllow::parse("udp://*:*").unwrap();
+        assert_eq!(format_net_allow(&r), "udp://*");
+    }
+
+    #[test]
+    fn render_allow_any_ip_all_ports_tcp_is_bare_star() {
+        let r = NetAllow::parse(":*").unwrap();
+        assert_eq!(format_net_allow(&r), "*");
+    }
+
+    #[test]
+    fn render_allow_host_ports() {
+        let r = NetAllow::parse("example.com:443").unwrap();
+        assert_eq!(format_net_allow(&r), "example.com:443");
+    }
+
+    #[test]
+    fn render_allow_roundtrips_through_parse() {
+        for spec in ["example.com:443", "udp://1.1.1.1:53", "icmp://github.com", "*", "udp://*"] {
+            let r = NetAllow::parse(spec).unwrap();
+            let rendered = format_net_allow(&r);
+            let r2 = NetAllow::parse(&rendered).unwrap();
+            assert_eq!(r.host, r2.host, "host mismatch for {spec}");
+            assert_eq!(r.ports, r2.ports, "ports mismatch for {spec}");
+            assert_eq!(r.all_ports, r2.all_ports, "all_ports mismatch for {spec}");
+            assert_eq!(r.protocol, r2.protocol, "protocol mismatch for {spec}");
+        }
     }
 }
