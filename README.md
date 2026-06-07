@@ -113,6 +113,11 @@ sandlock run --net-allow github.com:22,443 --net-allow :8080 \
 # Wildcard port (optional): a bare `host` (or `host:*`) permits every port
 sandlock run --net-allow github.com -r /usr -r /lib -r /etc -- ssh user@github.com
 
+# IP, CIDR range, or IPv6 literal as the target (matched by containment,
+# no DNS); same grammar as --net-deny
+sandlock run --net-allow 10.0.0.0/8:443 --net-allow '[2606:4700::/32]:443' \
+  -r /usr -r /lib -r /etc -- python3 agent.py
+
 # Unrestricted outbound: `*` opens any host and any TCP port (`:*` / `*:*`
 # are equivalent). For full egress add a UDP wildcard, `udp://*`.
 sandlock run --net-allow '*' --net-allow 'udp://*' \
@@ -580,17 +585,24 @@ Landlock + seccomp confinement. `CLONE_ID=0..N-1` is set automatically.
 
 ### Network Model
 
-Outbound traffic is gated by a single endpoint allowlist that names
-**protocol × destination**. Each `--net-allow` rule is one of:
+Outbound traffic is gated by an endpoint list naming
+**protocol × destination**. `--net-allow` (allowlist) and `--net-deny`
+(denylist) share one grammar and are mutually exclusive:
 
 ```
---net-allow <spec>          repeatable; no rules = deny all outbound
-  bare form  host[:port[,port,...]] / :port / *:port / host:* / :* / *:*  (TCP)
-             the port is optional: `host` or `*` alone means all ports
-  tcp://     same suffix grammar — explicit TCP
-  udp://     same suffix grammar — UDP (`udp://*` opens any UDP)
-  icmp://    host or `*`, no port — kernel ping socket (SOCK_DGRAM)
+<spec>     repeatable; the port is optional (a bare target = all ports)
+  target   host | <ip> | <cidr> | *           (`*` or empty target = any IP)
+  forms    target[:port[,port,...]] · :port · host:* · :* · *:*
+           [<ipv6|cidr>]:port                  (bracket IPv6 when a port follows)
+  scheme   tcp:// (default) · udp:// (`udp://*` = any UDP) · icmp:// (no port)
+
+  --net-allow  target may also be a hostname, resolved via DNS at start
+  --net-deny   target must be a literal IP/CIDR (no hostnames; use --http-deny)
 ```
+
+A comma groups ports within one spec (`host:80,443`); to pass multiple
+rules, repeat the flag. IP and CIDR targets are matched by containment
+with no DNS (an IP literal is a `/32` or `/128`); only hostnames resolve.
 
 Multiple rules are OR'd. A destination is permitted iff some rule
 matches the **same protocol** as the socket plus the destination IP
@@ -614,12 +626,11 @@ denied at the seccomp layer, and there is no on-behalf path active.
 For unrestricted TCP egress, opt in explicitly with
 `--net-allow '*'`; for any UDP, add `--net-allow 'udp://*'`.
 
-**Denylist (`--net-deny`).** The inverse model: networking is
-default-allow and the listed targets are blocked. Mutually exclusive
-with `--net-allow`. Targets are literal IPs or CIDRs (hostnames are
-rejected; use `--http-deny` for domains); the port is optional and
-`*` matches any IP. The same scheme grammar applies (`tcp://` default,
-`udp://`, `icmp://`).
+**Denylist (`--net-deny`).** The inverse of the allowlist: networking is
+default-allow and the listed targets are blocked. It uses the same
+grammar as `--net-allow` above, the only difference being that targets
+must be literal IPs/CIDRs (hostnames are rejected; use `--http-deny` for
+domains). Examples:
 
 ```
 --net-deny 10.0.0.0/8               # all ports on a CIDR (all protocols)
@@ -629,18 +640,19 @@ rejected; use `--http-deny` for domains); the port is optional and
 --net-deny 'udp://192.168.0.0/16'  # any UDP to a CIDR
 ```
 
-Repeat the flag for multiple rules.
-
-**Resolution.** Concrete hostnames are resolved once at sandbox start
-and pinned in a synthetic `/etc/hosts` (across all protocols). The
-synthetic file replaces the real one only when at least one rule has
-a concrete host; pure `:port` / `udp://*` / `icmp://*` rules leave
-the real `/etc/hosts` and DNS visible.
+**Resolution.** Only hostname targets touch DNS: they are resolved once
+at sandbox start and pinned in a synthetic `/etc/hosts` (across all
+protocols). IP and CIDR targets are matched by containment directly, so
+they never resolve and never appear in `/etc/hosts`. The synthetic file
+replaces the real one only when at least one rule has a concrete
+hostname; rules made purely of IPs/CIDRs, `:port`, `udp://*`, or
+`icmp://*` leave the real `/etc/hosts` and DNS visible.
 
 **Wildcards.** Hostnames are matched literally — `--net-allow
-*.example.com:443` is **not** supported, list each domain you need.
-The `*` token is allowed as the host (alias for empty: `*:port` ≡
-`:port`) and as the port for TCP/UDP rules (`host:*`, `:*`, `*:*`).
+*.example.com:443` is **not** supported, list each domain you need (or
+use a CIDR/IP target for an address range). The `*` token is allowed as
+the target (alias for empty: `*:port` ≡ `:port`) and as the port for
+TCP/UDP rules (`host:*`, `:*`, `*:*`).
 The port is optional: omitting it means all ports, so `host` ≡
 `host:*` and `*` ≡ `:*` ≡ `*:*` (and `udp://*` ≡ `udp://*:*`). Mixing
 `*` with concrete ports (`host:80,*`) is rejected. When any TCP rule
@@ -652,12 +664,15 @@ allow-all.
 
 **Implementation.** Two enforcement paths:
 
-  * **Direct path** — pure `:port` TCP policies (no concrete host)
-    and no HTTP ACL. Landlock enforces the TCP port allowlist at the
-    kernel level; no per-syscall overhead. UDP and ICMP are not
-    covered by Landlock and always use the on-behalf path when allowed.
-  * **On-behalf path** — any concrete host, any HTTP ACL rule, or any
-    UDP / ICMP rule. Seccomp traps `connect()`, `sendto()`, `sendmsg()`,
+  * **Direct path** — pure `:port` TCP policies (any IP, no concrete
+    host/IP/CIDR) and no HTTP ACL. Landlock enforces the TCP port
+    allowlist at the kernel level; no per-syscall overhead. UDP and ICMP
+    are not covered by Landlock and always use the on-behalf path when
+    allowed.
+  * **On-behalf path** — any host, IP, or CIDR target, any HTTP ACL
+    rule, or any UDP / ICMP rule (the destination IP must be checked,
+    which Landlock cannot do). Seccomp traps `connect()`, `sendto()`,
+    `sendmsg()`,
     and `sendmmsg()`; the supervisor dups the child fd, queries
     `getsockopt(SOL_SOCKET, SO_PROTOCOL)` to learn whether the socket
     is TCP / UDP / ICMP, then checks the destination against that
