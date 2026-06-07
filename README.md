@@ -128,7 +128,7 @@ sandlock run --net-allow icmp://github.com -r /usr -r /lib -r /etc -- ping githu
 
 # Denylist: default-allow networking, block specific IPs/CIDRs/ports
 # (inverse of --net-allow; mutually exclusive with it). Port is optional.
-sandlock run --net-deny 169.254.169.254 --net-deny private \
+sandlock run --net-deny 169.254.169.254 --net-deny 10.0.0.0/8 \
   -r /usr -r /lib -r /etc -- python3 agent.py
 
 # HTTP-level ACL (method + host + path rules via transparent proxy)
@@ -619,8 +619,7 @@ default-allow and the listed targets are blocked. Mutually exclusive
 with `--net-allow`. Targets are literal IPs or CIDRs (hostnames are
 rejected; use `--http-deny` for domains); the port is optional and
 `*` matches any IP. The same scheme grammar applies (`tcp://` default,
-`udp://`, `icmp://`), and the `private` token expands to all internal
-ranges across every protocol.
+`udp://`, `icmp://`).
 
 ```
 --net-deny 10.0.0.0/8               # all ports on a CIDR (all protocols)
@@ -628,7 +627,6 @@ ranges across every protocol.
 --net-deny 169.254.169.254:80,443  # comma-separated ports in one rule
 --net-deny '*'                     # any IP, all ports (TCP)
 --net-deny 'udp://192.168.0.0/16'  # any UDP to a CIDR
---net-deny private                 # all internal ranges
 ```
 
 Repeat the flag for multiple rules.

@@ -1818,11 +1818,10 @@ pub struct SandboxBuilder {
     pub net_allow: Vec<String>,
 
     /// `--net-deny`: default-allow networking, block these IPs/CIDRs/ports.
-    /// Accepts `<ip>`, `<cidr>`, `<cidr>:<port[,port]>`, `:<port>`, `*`,
-    /// `[<ipv6>]:<port>`, and the `private` token (all internal ranges).
-    /// The port is optional (no `:port` means all ports). Hostnames are
-    /// rejected; use `--http-deny` for domains. Repeat the flag for multiple
-    /// rules. Mutually exclusive with `--net-allow`.
+    /// Accepts `<ip>`, `<cidr>`, `<cidr>:<port[,port]>`, `:<port>`, `*`, and
+    /// `[<ipv6>]:<port>`. The port is optional (no `:port` means all ports).
+    /// Hostnames are rejected; use `--http-deny` for domains. Repeat the flag
+    /// for multiple rules. Mutually exclusive with `--net-allow`.
     #[cfg_attr(feature = "cli", arg(long = "net-deny", value_name = "SPEC"))]
     pub net_deny: Vec<String>,
 
@@ -2400,8 +2399,8 @@ impl SandboxBuilder {
             .map(|s| NetAllow::parse(&s))
             .collect::<Result<_, _>>()?;
 
-        // Parse --net-deny rules (the `private` token expands here).
-        // NetDeny::parse returns a Vec per spec, so flatten.
+        // Parse --net-deny rules. NetDeny::parse returns a Vec per spec,
+        // so flatten.
         let mut net_deny: Vec<NetDeny> = Vec::new();
         for spec in self.net_deny {
             net_deny.extend(NetDeny::parse(&spec)?);
@@ -2667,15 +2666,6 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(policy.net_deny.len(), 1);
-    }
-
-    #[test]
-    fn builder_net_deny_private_expands() {
-        let policy = Sandbox::builder()
-            .net_deny("private")
-            .build()
-            .unwrap();
-        assert!(policy.net_deny.len() > 3); // expanded across CIDRs x protocols
     }
 
     #[test]

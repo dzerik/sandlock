@@ -515,7 +515,7 @@ mod tests {
     fn profile_network_deny_parses() {
         let toml = r#"
             [network]
-            deny = ["10.0.0.0/8", "private"]
+            deny = ["10.0.0.0/8", "192.168.0.0/16"]
         "#;
         let (policy, _spec) = parse_profile(toml).unwrap();
         assert!(policy.net_deny.len() > 1);

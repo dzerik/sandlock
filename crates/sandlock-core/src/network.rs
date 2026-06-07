@@ -112,25 +112,10 @@ pub struct NetDeny {
     pub all_ports: bool,
 }
 
-/// Curated internal/private ranges expanded by the `private` token.
-/// Covers loopback, RFC1918, link-local (incl. the cloud metadata
-/// endpoint 169.254.169.254), IPv6 loopback, ULA, and IPv6 link-local.
-pub const PRIVATE_CIDRS: &[&str] = &[
-    "127.0.0.0/8",
-    "10.0.0.0/8",
-    "172.16.0.0/12",
-    "192.168.0.0/16",
-    "169.254.0.0/16",
-    "::1/128",
-    "fc00::/7",
-    "fe80::/10",
-];
-
 impl NetDeny {
-    /// Parse a `--net-deny` spec into one or more rules. Returns a `Vec`
-    /// because the `private` token expands to many rules. Forms:
+    /// Parse a `--net-deny` spec into a rule (wrapped in a `Vec` for the
+    /// caller's collection). Forms:
     ///
-    /// - `private` -- the curated internal-range set, all protocols.
     /// - `<ip>` / `<cidr>` / `*` -- all ports (the port is optional; `*`
     ///   targets any IP). TCP is the default scheme.
     /// - `<ip>:<port[,port,...]>` / `<cidr>:<port>` / `<cidr>:*`.
@@ -142,21 +127,6 @@ impl NetDeny {
     ///
     /// Hostnames are rejected (use `--http-deny` for domain blocking).
     pub fn parse(spec: &str) -> Result<Vec<NetDeny>, SandboxError> {
-        if spec == "private" {
-            let mut out = Vec::new();
-            for proto in [Protocol::Tcp, Protocol::Udp, Protocol::Icmp] {
-                for c in PRIVATE_CIDRS {
-                    out.push(NetDeny {
-                        protocol: proto,
-                        target: DenyTarget::Cidr(IpCidr::parse(c)?),
-                        ports: Vec::new(),
-                        all_ports: true,
-                    });
-                }
-            }
-            return Ok(out);
-        }
-
         let (protocol, rest) = match spec.split_once("://") {
             Some((scheme, body)) => {
                 let proto = Protocol::parse(scheme).ok_or_else(|| {
@@ -2129,19 +2099,6 @@ mod tests {
     }
 
     #[test]
-    fn netdeny_private_token_expands_v4_and_v6() {
-        let rules = NetDeny::parse("private").unwrap();
-        // Each curated CIDR is emitted once per protocol (tcp, udp, icmp).
-        assert_eq!(rules.len(), PRIVATE_CIDRS.len() * 3);
-        // Metadata endpoint is covered.
-        let meta: IpAddr = "169.254.169.254".parse().unwrap();
-        assert!(rules.iter().any(|r| matches!(&r.target, DenyTarget::Cidr(c) if c.contains(meta))));
-        // IPv6 ULA is covered.
-        let ula: IpAddr = "fd00::1".parse().unwrap();
-        assert!(rules.iter().any(|r| matches!(&r.target, DenyTarget::Cidr(c) if c.contains(ula))));
-    }
-
-    #[test]
     fn netdeny_bare_ipv6_address_all_ports() {
         let rules = NetDeny::parse("::1").unwrap();
         assert_eq!(rules.len(), 1);
@@ -2203,15 +2160,6 @@ mod tests {
         // TCP policy denies 10.x, UDP/ICMP unaffected (still allow-all).
         assert!(!set.tcp.allows("10.0.0.1".parse().unwrap(), 443));
         assert!(set.udp.allows("10.0.0.1".parse().unwrap(), 443));
-    }
-
-    #[test]
-    fn resolve_net_deny_private_covers_metadata_all_protocols() {
-        let rules = NetDeny::parse("private").unwrap();
-        let set = resolve_net_deny(&rules);
-        let meta: std::net::IpAddr = "169.254.169.254".parse().unwrap();
-        assert!(!set.tcp.allows(meta, 80));
-        assert!(!set.udp.allows(meta, 80));
     }
 
     #[test]
