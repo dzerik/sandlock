@@ -58,8 +58,11 @@ _PORT_RANGE_RE = re.compile(r"^(\d+)(?:-(\d+))?$")
 def parse_ports(specs: Sequence[int | str]) -> list[int]:
     """Parse port specifications into a sorted list of unique port numbers.
 
-    Each spec is an int (single port) or a string like ``"80"``,
-    ``"8000-9000"``.  Raises ValueError on out-of-range or bad format.
+    Each spec is an int (single port) or a string holding a comma-separated
+    list of single ports / inclusive ``"lo-hi"`` ranges, e.g. ``"80"``,
+    ``"8000-9000"``, or ``"8080,9000-9005"`` (matching the CLI's
+    ``--net-allow-bind`` grammar).  Raises ValueError on out-of-range or bad
+    format.
     """
     ports: set[int] = set()
     for spec in specs:
@@ -68,14 +71,16 @@ def parse_ports(specs: Sequence[int | str]) -> list[int]:
                 raise ValueError(f"port out of range: {spec}")
             ports.add(spec)
             continue
-        m = _PORT_RANGE_RE.match(spec.strip())
-        if m is None:
-            raise ValueError(f"invalid port spec: {spec!r}")
-        lo = int(m.group(1))
-        hi = int(m.group(2)) if m.group(2) else lo
-        if lo > hi or not 0 <= lo <= 65535 or not 0 <= hi <= 65535:
-            raise ValueError(f"invalid port range: {spec!r}")
-        ports.update(range(lo, hi + 1))
+        for part in spec.split(","):
+            part = part.strip()
+            m = _PORT_RANGE_RE.match(part)
+            if m is None:
+                raise ValueError(f"invalid port spec: {part!r}")
+            lo = int(m.group(1))
+            hi = int(m.group(2)) if m.group(2) else lo
+            if lo > hi or not 0 <= lo <= 65535 or not 0 <= hi <= 65535:
+                raise ValueError(f"invalid port range: {part!r}")
+            ports.update(range(lo, hi + 1))
     return sorted(ports)
 
 

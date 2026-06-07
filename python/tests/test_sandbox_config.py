@@ -147,6 +147,16 @@ class TestParsePorts:
     def test_mixed(self):
         assert parse_ports([80, "443", "8000-8002"]) == [80, 443, 8000, 8001, 8002]
 
+    def test_comma_in_string(self):
+        # A string element may hold a comma list / ranges, matching the CLI's
+        # --net-allow-bind grammar.
+        assert parse_ports(["8080,9090"]) == [8080, 9090]
+        assert parse_ports(["8080,9000-9002", 443]) == [443, 8080, 9000, 9001, 9002]
+
+    def test_comma_empty_part_rejected(self):
+        with pytest.raises(ValueError):
+            parse_ports(["8080,"])
+
     def test_dedup(self):
         assert parse_ports([80, "80", "79-81"]) == [79, 80, 81]
 
