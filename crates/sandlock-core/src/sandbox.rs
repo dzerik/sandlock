@@ -2399,12 +2399,12 @@ impl SandboxBuilder {
             .map(|s| NetAllow::parse(&s))
             .collect::<Result<_, _>>()?;
 
-        // Parse --net-deny rules. NetDeny::parse returns a Vec per spec,
-        // so flatten.
-        let mut net_deny: Vec<NetDeny> = Vec::new();
-        for spec in self.net_deny {
-            net_deny.extend(NetDeny::parse(&spec)?);
-        }
+        // Parse --net-deny rules (one rule per spec).
+        let net_deny: Vec<NetDeny> = self
+            .net_deny
+            .into_iter()
+            .map(|s| NetDeny::parse(&s))
+            .collect::<Result<_, _>>()?;
 
         // --net-allow and --net-deny are mutually exclusive. Check the
         // user-supplied allow count (the original specs), not the post-HTTP

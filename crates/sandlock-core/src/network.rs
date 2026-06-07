@@ -113,8 +113,7 @@ pub struct NetDeny {
 }
 
 impl NetDeny {
-    /// Parse a `--net-deny` spec into a rule (wrapped in a `Vec` for the
-    /// caller's collection). Forms:
+    /// Parse a `--net-deny` spec into a single rule. Forms:
     ///
     /// - `<ip>` / `<cidr>` / `*` -- all ports (the port is optional; `*`
     ///   targets any IP). TCP is the default scheme.
@@ -126,7 +125,7 @@ impl NetDeny {
     /// - `tcp://...` / `udp://...` / `icmp://...` schemes (icmp: no port).
     ///
     /// Hostnames are rejected (use `--http-deny` for domain blocking).
-    pub fn parse(spec: &str) -> Result<Vec<NetDeny>, SandboxError> {
+    pub fn parse(spec: &str) -> Result<NetDeny, SandboxError> {
         let (protocol, rest) = match spec.split_once("://") {
             Some((scheme, body)) => {
                 let proto = Protocol::parse(scheme).ok_or_else(|| {
@@ -148,12 +147,12 @@ impl NetDeny {
                     spec
                 )));
             }
-            return Ok(vec![NetDeny {
+            return Ok(NetDeny {
                 protocol,
                 target: parse_deny_target(rest)?,
                 ports: Vec::new(),
                 all_ports: true,
-            }]);
+            });
         }
 
         // 1. Bracketed IPv6 with a port: `[addr]:ports`.
@@ -165,12 +164,12 @@ impl NetDeny {
                 ))
             })?;
             let (ports, all_ports) = parse_deny_ports(port_part, spec)?;
-            return Ok(vec![NetDeny {
+            return Ok(NetDeny {
                 protocol,
                 target: DenyTarget::Cidr(IpCidr::parse(inside)?),
                 ports,
                 all_ports,
-            }]);
+            });
         }
 
         // An empty body must not silently mean "deny everything"; require
@@ -185,12 +184,12 @@ impl NetDeny {
         // 2. Whole body is an IP/CIDR with no port -> all ports. This
         //    is what makes bare `10.0.0.0/8` and IPv6 `fc00::/7` work.
         if let Ok(cidr) = IpCidr::parse(rest) {
-            return Ok(vec![NetDeny {
+            return Ok(NetDeny {
                 protocol,
                 target: DenyTarget::Cidr(cidr),
                 ports: Vec::new(),
                 all_ports: true,
-            }]);
+            });
         }
 
         // 3. `target[:ports]` where target is an IPv4/CIDR, `*`, or empty.
@@ -205,12 +204,12 @@ impl NetDeny {
             Some(p) => parse_deny_ports(p, spec)?,
             None => (Vec::new(), true),
         };
-        Ok(vec![NetDeny {
+        Ok(NetDeny {
             protocol,
             target,
             ports,
             all_ports,
-        }])
+        })
     }
 }
 
@@ -2043,50 +2042,48 @@ mod tests {
 
     #[test]
     fn netdeny_bare_cidr_is_all_ports_tcp() {
-        let rules = NetDeny::parse("10.0.0.0/8").unwrap();
-        assert_eq!(rules.len(), 1);
-        assert_eq!(rules[0].protocol, Protocol::Tcp);
-        assert!(matches!(rules[0].target, DenyTarget::Cidr(_)));
-        assert!(rules[0].all_ports);
+        let rule = NetDeny::parse("10.0.0.0/8").unwrap();
+        assert_eq!(rule.protocol, Protocol::Tcp);
+        assert!(matches!(rule.target, DenyTarget::Cidr(_)));
+        assert!(rule.all_ports);
     }
 
     #[test]
     fn netdeny_bare_ip_is_host_route_all_ports() {
-        let rules = NetDeny::parse("169.254.169.254").unwrap();
-        assert_eq!(rules.len(), 1);
-        match &rules[0].target {
+        let rule = NetDeny::parse("169.254.169.254").unwrap();
+        match &rule.target {
             DenyTarget::Cidr(c) => assert_eq!(c.prefix_len, 32),
             _ => panic!("expected cidr"),
         }
-        assert!(rules[0].all_ports);
+        assert!(rule.all_ports);
     }
 
     #[test]
     fn netdeny_cidr_with_port() {
-        let rules = NetDeny::parse("10.0.0.0/8:443").unwrap();
-        assert_eq!(rules[0].ports, vec![443]);
-        assert!(!rules[0].all_ports);
+        let rule = NetDeny::parse("10.0.0.0/8:443").unwrap();
+        assert_eq!(rule.ports, vec![443]);
+        assert!(!rule.all_ports);
     }
 
     #[test]
     fn netdeny_any_ip_port() {
-        let rules = NetDeny::parse(":25").unwrap();
-        assert!(matches!(rules[0].target, DenyTarget::AnyIp));
-        assert_eq!(rules[0].ports, vec![25]);
+        let rule = NetDeny::parse(":25").unwrap();
+        assert!(matches!(rule.target, DenyTarget::AnyIp));
+        assert_eq!(rule.ports, vec![25]);
     }
 
     #[test]
     fn netdeny_udp_scheme() {
-        let rules = NetDeny::parse("udp://192.168.0.0/16:53").unwrap();
-        assert_eq!(rules[0].protocol, Protocol::Udp);
-        assert_eq!(rules[0].ports, vec![53]);
+        let rule = NetDeny::parse("udp://192.168.0.0/16:53").unwrap();
+        assert_eq!(rule.protocol, Protocol::Udp);
+        assert_eq!(rule.ports, vec![53]);
     }
 
     #[test]
     fn netdeny_ipv6_bracket_port() {
-        let rules = NetDeny::parse("[::1]:443").unwrap();
-        assert_eq!(rules[0].ports, vec![443]);
-        match &rules[0].target {
+        let rule = NetDeny::parse("[::1]:443").unwrap();
+        assert_eq!(rule.ports, vec![443]);
+        match &rule.target {
             DenyTarget::Cidr(c) => assert_eq!(c.prefix_len, 128),
             _ => panic!("expected cidr"),
         }
@@ -2100,10 +2097,9 @@ mod tests {
 
     #[test]
     fn netdeny_bare_ipv6_address_all_ports() {
-        let rules = NetDeny::parse("::1").unwrap();
-        assert_eq!(rules.len(), 1);
-        assert!(rules[0].all_ports);
-        match &rules[0].target {
+        let rule = NetDeny::parse("::1").unwrap();
+        assert!(rule.all_ports);
+        match &rule.target {
             DenyTarget::Cidr(c) => assert_eq!(c.prefix_len, 128),
             _ => panic!("expected cidr"),
         }
@@ -2111,11 +2107,10 @@ mod tests {
 
     #[test]
     fn netdeny_bare_ipv6_cidr_all_ports() {
-        let rules = NetDeny::parse("fc00::/7").unwrap();
-        assert_eq!(rules.len(), 1);
-        assert!(rules[0].all_ports);
+        let rule = NetDeny::parse("fc00::/7").unwrap();
+        assert!(rule.all_ports);
         let ula: std::net::IpAddr = "fd00::1".parse().unwrap();
-        assert!(matches!(&rules[0].target, DenyTarget::Cidr(c) if c.contains(ula)));
+        assert!(matches!(&rule.target, DenyTarget::Cidr(c) if c.contains(ula)));
     }
 
     #[test]
@@ -2127,21 +2122,19 @@ mod tests {
     fn netdeny_bare_star_is_any_ip_all_ports() {
         // `*` with no port is the any-IP, all-ports form (port optional,
         // symmetric with a bare IP/CIDR).
-        let rules = NetDeny::parse("*").unwrap();
-        assert_eq!(rules.len(), 1);
-        assert_eq!(rules[0].protocol, Protocol::Tcp);
-        assert!(matches!(rules[0].target, DenyTarget::AnyIp));
-        assert!(rules[0].all_ports);
-        assert!(rules[0].ports.is_empty());
+        let rule = NetDeny::parse("*").unwrap();
+        assert_eq!(rule.protocol, Protocol::Tcp);
+        assert!(matches!(rule.target, DenyTarget::AnyIp));
+        assert!(rule.all_ports);
+        assert!(rule.ports.is_empty());
     }
 
     #[test]
     fn netdeny_udp_bare_star_all_ports() {
-        let rules = NetDeny::parse("udp://*").unwrap();
-        assert_eq!(rules.len(), 1);
-        assert_eq!(rules[0].protocol, Protocol::Udp);
-        assert!(matches!(rules[0].target, DenyTarget::AnyIp));
-        assert!(rules[0].all_ports);
+        let rule = NetDeny::parse("udp://*").unwrap();
+        assert_eq!(rule.protocol, Protocol::Udp);
+        assert!(matches!(rule.target, DenyTarget::AnyIp));
+        assert!(rule.all_ports);
     }
 
     #[test]
@@ -2155,8 +2148,8 @@ mod tests {
 
     #[test]
     fn resolve_net_deny_groups_per_protocol() {
-        let rules = NetDeny::parse("10.0.0.0/8").unwrap();
-        let set = resolve_net_deny(&rules);
+        let rule = NetDeny::parse("10.0.0.0/8").unwrap();
+        let set = resolve_net_deny(std::slice::from_ref(&rule));
         // TCP policy denies 10.x, UDP/ICMP unaffected (still allow-all).
         assert!(!set.tcp.allows("10.0.0.1".parse().unwrap(), 443));
         assert!(set.udp.allows("10.0.0.1".parse().unwrap(), 443));
@@ -2164,8 +2157,8 @@ mod tests {
 
     #[test]
     fn resolve_net_deny_any_ip_port() {
-        let rules = NetDeny::parse(":25").unwrap();
-        let set = resolve_net_deny(&rules);
+        let rule = NetDeny::parse(":25").unwrap();
+        let set = resolve_net_deny(std::slice::from_ref(&rule));
         assert!(!set.tcp.allows("8.8.8.8".parse().unwrap(), 25));
         assert!(set.tcp.allows("8.8.8.8".parse().unwrap(), 80));
     }
