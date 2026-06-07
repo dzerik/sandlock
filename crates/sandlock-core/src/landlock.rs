@@ -483,7 +483,7 @@ fn confine_inner(policy: &Sandbox, handle_net: bool) -> Result<(), SandlockError
     let net_tcp_active =
         ProtectionStatus::resolve(Protection::NetTcp, abi, pol) == ProtectionStatus::Active;
     if handle_net && net_tcp_active {
-        for &port in &policy.net_bind {
+        for &port in &policy.net_allow_bind {
             add_net_rule(&ruleset_fd, port, LANDLOCK_ACCESS_NET_BIND_TCP).map_err(|e| {
                 SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(e))
             })?;

@@ -109,7 +109,7 @@ impl TryFrom<&Sandbox> for Confinement {
         if !sandbox.fs_denied.is_empty() { unsupported.push("fs_denied"); }
         if !sandbox.extra_deny_syscalls.is_empty() { unsupported.push("extra_deny_syscalls"); }
         if !sandbox.net_allow.is_empty() { unsupported.push("net_allow"); }
-        if !sandbox.net_bind.is_empty() { unsupported.push("net_bind"); }
+        if !sandbox.net_allow_bind.is_empty() { unsupported.push("net_allow_bind"); }
         if sandbox.allows_sysv_ipc() { unsupported.push("extra_allow_syscalls=[\"sysv_ipc\"]"); }
         if !sandbox.http_allow.is_empty() { unsupported.push("http_allow"); }
         if !sandbox.http_deny.is_empty() { unsupported.push("http_deny"); }
@@ -255,7 +255,7 @@ pub struct Sandbox {
     /// Parsed `--net-deny` rules (default-allow, IP/CIDR/port denylist).
     /// Mutually exclusive with `net_allow`.
     pub net_deny: Vec<NetDeny>,
-    pub net_bind: Vec<u16>,
+    pub net_allow_bind: Vec<u16>,
     // HTTP ACL
     pub http_allow: Vec<HttpRule>,
     pub http_deny: Vec<HttpRule>,
@@ -379,7 +379,7 @@ impl Clone for Sandbox {
             protection_policy: self.protection_policy.clone(),
             net_allow: self.net_allow.clone(),
             net_deny: self.net_deny.clone(),
-            net_bind: self.net_bind.clone(),
+            net_allow_bind: self.net_allow_bind.clone(),
             http_allow: self.http_allow.clone(),
             http_deny: self.http_deny.clone(),
             http_ports: self.http_ports.clone(),
@@ -1833,8 +1833,8 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", arg(long = "net-deny", value_name = "SPEC"))]
     pub net_deny: Vec<String>,
 
-    #[cfg_attr(feature = "cli", arg(long = "net-bind"))]
-    pub net_bind: Vec<u16>,
+    #[cfg_attr(feature = "cli", arg(long = "net-allow-bind"))]
+    pub net_allow_bind: Vec<u16>,
 
     #[cfg_attr(feature = "cli", arg(long = "http-allow", value_name = "RULE"))]
     pub http_allow: Vec<String>,
@@ -2004,7 +2004,7 @@ impl Clone for SandboxBuilder {
             extra_allow_syscalls: self.extra_allow_syscalls.clone(),
             net_allow: self.net_allow.clone(),
             net_deny: self.net_deny.clone(),
-            net_bind: self.net_bind.clone(),
+            net_allow_bind: self.net_allow_bind.clone(),
             http_allow: self.http_allow.clone(),
             http_deny: self.http_deny.clone(),
             http_ports: self.http_ports.clone(),
@@ -2126,8 +2126,8 @@ impl SandboxBuilder {
         self
     }
 
-    pub fn net_bind_port(mut self, port: u16) -> Self {
-        self.net_bind.push(port);
+    pub fn net_allow_bind_port(mut self, port: u16) -> Self {
+        self.net_allow_bind.push(port);
         self
     }
 
@@ -2439,7 +2439,7 @@ impl SandboxBuilder {
             protection_policy: self.protection_policy,
             net_allow,
             net_deny,
-            net_bind: self.net_bind,
+            net_allow_bind: self.net_allow_bind,
             http_allow,
             http_deny,
             http_ports,

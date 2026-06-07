@@ -288,7 +288,7 @@ class TestPortRemap:
             "print(s.getsockname()[1]); "
             "s.close()"
         )
-        policy = _policy(port_remap=True, net_bind=[8080])
+        policy = _policy(port_remap=True, net_allow_bind=[8080])
 
         holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         holder.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -358,7 +358,7 @@ class TestPortRemap:
             "print(json.dumps({'server_port': server_port, 'sent': total_sent, "
             "'received': len(received), 'data_ok': bytes(received) == payload}))"
         )
-        policy = _policy(port_remap=True, net_bind=[7070], net_allow=["127.0.0.1:7070"])
+        policy = _policy(port_remap=True, net_allow_bind=[7070], net_allow=["127.0.0.1:7070"])
         result = policy.run(["python3", "-c", code])
 
         assert result.success, f"Sandbox failed: {result}"

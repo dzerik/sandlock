@@ -329,12 +329,12 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_net_allow(
 /// # Safety
 /// `b` must be a valid builder pointer.
 #[no_mangle]
-pub unsafe extern "C" fn sandlock_sandbox_builder_net_bind_port(
+pub unsafe extern "C" fn sandlock_sandbox_builder_net_allow_bind_port(
     b: *mut SandboxBuilder, port: u16,
 ) -> *mut SandboxBuilder {
     if b.is_null() { return b; }
     let builder = *Box::from_raw(b);
-    Box::into_raw(Box::new(builder.net_bind_port(port)))
+    Box::into_raw(Box::new(builder.net_allow_bind_port(port)))
 }
 
 /// # Safety

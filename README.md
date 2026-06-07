@@ -166,8 +166,8 @@ sandlock run \
   --http-ca ca.pem --http-key ca-key.pem \
   -r /usr -r /lib -r /etc -- python3 agent.py
 
-# Server listening on a port (Landlock --net-bind, separate from --net-allow)
-sandlock run --net-bind 8080 -r /usr -r /lib -r /etc -- python3 server.py
+# Server listening on a port (Landlock --net-allow-bind, separate from --net-allow)
+sandlock run --net-allow-bind 8080 -r /usr -r /lib -r /etc -- python3 server.py
 
 # Clean environment
 sandlock run --clean-env --env CC=gcc \
@@ -177,11 +177,11 @@ sandlock run --clean-env --env CC=gcc \
 sandlock run --time-start "2000-01-01T00:00:00Z" --random-seed 42 -- ./build.sh
 
 # Port virtualization (multiple sandboxes can bind the same port)
-sandlock run --port-remap --net-bind 6379 -r /usr -r /lib -r /etc -- redis-server --port 6379
+sandlock run --port-remap --net-allow-bind 6379 -r /usr -r /lib -r /etc -- redis-server --port 6379
 
 # Port virtualization with named sandboxes (enables network discovery)
-sandlock run --name api.local --port-remap --net-bind 8080 -r /usr -r /lib -r /etc -- python3 server.py
-sandlock run --name web.local --port-remap --net-bind 8080 -r /usr -r /lib -r /etc -- python3 server.py
+sandlock run --name api.local --port-remap --net-allow-bind 8080 -r /usr -r /lib -r /etc -- python3 server.py
+sandlock run --name web.local --port-remap --net-allow-bind 8080 -r /usr -r /lib -r /etc -- python3 server.py
 
 # List all running sandboxes
 sandlock list
@@ -695,7 +695,7 @@ var at it (e.g. `NODE_EXTRA_CA_CERTS`). Without any of these, port 443
 is not intercepted: `--net-allow host:443` permits raw TLS to the host
 with no content inspection.
 
-**Bind.** `--net-bind <port>` is independent from `--net-allow` and
+**Bind.** `--net-allow-bind <port>` is independent from `--net-allow` and
 governs server-side `bind()`. Landlock enforces it (TCP only);
 `--port-remap` adds on-behalf virtualization for binding.
 

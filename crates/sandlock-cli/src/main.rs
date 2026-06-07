@@ -346,7 +346,7 @@ async fn run_command(args: RunArgs) -> Result<i32> {
         for rule in &base.net_deny {
             b = b.net_deny(format_net_rule(rule));
         }
-        for p in &base.net_bind { b = b.net_bind_port(*p); }
+        for p in &base.net_allow_bind { b = b.net_allow_bind_port(*p); }
         for rule in &base.http_allow {
             let s = format!("{} {}{}", rule.method, rule.host, rule.path);
             b = b.http_allow(&s);
@@ -406,7 +406,7 @@ async fn run_command(args: RunArgs) -> Result<i32> {
     if let Some(n) = pb.max_processes { builder = builder.max_processes(n); }
     for spec in &pb.net_allow { builder = builder.net_allow(spec); }
     for spec in &pb.net_deny { builder = builder.net_deny(spec); }
-    for p in &pb.net_bind { builder = builder.net_bind_port(*p); }
+    for p in &pb.net_allow_bind { builder = builder.net_allow_bind_port(*p); }
     if let Some(seed) = pb.random_seed { builder = builder.random_seed(seed); }
     if pb.clean_env { builder = builder.clean_env(true); }
     if let Some(n) = pb.num_cpus { builder = builder.num_cpus(n); }
@@ -659,7 +659,7 @@ fn validate_no_supervisor(args: &RunArgs) -> Result<()> {
     if args.timeout.is_some() { bad.push("--timeout"); }
     if !pb.net_allow.is_empty() { bad.push("--net-allow"); }
     if !pb.net_deny.is_empty() { bad.push("--net-deny"); }
-    if !pb.net_bind.is_empty() { bad.push("--net-bind"); }
+    if !pb.net_allow_bind.is_empty() { bad.push("--net-allow-bind"); }
     if !pb.http_allow.is_empty() { bad.push("--http-allow"); }
     if !pb.http_deny.is_empty() { bad.push("--http-deny"); }
     if !pb.http_ports.is_empty() { bad.push("--http-port"); }
@@ -718,7 +718,7 @@ fn validate_no_supervisor_profile(profile: &Sandbox, source: &str) -> Result<()>
     if !profile.fs_denied.is_empty() { bad.push("[filesystem].deny"); }
     if !profile.net_allow.is_empty() { bad.push("[network].allow"); }
     if !profile.net_deny.is_empty() { bad.push("[network].deny"); }
-    if !profile.net_bind.is_empty() { bad.push("[network].bind"); }
+    if !profile.net_allow_bind.is_empty() { bad.push("[network].bind"); }
     if profile.port_remap { bad.push("[network].port_remap"); }
     if !profile.http_allow.is_empty() { bad.push("[http].allow"); }
     if !profile.http_deny.is_empty() { bad.push("[http].deny"); }

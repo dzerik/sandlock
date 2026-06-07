@@ -175,7 +175,7 @@ class Sandbox:
     leaking sandbox memory contents but breaks gdb/strace/perf."""
 
     # Network — bind allowlist (Landlock ABI v4+, TCP only)
-    net_bind: Sequence[int | str] = field(default_factory=list)
+    net_allow_bind: Sequence[int | str] = field(default_factory=list)
     """TCP ports the sandbox may bind. Empty = deny all. Each entry is
     a port number or a ``"lo-hi"`` range string. Landlock's port hooks
     are TCP-only — UDP bind is not separately gated."""
@@ -405,7 +405,7 @@ class Sandbox:
 
     def bind_ports(self) -> list[int]:
         """Return parsed bind port list, or empty if unrestricted."""
-        return parse_ports(self.net_bind) if self.net_bind else []
+        return parse_ports(self.net_allow_bind) if self.net_allow_bind else []
 
     def memory_bytes(self) -> int | None:
         """Return max_memory as bytes, or None if unset."""

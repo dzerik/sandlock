@@ -330,7 +330,7 @@ async fn test_net_allow_permits_listed_endpoint() {
     let test_port: u16 = 19753;
     let policy = base_policy()
         .net_allow(format!("127.0.0.1:{}", test_port))
-        .net_bind_port(test_port)
+        .net_allow_bind_port(test_port)
         .port_remap(true)
         .build()
         .unwrap();

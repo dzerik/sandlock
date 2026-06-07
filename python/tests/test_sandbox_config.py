@@ -76,7 +76,7 @@ class TestPolicy:
         assert p.fs_denied == []
         assert p.extra_deny_syscalls == []
         assert p.extra_allow_syscalls == []
-        assert p.net_bind == []
+        assert p.net_allow_bind == []
         assert p.net_allow == []
         assert p.max_memory is None
         assert p.max_processes == 64
@@ -168,7 +168,7 @@ class TestParsePorts:
 
 class TestNetPolicy:
     def test_bind_ports(self):
-        p = Sandbox(net_bind=[80, "443", "8000-8002"])
+        p = Sandbox(net_allow_bind=[80, "443", "8000-8002"])
         assert p.bind_ports() == [80, 443, 8000, 8001, 8002]
 
     def test_unrestricted_by_default(self):

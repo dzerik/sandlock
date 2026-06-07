@@ -85,12 +85,12 @@ class TestPolicyFromDict:
     def test_network_section(self):
         p = policy_from_dict({
             "network": {
-                "bind": [8080],
+                "allow_bind": [8080],
                 "allow": ["api.example.com:443", ":8080"],
                 "port_remap": True,
             },
         })
-        assert p.net_bind == ["8080"]  # ints coerced to strings
+        assert p.net_allow_bind == ["8080"]  # ints coerced to strings
         assert list(p.net_allow) == ["api.example.com:443", ":8080"]
         assert p.port_remap is True
 

@@ -29,11 +29,11 @@ fn test_builder_fs_paths() {
 #[test]
 fn test_builder_network() {
     let policy = Sandbox::builder()
-        .net_bind_port(8080)
+        .net_allow_bind_port(8080)
         .net_allow("api.example.com:443,80")
         .build()
         .unwrap();
-    assert_eq!(policy.net_bind, vec![8080]);
+    assert_eq!(policy.net_allow_bind, vec![8080]);
     assert_eq!(policy.net_allow.len(), 1);
     let rule = &policy.net_allow[0];
     assert!(matches!(&rule.target, sandlock_core::sandbox::NetTarget::Host(h) if h == "api.example.com"));
