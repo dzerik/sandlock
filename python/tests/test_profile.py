@@ -100,6 +100,12 @@ class TestPolicyFromDict:
         })
         assert list(p.net_deny) == ["10.0.0.0/8", "169.254.169.254:80"]
 
+    def test_network_deny_bind_section(self):
+        p = policy_from_dict({
+            "network": {"deny_bind": [8080, "9000-9002"]},
+        })
+        assert p.deny_bind_ports() == [8080, 9000, 9001, 9002]
+
     def test_http_section(self):
         p = policy_from_dict({
             "http": {

@@ -107,6 +107,24 @@ class TestNetDeny:
             ).run(["echo", "ok"])
 
 
+class TestNetDenyBind:
+    """`net_deny_bind` wired through the FFI: default-allow bind with a TCP
+    port denylist, mutually exclusive with `net_allow_bind`."""
+
+    def test_net_deny_bind_builds_and_runs(self):
+        result = _policy(net_deny_bind=["8080,9000-9002", 443]).run(["echo", "ok"])
+        assert result.success
+        assert result.stdout.strip() == b"ok"
+
+    def test_deny_bind_ports_expands(self):
+        sb = _policy(net_deny_bind=["8080,9000-9002", 443])
+        assert sb.deny_bind_ports() == [443, 8080, 9000, 9001, 9002]
+
+    def test_allow_bind_and_deny_bind_mutually_exclusive(self):
+        with pytest.raises(RuntimeError, match="mutually exclusive"):
+            _policy(net_allow_bind=[8080], net_deny_bind=[9090]).run(["echo", "ok"])
+
+
 class TestSandlockRunCAbiMultiThreaded:
     """Regression for issue #47 covering only the C ABI ``sandlock_run`` path.
 

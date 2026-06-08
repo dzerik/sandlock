@@ -433,7 +433,7 @@ fn set_port_in_sockaddr(bytes: &mut [u8], port: u16) {
 /// Returns `None` for protocols sandlock does not gate via `net_allow`
 /// (raw, SCTP, etc.) — the handler treats those as "no rule applies"
 /// which collapses to the default-deny path.
-fn query_socket_protocol(fd: RawFd) -> Option<Protocol> {
+pub(crate) fn query_socket_protocol(fd: RawFd) -> Option<Protocol> {
     let mut proto: libc::c_int = 0;
     let mut len: libc::socklen_t = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
     let rc = unsafe {

@@ -701,6 +701,11 @@ governs server-side `bind()` as a default-deny allowlist. Each value is a
 comma-separated list of single ports or inclusive `lo-hi` ranges (e.g.
 `--net-allow-bind 8080,9000-9005`), and the flag repeats. Landlock enforces
 it (TCP only); `--port-remap` adds on-behalf virtualization for binding.
+`--net-deny-bind <ports>` is the inverse: default-allow binding, deny the
+listed TCP ports (same port syntax, mutually exclusive with
+`--net-allow-bind`). Because Landlock is allowlist-only, a deny-bind relaxes
+the Landlock `BIND_TCP` hook and enforces the denylist on the on-behalf
+seccomp `bind()` path instead.
 
 **AF_UNIX sockets** are governed by Landlock's
 `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET`, independent from `--net-allow`.

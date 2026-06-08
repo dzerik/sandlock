@@ -312,11 +312,19 @@ pub fn compute_net_mask(
             .net_allow
             .iter()
             .any(|r| r.protocol == Protocol::Tcp && r.all_ports);
-    let mask = if net_wildcard {
+    let mut mask = if net_wildcard {
         LANDLOCK_ACCESS_NET_BIND_TCP
     } else {
         LANDLOCK_ACCESS_NET_BIND_TCP | LANDLOCK_ACCESS_NET_CONNECT_TCP
     };
+    // `--net-deny-bind` is default-allow: every TCP bind must reach the
+    // on-behalf seccomp handler (the bind denylist enforcer), so Landlock
+    // must not gate BIND_TCP. Drop it from the handled set; the on-behalf
+    // path becomes the sole bind enforcer. (Mutually exclusive with
+    // `--net-allow-bind`, so no kernel bind rules are installed either.)
+    if !sandbox.net_deny_bind.is_empty() {
+        mask &= !LANDLOCK_ACCESS_NET_BIND_TCP;
+    }
     (mask, net_wildcard)
 }
 
@@ -757,5 +765,29 @@ mod mask_contract_tests {
             "net_deny must drop CONNECT_TCP so all TCP connects reach the on-behalf path",
         );
         assert!(wildcard, "net_deny must set the wildcard flag");
+    }
+
+    #[test]
+    fn net_mask_net_deny_bind_drops_bind_tcp() {
+        // `--net-deny-bind` is default-allow and enforced on the on-behalf
+        // bind() path, so Landlock must NOT gate BIND_TCP: every TCP bind has
+        // to reach the supervisor's denylist check. The mask keeps CONNECT_TCP
+        // (no connect rules here) but drops BIND_TCP.
+        let pol = ProtectionPolicy::strict_all();
+        let sb = Sandbox::builder()
+            .net_deny_bind("8080")
+            .build()
+            .expect("net_deny_bind sandbox builds");
+        let (mask, _wildcard) = compute_net_mask(6, &pol, &sb, true);
+        assert_eq!(
+            mask & LANDLOCK_ACCESS_NET_BIND_TCP,
+            0,
+            "net_deny_bind must drop BIND_TCP so all TCP binds reach the on-behalf path",
+        );
+        assert_ne!(
+            mask & LANDLOCK_ACCESS_NET_CONNECT_TCP,
+            0,
+            "net_deny_bind must not affect CONNECT_TCP handling",
+        );
     }
 }

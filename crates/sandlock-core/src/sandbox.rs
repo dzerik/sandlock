@@ -109,7 +109,9 @@ impl TryFrom<&Sandbox> for Confinement {
         if !sandbox.fs_denied.is_empty() { unsupported.push("fs_denied"); }
         if !sandbox.extra_deny_syscalls.is_empty() { unsupported.push("extra_deny_syscalls"); }
         if !sandbox.net_allow.is_empty() { unsupported.push("net_allow"); }
+        if !sandbox.net_deny.is_empty() { unsupported.push("net_deny"); }
         if !sandbox.net_allow_bind.is_empty() { unsupported.push("net_allow_bind"); }
+        if !sandbox.net_deny_bind.is_empty() { unsupported.push("net_deny_bind"); }
         if sandbox.allows_sysv_ipc() { unsupported.push("extra_allow_syscalls=[\"sysv_ipc\"]"); }
         if !sandbox.http_allow.is_empty() { unsupported.push("http_allow"); }
         if !sandbox.http_deny.is_empty() { unsupported.push("http_deny"); }
@@ -255,7 +257,13 @@ pub struct Sandbox {
     /// Parsed `--net-deny` rules (default-allow, IP/CIDR/port denylist).
     /// Mutually exclusive with `net_allow`.
     pub net_deny: Vec<NetDeny>,
+    /// `--net-allow-bind`: TCP ports the sandbox may bind (default-deny
+    /// allowlist, Landlock-enforced). Mutually exclusive with `net_deny_bind`.
     pub net_allow_bind: Vec<u16>,
+    /// `--net-deny-bind`: TCP ports the sandbox may NOT bind (default-allow
+    /// denylist, enforced on the on-behalf `bind()` path). Mutually
+    /// exclusive with `net_allow_bind`.
+    pub net_deny_bind: Vec<u16>,
     // HTTP ACL
     pub http_allow: Vec<HttpRule>,
     pub http_deny: Vec<HttpRule>,
@@ -380,6 +388,7 @@ impl Clone for Sandbox {
             net_allow: self.net_allow.clone(),
             net_deny: self.net_deny.clone(),
             net_allow_bind: self.net_allow_bind.clone(),
+            net_deny_bind: self.net_deny_bind.clone(),
             http_allow: self.http_allow.clone(),
             http_deny: self.http_deny.clone(),
             http_ports: self.http_ports.clone(),
@@ -1398,6 +1407,7 @@ impl Sandbox {
                     || self.policy_fn.is_some()
                     || !self.http_allow.is_empty()
                     || !self.http_deny.is_empty(),
+                has_bind_denylist: !self.net_deny_bind.is_empty(),
                 has_random_seed: self.random_seed.is_some(),
                 has_time_start: self.time_start.is_some(),
                 argv_safety_required: self.policy_fn.is_some()
@@ -1468,6 +1478,7 @@ impl Sandbox {
             net_state.http_acl_addr = self.rt().http_acl_handle.as_ref().map(|h| h.addr);
             net_state.http_acl_ports = self.http_ports.iter().copied().collect();
             net_state.http_acl_orig_dest = self.rt().http_acl_handle.as_ref().map(|h| h.orig_dest.clone());
+            net_state.bind_deny_ports = self.net_deny_bind.iter().copied().collect();
             if let Some(cb) = self.rt_mut().on_bind.take() {
                 net_state.port_map.on_bind = Some(cb);
             }
@@ -1839,6 +1850,13 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", arg(long = "net-allow-bind", value_name = "PORTS"))]
     pub net_allow_bind: Vec<String>,
 
+    /// `--net-deny-bind`: TCP ports the sandbox may NOT bind/listen on
+    /// (default-allow denylist; the inverse of `--net-allow-bind`). Same
+    /// port syntax (comma-separated ports / `lo-hi` ranges). Repeatable.
+    /// Mutually exclusive with `--net-allow-bind`.
+    #[cfg_attr(feature = "cli", arg(long = "net-deny-bind", value_name = "PORTS"))]
+    pub net_deny_bind: Vec<String>,
+
     #[cfg_attr(feature = "cli", arg(long = "http-allow", value_name = "RULE"))]
     pub http_allow: Vec<String>,
 
@@ -2008,6 +2026,7 @@ impl Clone for SandboxBuilder {
             net_allow: self.net_allow.clone(),
             net_deny: self.net_deny.clone(),
             net_allow_bind: self.net_allow_bind.clone(),
+            net_deny_bind: self.net_deny_bind.clone(),
             http_allow: self.http_allow.clone(),
             http_deny: self.http_deny.clone(),
             http_ports: self.http_ports.clone(),
@@ -2140,6 +2159,22 @@ impl SandboxBuilder {
     /// ports or inclusive `lo-hi` ranges (e.g. `"8080,9000-9005"`).
     pub fn net_allow_bind(mut self, spec: impl Into<String>) -> Self {
         self.net_allow_bind.push(spec.into());
+        self
+    }
+
+    /// Deny binding a single TCP port (default-allow denylist). For
+    /// comma-separated lists or `lo-hi` ranges, use
+    /// [`net_deny_bind`](Self::net_deny_bind).
+    pub fn net_deny_bind_port(mut self, port: u16) -> Self {
+        self.net_deny_bind.push(port.to_string());
+        self
+    }
+
+    /// Deny binding TCP ports from a spec: a comma-separated list of single
+    /// ports or inclusive `lo-hi` ranges (e.g. `"8080,9000-9005"`). The
+    /// inverse of [`net_allow_bind`](Self::net_allow_bind).
+    pub fn net_deny_bind(mut self, spec: impl Into<String>) -> Self {
+        self.net_deny_bind.push(spec.into());
         self
     }
 
@@ -2435,6 +2470,16 @@ impl SandboxBuilder {
             ));
         }
 
+        // Expand bind port specs. --net-allow-bind (default-deny allowlist)
+        // and --net-deny-bind (default-allow denylist) are contradictory.
+        let net_allow_bind = parse_bind_ports(&self.net_allow_bind, "--net-allow-bind")?;
+        let net_deny_bind = parse_bind_ports(&self.net_deny_bind, "--net-deny-bind")?;
+        if !net_allow_bind.is_empty() && !net_deny_bind.is_empty() {
+            return Err(SandboxError::Invalid(
+                "--net-allow-bind and --net-deny-bind are mutually exclusive".into(),
+            ));
+        }
+
         crate::http::extend_net_allow_for_http(
             &mut net_allow,
             &http_allow,
@@ -2451,7 +2496,8 @@ impl SandboxBuilder {
             protection_policy: self.protection_policy,
             net_allow,
             net_deny,
-            net_allow_bind: parse_bind_ports(&self.net_allow_bind)?,
+            net_allow_bind,
+            net_deny_bind,
             http_allow,
             http_deny,
             http_ports,
@@ -2505,36 +2551,36 @@ impl SandboxBuilder {
 /// Expand `--net-allow-bind` specs into a sorted, deduplicated port list.
 /// Each spec is a comma-separated list of single ports (`8080`) or inclusive
 /// `lo-hi` ranges (`8000-8010`). Mirrors the Python SDK's `parse_ports`.
-fn parse_bind_ports(specs: &[String]) -> Result<Vec<u16>, SandboxError> {
+fn parse_bind_ports(specs: &[String], label: &str) -> Result<Vec<u16>, SandboxError> {
     let mut ports: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
     for spec in specs {
         for part in spec.split(',') {
             let part = part.trim();
             if part.is_empty() {
                 return Err(SandboxError::Invalid(format!(
-                    "--net-allow-bind: empty port in `{}`",
-                    spec
+                    "{}: empty port in `{}`",
+                    label, spec
                 )));
             }
             match part.split_once('-') {
                 Some((lo, hi)) => {
                     let lo: u16 = lo.trim().parse().map_err(|_| {
-                        SandboxError::Invalid(format!("--net-allow-bind: invalid port range `{}`", part))
+                        SandboxError::Invalid(format!("{}: invalid port range `{}`", label, part))
                     })?;
                     let hi: u16 = hi.trim().parse().map_err(|_| {
-                        SandboxError::Invalid(format!("--net-allow-bind: invalid port range `{}`", part))
+                        SandboxError::Invalid(format!("{}: invalid port range `{}`", label, part))
                     })?;
                     if lo > hi {
                         return Err(SandboxError::Invalid(format!(
-                            "--net-allow-bind: reversed port range `{}` (lo > hi)",
-                            part
+                            "{}: reversed port range `{}` (lo > hi)",
+                            label, part
                         )));
                     }
                     ports.extend(lo..=hi);
                 }
                 None => {
                     let p: u16 = part.parse().map_err(|_| {
-                        SandboxError::Invalid(format!("--net-allow-bind: invalid port `{}`", part))
+                        SandboxError::Invalid(format!("{}: invalid port `{}`", label, part))
                     })?;
                     ports.insert(p);
                 }
@@ -2757,6 +2803,28 @@ mod tests {
             .net_deny("10.0.0.0/8")
             .build();
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn builder_net_deny_bind_comma_and_ranges() {
+        // Same port grammar as --net-allow-bind (comma lists + lo-hi ranges).
+        let policy = Sandbox::builder()
+            .net_deny_bind("8080,9000-9002")
+            .net_deny_bind_port(443)
+            .build()
+            .unwrap();
+        assert_eq!(policy.net_deny_bind, vec![443, 8080, 9000, 9001, 9002]);
+        assert!(policy.net_allow_bind.is_empty());
+    }
+
+    #[test]
+    fn builder_rejects_allow_bind_and_deny_bind_together() {
+        let err = Sandbox::builder()
+            .net_allow_bind("8080")
+            .net_deny_bind("9090")
+            .build();
+        assert!(err.is_err());
+        assert!(format!("{}", err.unwrap_err()).contains("mutually exclusive"));
     }
 
     #[test]

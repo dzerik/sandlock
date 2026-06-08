@@ -352,6 +352,17 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_net_allow_bind_port(
 /// # Safety
 /// `b` must be a valid builder pointer.
 #[no_mangle]
+pub unsafe extern "C" fn sandlock_sandbox_builder_net_deny_bind_port(
+    b: *mut SandboxBuilder, port: u16,
+) -> *mut SandboxBuilder {
+    if b.is_null() { return b; }
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.net_deny_bind_port(port)))
+}
+
+/// # Safety
+/// `b` must be a valid builder pointer.
+#[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_port_remap(
     b: *mut SandboxBuilder, v: bool,
 ) -> *mut SandboxBuilder {

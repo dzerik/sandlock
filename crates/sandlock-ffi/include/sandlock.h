@@ -409,6 +409,13 @@ sandlock_builder_t *sandlock_sandbox_builder_net_allow_bind_port(sandlock_builde
  * # Safety
  * `b` must be a valid builder pointer.
  */
+sandlock_builder_t *sandlock_sandbox_builder_net_deny_bind_port(sandlock_builder_t *b,
+                                                                uint16_t port);
+
+/**
+ * # Safety
+ * `b` must be a valid builder pointer.
+ */
 sandlock_builder_t *sandlock_sandbox_builder_port_remap(sandlock_builder_t *b, bool v);
 
 /**

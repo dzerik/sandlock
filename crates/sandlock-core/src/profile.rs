@@ -92,6 +92,7 @@ pub enum PortSpec {
 #[serde(deny_unknown_fields, default)]
 pub struct NetworkSection {
     pub allow_bind: Vec<PortSpec>,
+    pub deny_bind: Vec<PortSpec>,
     pub allow: Vec<String>,
     pub deny: Vec<String>,
     pub port_remap: bool,
@@ -183,6 +184,12 @@ pub fn parse_input(input: ProfileInput) -> Result<(Sandbox, ProgramSpec), Sandlo
         b = match entry {
             PortSpec::Port(p) => b.net_allow_bind_port(*p),
             PortSpec::Spec(s) => b.net_allow_bind(s),
+        };
+    }
+    for entry in input.network.deny_bind.iter() {
+        b = match entry {
+            PortSpec::Port(p) => b.net_deny_bind_port(*p),
+            PortSpec::Spec(s) => b.net_deny_bind(s),
         };
     }
     for r in input.network.allow.iter() { b = b.net_allow(r.as_str()); }
@@ -537,6 +544,18 @@ mod tests {
         "#;
         let (policy, _spec) = parse_profile(toml).unwrap();
         assert!(policy.net_deny.len() > 1);
+    }
+
+    #[test]
+    fn profile_network_deny_bind_parses() {
+        // Mixed int + range string, same as allow_bind.
+        let toml = r#"
+            [network]
+            deny_bind = [8080, "9000-9002"]
+        "#;
+        let (policy, _spec) = parse_profile(toml).unwrap();
+        assert_eq!(policy.net_deny_bind, vec![8080, 9000, 9001, 9002]);
+        assert!(policy.net_allow_bind.is_empty());
     }
 
     #[test]

@@ -374,6 +374,7 @@ const PORT_REMAP_SYSCALLS: &[i64] = &[
 fn needs_network_supervision(policy: &Sandbox) -> bool {
     !policy.net_allow.is_empty()
         || !policy.net_deny.is_empty()
+        || !policy.net_deny_bind.is_empty()
         || policy.policy_fn.is_some()
         || !policy.http_allow.is_empty()
         || !policy.http_deny.is_empty()

@@ -40,7 +40,7 @@ func cbool(v bool) C.bool { return C.bool(v) }
 func (s *Sandbox) validateStrings() error {
 	groups := [][]string{
 		s.FSReadable, s.FSWritable, s.FSDenied,
-		s.NetAllow, s.NetDeny, s.NetAllowBind,
+		s.NetAllow, s.NetDeny, s.NetAllowBind, s.NetDenyBind,
 		s.HTTPAllow, s.HTTPDeny,
 		s.ExtraAllowSyscalls, s.ExtraDenySyscalls,
 		{s.Workdir, s.Cwd, s.Chroot, s.FSStorage, s.MaxMemory, s.MaxDisk,
@@ -138,6 +138,16 @@ func (s *Sandbox) buildPolicy() (*C.sandlock_sandbox_t, error) {
 		}
 		for _, p := range ports {
 			b = C.sandlock_sandbox_builder_net_allow_bind_port(b, C.uint16_t(p))
+		}
+	}
+	if len(s.NetDenyBind) > 0 {
+		ports, err := policy.ParsePorts(s.NetDenyBind)
+		if err != nil {
+			freeBuilderViaBuild(b)
+			return nil, err
+		}
+		for _, p := range ports {
+			b = C.sandlock_sandbox_builder_net_deny_bind_port(b, C.uint16_t(p))
 		}
 	}
 	if s.PortRemap {

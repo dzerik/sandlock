@@ -84,8 +84,13 @@ type Sandbox struct {
 	// NetAllowBind lists TCP ports the sandbox may bind/listen on
 	// (default-deny). Each entry is a comma-separated list of single ports
 	// or inclusive "lo-hi" ranges ("8080", "3000-3010", "8080,9000-9005").
+	// Mutually exclusive with NetDenyBind.
 	NetAllowBind []string
-	PortRemap    bool // transparent per-sandbox TCP port virtualization
+	// NetDenyBind is the inverse of NetAllowBind: default-allow binding,
+	// deny these TCP ports (same port syntax). Mutually exclusive with
+	// NetAllowBind.
+	NetDenyBind []string
+	PortRemap   bool // transparent per-sandbox TCP port virtualization
 
 	// HTTP ACL (method + host + path rules via a transparent proxy).
 	HTTPAllow   []string // allow rules, "METHOD host/path"

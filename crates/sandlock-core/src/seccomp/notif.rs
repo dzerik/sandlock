@@ -405,6 +405,10 @@ pub struct NotifPolicy {
     pub max_processes: u32,
     pub has_memory_limit: bool,
     pub has_net_allowlist: bool,
+    /// `--net-deny-bind` is active: trap `bind()` and register the on-behalf
+    /// handler so denied TCP ports can be refused (independent of the
+    /// connect-side `has_net_allowlist`).
+    pub has_bind_denylist: bool,
     pub has_random_seed: bool,
     pub has_time_start: bool,
     /// Argv-safety gate: the supervisor must freeze every task that
