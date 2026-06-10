@@ -12,16 +12,16 @@
 //! 4. `sandbox.wait()` collects the exit status and persists it to state.json.
 //!
 //! Communication with the CLI is newline-delimited JSON over a Unix socket in
-//! the container's state directory.
+//! the sandbox's state directory.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::policy::OciPolicy;
-use crate::state::ContainerState;
+use crate::state::SandboxState;
 
-/// Filename of the supervisor control socket inside the container state dir.
+/// Filename of the supervisor control socket inside the sandbox state dir.
 pub const SUPERVISOR_SOCKET: &str = "supervisor.sock";
 
 /// Commands the CLI sends to the Supervisor over the Unix socket.
@@ -33,7 +33,7 @@ pub enum SupervisorCmd {
     /// Query the child PID.
     Ping,
     /// Terminate the supervisor without starting the child (used by `delete`
-    /// when the container was never started).  The sandbox `Drop` kills the
+    /// when the sandbox was never started).  The sandbox `Drop` kills the
     /// parked child.
     Shutdown,
 }
@@ -47,7 +47,7 @@ pub enum SupervisorReply {
     Err { msg: String },
 }
 
-/// Returns the path to the supervisor socket for the given container ID.
+/// Returns the path to the supervisor socket for the given sandbox ID.
 pub fn socket_path(id: &str) -> PathBuf {
     PathBuf::from(crate::state::state_dir())
         .join(id)
@@ -95,7 +95,7 @@ pub fn run_supervisor(
 
     // Create backing dirs for emulated tmpfs mounts before building the
     // sandbox so each bind redirect has a target on disk.  They live under the
-    // container state dir and are removed with it on `delete`.
+    // sandbox state dir and are removed with it on `delete`.
     for dir in &policy.scratch_dirs {
         std::fs::create_dir_all(dir)
             .with_context(|| format!("create tmpfs backing dir {:?}", dir))?;
@@ -180,8 +180,8 @@ async fn supervisor_main(
 
     // Persist Created state with the real child PID.
     {
-        let mut state = ContainerState::load(id).unwrap_or_else(|_| {
-            ContainerState::new(id, Path::new("/"), "1.0.2")
+        let mut state = SandboxState::load(id).unwrap_or_else(|_| {
+            SandboxState::new(id, Path::new("/"), "1.0.2")
         });
         state.set_created(child_pid);
         state.save().ok();
@@ -223,7 +223,7 @@ async fn supervisor_main(
                 // full sandlock policy already in place.
                 match sandbox.start() {
                     Ok(()) => {
-                        if let Ok(mut s) = ContainerState::load(id) {
+                        if let Ok(mut s) = SandboxState::load(id) {
                             s.set_running();
                             s.save().ok();
                         }
@@ -273,7 +273,7 @@ async fn supervisor_main(
         Err(_) => None,
     };
 
-    if let Ok(mut s) = ContainerState::load(id) {
+    if let Ok(mut s) = SandboxState::load(id) {
         s.set_stopped(exit_info);
         s.save().ok();
     }
@@ -287,8 +287,8 @@ mod tests {
 
     #[test]
     fn socket_path_is_under_state_dir() {
-        let p = socket_path("my-container");
-        assert!(p.to_str().unwrap().contains("my-container"));
+        let p = socket_path("my-sandbox");
+        assert!(p.to_str().unwrap().contains("my-sandbox"));
         assert!(p.to_str().unwrap().contains("supervisor.sock"));
     }
 

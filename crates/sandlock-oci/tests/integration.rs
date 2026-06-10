@@ -87,10 +87,10 @@ fn spec_load_and_policy_mapping() {
 
 #[test]
 fn state_created_lifecycle() {
-    use sandlock_oci::state::{ContainerState, Status};
+    use sandlock_oci::state::{SandboxState, Status};
 
     let dir = tempdir().unwrap();
-    let mut state = ContainerState::new("test-lifecycle", dir.path(), "1.0.2");
+    let mut state = SandboxState::new("test-lifecycle", dir.path(), "1.0.2");
     // new() starts in Creating; set_created() advances to Created.
     assert_eq!(state.status, Status::Creating);
 
@@ -148,17 +148,17 @@ fn oci_check_exits_zero() {
 }
 
 #[test]
-fn oci_state_unknown_container_errors() {
+fn oci_state_unknown_sandbox_errors() {
     if !oci_bin().exists() {
         eprintln!("sandlock-oci binary not built — skipping");
         return;
     }
     let out = run_oci(&["state", "this-does-not-exist-xyz-12345"]);
-    assert!(!out.status.success(), "expected failure for unknown container");
+    assert!(!out.status.success(), "expected failure for unknown sandbox");
 }
 
 #[test]
-fn oci_list_no_containers() {
+fn oci_list_no_sandboxes() {
     if !oci_bin().exists() {
         eprintln!("sandlock-oci binary not built — skipping");
         return;
@@ -169,12 +169,12 @@ fn oci_list_no_containers() {
 }
 
 #[test]
-fn oci_kill_unknown_container_errors() {
+fn oci_kill_unknown_sandbox_errors() {
     if !oci_bin().exists() {
         eprintln!("sandlock-oci binary not built — skipping");
         return;
     }
-    let out = run_oci(&["kill", "no-such-container-xyz", "SIGTERM"]);
+    let out = run_oci(&["kill", "no-such-sandbox-xyz", "SIGTERM"]);
     assert!(!out.status.success());
 }
 
@@ -184,8 +184,8 @@ fn oci_delete_nonexistent_is_ok() {
         eprintln!("sandlock-oci binary not built — skipping");
         return;
     }
-    // Deleting a container that doesn't exist should not fail.
-    let out = run_oci(&["delete", "ghost-container-xyz-99"]);
+    // Deleting a sandbox that doesn't exist should not fail.
+    let out = run_oci(&["delete", "ghost-sandbox-xyz-99"]);
     assert!(out.status.success());
 }
 

@@ -16,18 +16,18 @@ use std::path::{Path, PathBuf};
 
 /// Serializable OCI-to-sandlock policy representation.
 ///
-/// Stored alongside state.json in the container's state directory so that
+/// Stored alongside state.json in the sandbox's state directory so that
 /// the supervisor (or any recovery tool) can reconstruct the confinement
 /// parameters without re-parsing the OCI bundle.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OciPolicy {
-    /// Absolute path to the container rootfs (chroot target).
+    /// Absolute path to the sandbox rootfs (chroot target).
     pub rootfs: Option<PathBuf>,
 
-    /// Paths readable inside the container (relative to rootfs if set).
+    /// Paths readable inside the sandbox (relative to rootfs if set).
     pub fs_read: Vec<PathBuf>,
 
-    /// Paths writable inside the container (relative to rootfs if set).
+    /// Paths writable inside the sandbox (relative to rootfs if set).
     pub fs_write: Vec<PathBuf>,
 
     /// Explicit bind mounts: (dest_inside_rootfs, host_source_path).
@@ -36,7 +36,7 @@ pub struct OciPolicy {
     /// Initial working directory (relative to rootfs if set).
     pub cwd: Option<PathBuf>,
 
-    /// Environment variables to set in the container.
+    /// Environment variables to set in the sandbox.
     pub env: HashMap<String, String>,
 
     /// Memory limit (optional).
@@ -49,7 +49,7 @@ pub struct OciPolicy {
     pub max_cpu: Option<u8>,
 
     /// Host directories backing emulated tmpfs mounts.  Created before launch
-    /// and removed with the container state dir on `delete`.
+    /// and removed with the sandbox state dir on `delete`.
     #[serde(default)]
     pub scratch_dirs: Vec<PathBuf>,
 }
@@ -59,7 +59,7 @@ impl OciPolicy {
     pub fn from_spec(spec: &Spec, bundle: &Path, id: &str) -> Result<Self> {
         let rootfs = rootfs_path(spec, bundle)?;
 
-        // OCI `root.readonly`: when set, the container rootfs must be read-only,
+        // OCI `root.readonly`: when set, the sandbox rootfs must be read-only,
         // so the whole chroot is granted read access rather than read-write.
         let root_readonly = spec
             .root()
@@ -73,7 +73,7 @@ impl OciPolicy {
         let mut scratch_dirs = Vec::new();
 
         if rootfs.is_some() {
-            // The container owns its rootfs, so grant the whole chroot rather
+            // The sandbox owns its rootfs, so grant the whole chroot rather
             // than guessing a fixed set of system directories.  `root.readonly`
             // selects read-only vs. read-write for the entire tree (fs_write's
             // Landlock mask already includes read access).  Individual mounts,
@@ -187,7 +187,7 @@ impl OciPolicy {
             builder = builder.cwd(cwd);
         }
 
-        // Start from a clean environment so the container sees exactly the
+        // Start from a clean environment so the sandbox sees exactly the
         // vars declared in the OCI spec, not the supervisor's inherited env.
         builder = builder.clean_env(true);
         for (k, v) in &self.env {
@@ -238,7 +238,7 @@ fn rootfs_path(spec: &Spec, bundle: &Path) -> Result<Option<PathBuf>> {
 ///
 /// - **bind** (real source): `fs_mount(dest, source)`, ro/rw from options.
 /// - **tmpfs** writable scratch (`/tmp`, `/run`, `/dev/shm`, …): backed by a
-///   host directory under the container state dir and bind-mounted read-write,
+///   host directory under the sandbox state dir and bind-mounted read-write,
 ///   so it works on a read-only root and stays isolated from the rootfs.
 /// - **tmpfs at `/dev`, proc, sysfs**: passed through read-only so sandlock's
 ///   `/dev` interception and `/proc` virtualization service them; an empty

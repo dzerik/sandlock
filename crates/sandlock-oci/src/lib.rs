@@ -6,7 +6,7 @@
 //! ## Key types
 //!
 //! - [`OciPolicy`] — in-memory representation of the translated OCI config
-//! - [`ContainerState`] — on-disk lifecycle state for a container
+//! - [`SandboxState`] — on-disk lifecycle state for a sandbox
 //! - [`SupervisorCmd`] / [`SupervisorReply`] — IPC messages for the supervisor
 
 pub mod policy;
@@ -15,5 +15,5 @@ pub mod state;
 pub mod supervisor;
 
 pub use policy::OciPolicy;
-pub use state::{ContainerState, ExitInfo, Status};
+pub use state::{SandboxState, ExitInfo, Status};
 pub use supervisor::{SupervisorCmd, SupervisorReply, SUPERVISOR_SOCKET};

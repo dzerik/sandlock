@@ -1,4 +1,4 @@
-//! Persistent state management for OCI container lifecycle.
+//! Persistent state management for the OCI container lifecycle.
 //!
 //! State JSON is stored at `<root>/<id>/state.json`, where `<root>` is the
 //! `--root` directory (when given), `$XDG_RUNTIME_DIR/sandlock-oci` for
@@ -69,13 +69,13 @@ pub fn state_dir() -> String {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Status {
-    /// Transient state while the supervisor is setting up the container.
+    /// Transient state while the supervisor is setting up the sandbox.
     Creating,
-    /// Container has been created (child parked) but not yet started.
+    /// Sandbox has been created (child parked) but not yet started.
     Created,
-    /// Container is currently running.
+    /// Sandbox is currently running.
     Running,
-    /// Container process has exited.
+    /// Sandbox process has exited.
     Stopped,
 }
 
@@ -90,34 +90,34 @@ impl std::fmt::Display for Status {
     }
 }
 
-/// The on-disk state blob for a sandlock-oci container.
+/// The on-disk state blob for a sandlock-oci sandbox.
 ///
 /// Fields match the OCI Runtime State specification.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ContainerState {
+pub struct SandboxState {
     /// OCI spec version.
     #[serde(rename = "ociVersion")]
     pub oci_version: String,
-    /// Container identifier (unique on this host).
+    /// Sandbox identifier (unique on this host).
     pub id: String,
     /// Current lifecycle status.
     pub status: Status,
-    /// PID of the container's init process (0 = not yet started).
+    /// PID of the sandbox's init process (0 = not yet started).
     pub pid: i32,
     /// Absolute path to the bundle directory.
     pub bundle: PathBuf,
-    /// Unix timestamp (seconds) when the container was created.
+    /// Unix timestamp (seconds) when the sandbox was created.
     pub created: u64,
     /// Optional annotations from the OCI spec.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub annotations: std::collections::HashMap<String, String>,
-    /// Exit code or signal that terminated the container.
-    /// `None` while the container is Created or Running.
+    /// Exit code or signal that terminated the sandbox.
+    /// `None` while the sandbox is Created or Running.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_info: Option<ExitInfo>,
 }
 
-/// Captures how the container's init process exited.
+/// Captures how the sandbox's init process exited.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExitInfo {
     /// Exit code if the process exited normally.
@@ -126,14 +126,14 @@ pub struct ExitInfo {
     pub signal: Option<i32>,
 }
 
-impl ContainerState {
+impl SandboxState {
     /// Create a new state in the `Created` status.
     pub fn new(id: &str, bundle: &Path, oci_version: &str) -> Self {
         let created = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        ContainerState {
+        SandboxState {
             oci_version: oci_version.to_string(),
             id: id.to_string(),
             status: Status::Creating,
@@ -145,7 +145,7 @@ impl ContainerState {
         }
     }
 
-    /// Path to the state directory for this container.
+    /// Path to the state directory for this sandbox.
     pub fn state_dir(&self) -> PathBuf {
         Path::new(&state_dir()).join(&self.id)
     }
@@ -161,7 +161,7 @@ impl ContainerState {
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("create state dir {:?}", dir))?;
         let data = serde_json::to_string_pretty(self)
-            .context("serialize container state")?;
+            .context("serialize sandbox state")?;
         std::fs::write(self.state_file(), data)
             .with_context(|| format!("write state to {:?}", self.state_file()))
     }
@@ -191,7 +191,7 @@ impl ContainerState {
         self.pid = pid;
     }
 
-    /// Mark the container as running.
+    /// Mark the sandbox as running.
     pub fn set_running(&mut self) {
         self.status = Status::Running;
     }
@@ -202,7 +202,7 @@ impl ContainerState {
         self.exit_info = exit_info;
     }
 
-    /// Returns true if the container process is still alive.
+    /// Returns true if the sandbox process is still alive.
     pub fn is_alive(&self) -> bool {
         if self.pid <= 0 {
             return false;
@@ -212,8 +212,8 @@ impl ContainerState {
     }
 }
 
-/// List all container IDs currently tracked in STATE_DIR.
-pub fn list_containers() -> Result<Vec<String>> {
+/// List all sandbox IDs currently tracked in STATE_DIR.
+pub fn list_sandboxes() -> Result<Vec<String>> {
     let dir_str = state_dir();
     let dir = Path::new(&dir_str);
     if !dir.exists() {
@@ -238,8 +238,8 @@ mod tests {
     use super::*;
     use std::env;
 
-    fn _make_state(id: &str) -> ContainerState {
-        ContainerState::new(id, Path::new("/tmp"), "1.0.2")
+    fn _make_state(id: &str) -> SandboxState {
+        SandboxState::new(id, Path::new("/tmp"), "1.0.2")
     }
 
     #[test]
@@ -251,9 +251,9 @@ mod tests {
 
     #[test]
     fn state_roundtrip_json() {
-        let state = ContainerState::new("test-ctr", Path::new("/tmp"), "1.0.2");
+        let state = SandboxState::new("test-ctr", Path::new("/tmp"), "1.0.2");
         let json = serde_json::to_string(&state).unwrap();
-        let loaded: ContainerState = serde_json::from_str(&json).unwrap();
+        let loaded: SandboxState = serde_json::from_str(&json).unwrap();
         assert_eq!(loaded.id, "test-ctr");
         // new() begins in Creating; set_created() transitions to Created.
         assert_eq!(loaded.status, Status::Creating);
@@ -261,7 +261,7 @@ mod tests {
 
     #[test]
     fn is_alive_returns_false_for_zero_pid() {
-        let state = ContainerState::new("dead-ctr", Path::new("/tmp"), "1.0.2");
+        let state = SandboxState::new("dead-ctr", Path::new("/tmp"), "1.0.2");
         assert!(!state.is_alive());
     }
 
