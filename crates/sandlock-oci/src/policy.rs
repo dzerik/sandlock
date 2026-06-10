@@ -54,17 +54,29 @@ impl OciPolicy {
     pub fn from_spec(spec: &Spec, bundle: &Path) -> Result<Self> {
         let rootfs = rootfs_path(spec, bundle);
 
+        // OCI `root.readonly`: when set, the container rootfs must be read-only,
+        // so the whole chroot is granted read access rather than read-write.
+        let root_readonly = spec
+            .root()
+            .as_ref()
+            .and_then(|r| r.readonly())
+            .unwrap_or(false);
+
         let mut fs_read = Vec::new();
         let mut fs_write = Vec::new();
         let mut fs_mount = Vec::new();
 
         if rootfs.is_some() {
-            // Standard read-only paths inside the chroot
-            for p in &["/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc", "/proc", "/dev"] {
-                fs_read.push(PathBuf::from(*p));
+            // The container owns its rootfs, so grant the whole chroot rather
+            // than guessing a fixed set of system directories.  `root.readonly`
+            // selects read-only vs. read-write for the entire tree (fs_write's
+            // Landlock mask already includes read access).  Individual mounts,
+            // with their ro/rw options, layer on top via map_mounts.
+            if root_readonly {
+                fs_read.push(PathBuf::from("/"));
+            } else {
+                fs_write.push(PathBuf::from("/"));
             }
-            // /tmp is writable by default
-            fs_write.push(PathBuf::from("/tmp"));
         }
 
         // Process mounts — populate fs_mount, fs_read, fs_write
@@ -330,6 +342,41 @@ mod tests {
         assert!(policy.max_memory.is_none());
         assert!(policy.max_processes.is_none());
         assert!(policy.max_cpu.is_none());
+    }
+
+    #[test]
+    fn readonly_root_grants_rootfs_read_only() {
+        let dir = tempdir().unwrap();
+        let bundle = dir.path();
+        fs::create_dir_all(bundle.join("rootfs")).unwrap();
+
+        let spec = SpecBuilder::default()
+            .version("1.0.2")
+            .root(RootBuilder::default().path("rootfs").readonly(true).build().unwrap())
+            .process(
+                ProcessBuilder::default()
+                    .args(vec!["sh".to_string()])
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap();
+
+        let policy = OciPolicy::from_spec(&spec, bundle).unwrap();
+        assert!(policy.fs_read.contains(&PathBuf::from("/")));
+        assert!(!policy.fs_write.contains(&PathBuf::from("/")));
+    }
+
+    #[test]
+    fn writable_root_grants_rootfs_writable() {
+        let dir = tempdir().unwrap();
+        let bundle = dir.path();
+        fs::create_dir_all(bundle.join("rootfs")).unwrap();
+
+        // minimal_spec() sets readonly(false).
+        let policy = OciPolicy::from_spec(&minimal_spec(), bundle).unwrap();
+        assert!(policy.fs_write.contains(&PathBuf::from("/")));
+        assert!(!policy.fs_read.contains(&PathBuf::from("/")));
     }
 
     #[test]
