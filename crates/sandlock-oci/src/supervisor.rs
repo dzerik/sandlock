@@ -219,22 +219,31 @@ async fn supervisor_main(
                 let _ = stream.write_all(b"\n").await;
             }
             SupervisorCmd::Start => {
-                // OCI `start` — write to the ready pipe so the parked child
-                // proceeds to execve with the full sandlock policy already in place.
-                let reply = match sandbox.start() {
+                // OCI `start` — release the parked child to execve with the
+                // full sandlock policy already in place.
+                match sandbox.start() {
                     Ok(()) => {
                         if let Ok(mut s) = ContainerState::load(id) {
                             s.set_running();
                             s.save().ok();
                         }
-                        SupervisorReply::Ok
+                        let reply = serde_json::to_vec(&SupervisorReply::Ok).unwrap_or_default();
+                        let _ = stream.write_all(&reply).await;
+                        let _ = stream.write_all(b"\n").await;
+                        break LoopExit::Started;
                     }
-                    Err(e) => SupervisorReply::Err { msg: e.to_string() },
-                };
-                let reply_bytes = serde_json::to_vec(&reply).unwrap_or_default();
-                let _ = stream.write_all(&reply_bytes).await;
-                let _ = stream.write_all(b"\n").await;
-                break LoopExit::Started;
+                    Err(e) => {
+                        let reply = serde_json::to_vec(&SupervisorReply::Err { msg: e.to_string() })
+                            .unwrap_or_default();
+                        let _ = stream.write_all(&reply).await;
+                        let _ = stream.write_all(b"\n").await;
+                        // start() failed with the child still parked: do NOT
+                        // wait() (it would block forever on a child that never
+                        // execve's).  Exit via the Shutdown path so the Sandbox
+                        // Drop kills and reaps the parked child.
+                        break LoopExit::Shutdown;
+                    }
+                }
             }
             SupervisorCmd::Shutdown => {
                 // `delete` before `start` — acknowledge and exit.  The sandbox
