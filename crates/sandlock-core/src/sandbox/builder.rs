@@ -561,6 +561,11 @@ impl SandboxBuilder {
 
     /// Run the sandboxed process as `uid`/`gid` via a single-entry user
     /// namespace map (no host privilege required).
+    ///
+    /// If `uid`/`gid` already match the process's real uid/gid at launch, no
+    /// user namespace is created — the process already has that identity, so
+    /// the request is satisfied without one (and without requiring unprivileged
+    /// user namespaces to be available on the host).
     pub fn user(mut self, uid: u32, gid: u32) -> Self {
         self.user = Some(RunAs { uid, gid });
         self

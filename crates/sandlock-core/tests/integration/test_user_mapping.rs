@@ -143,3 +143,31 @@ async fn test_uid_custom() {
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
     assert_eq!(stdout.trim(), "1000", "Expected uid 1000, got: {:?}", stdout.trim());
 }
+
+/// Requesting the identity the process already has must NOT create a user
+/// namespace — so it works even where unprivileged userns is unavailable.
+/// (No `userns_available()` guard on purpose: this exercises the skip path.)
+#[tokio::test]
+async fn test_user_matching_runtime_skips_userns() {
+    let uid = unsafe { libc::getuid() };
+    let gid = unsafe { libc::getgid() };
+
+    let policy = Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .user(uid, gid)
+        .build()
+        .unwrap();
+
+    let result = policy.clone().with_name("test").run(&["echo", "hi"]).await.unwrap();
+    assert!(
+        result.success(),
+        "matching-identity user() should skip the userns and run cleanly: {:?}",
+        result.exit_status
+    );
+    let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
+    assert_eq!(stdout.trim(), "hi");
+}
