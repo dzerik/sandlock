@@ -117,22 +117,6 @@ fn state_created_lifecycle() {
 }
 
 #[test]
-fn state_exit_info_from_status() {
-    use libc;
-    use sandlock_oci::state::ExitInfo;
-
-    // Normal exit
-    let info = ExitInfo::from_status(0 << 8);
-    assert_eq!(info.code, Some(0));
-    assert!(info.signal.is_none());
-
-    // Signal kill
-    let info = ExitInfo::from_status(libc::SIGKILL);
-    assert!(info.code.is_none());
-    assert_eq!(info.signal, Some(libc::SIGKILL));
-}
-
-#[test]
 fn policy_from_spec_builds_sandbox() {
     let dir = tempdir().unwrap();
     create_bundle(dir.path(), &["sh", "-c", "exit 0"]);

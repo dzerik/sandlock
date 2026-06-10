@@ -79,28 +79,6 @@ pub struct ExitInfo {
     pub signal: Option<i32>,
 }
 
-impl ExitInfo {
-    /// Create from a raw waitpid status value.
-    pub fn from_status(status: i32) -> Self {
-        if libc::WIFEXITED(status) {
-            ExitInfo {
-                code: Some(unsafe { libc::WEXITSTATUS(status) }),
-                signal: None,
-            }
-        } else if libc::WIFSIGNALED(status) {
-            ExitInfo {
-                code: None,
-                signal: Some(unsafe { libc::WTERMSIG(status) }),
-            }
-        } else {
-            ExitInfo {
-                code: None,
-                signal: None,
-            }
-        }
-    }
-}
-
 impl ContainerState {
     /// Create a new state in the `Created` status.
     pub fn new(id: &str, bundle: &Path, oci_version: &str) -> Self {
@@ -269,20 +247,6 @@ mod tests {
         state.set_stopped(Some(info));
         assert_eq!(state.status, Status::Stopped);
         assert_eq!(state.exit_info.as_ref().unwrap().code, Some(0));
-    }
-
-    #[test]
-    fn exit_info_from_status_exited() {
-        let info = ExitInfo::from_status(0 << 8); // exit code 0
-        assert_eq!(info.code, Some(0));
-        assert!(info.signal.is_none());
-    }
-
-    #[test]
-    fn exit_info_from_status_signaled() {
-        let info = ExitInfo::from_status(libc::SIGKILL); // killed by SIGKILL
-        assert!(info.code.is_none());
-        assert_eq!(info.signal, Some(libc::SIGKILL));
     }
 
     #[test]
