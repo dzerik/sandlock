@@ -201,7 +201,7 @@ fn cmd_create(id: &str, bundle: &PathBuf, pid_file: Option<&std::path::Path>) ->
 
     // Load and validate spec
     let spec = spec::load_spec(&bundle)?;
-    let policy = spec::spec_to_policy(&spec, &bundle)?;
+    let policy = spec::spec_to_policy(&spec, &bundle, id)?;
 
     // Extract the command from the spec — OCI requires non-empty args
     let cmd_args: Vec<String> = spec

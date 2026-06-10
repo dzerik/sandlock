@@ -76,7 +76,7 @@ fn spec_load_and_policy_mapping() {
         .unwrap();
     assert_eq!(spec.version(), "1.0.2");
 
-    let policy = sandlock_oci::spec::spec_to_policy(&spec, dir.path()).unwrap();
+    let policy = sandlock_oci::spec::spec_to_policy(&spec, dir.path(), "test").unwrap();
     // PATH env is forwarded
     assert!(policy.env.contains_key("PATH"));
     // Cwd is forwarded
@@ -122,7 +122,7 @@ fn policy_from_spec_builds_sandbox() {
     create_bundle(dir.path(), &["sh", "-c", "exit 0"]);
 
     let spec = sandlock_oci::spec::load_spec(dir.path()).unwrap();
-    let policy = sandlock_oci::spec::spec_to_policy(&spec, dir.path()).unwrap();
+    let policy = sandlock_oci::spec::spec_to_policy(&spec, dir.path(), "test").unwrap();
 
     // Can convert to sandbox config
     let sandbox = policy.to_sandbox().unwrap();

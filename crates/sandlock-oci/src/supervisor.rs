@@ -93,6 +93,14 @@ pub fn run_supervisor(
         anyhow::bail!("OCI spec error: process.args is empty");
     }
 
+    // Create backing dirs for emulated tmpfs mounts before building the
+    // sandbox so each bind redirect has a target on disk.  They live under the
+    // container state dir and are removed with it on `delete`.
+    for dir in &policy.scratch_dirs {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("create tmpfs backing dir {:?}", dir))?;
+    }
+
     // Build the Sandbox from the OCI policy — this carries chroot, env, fs
     // rules, resource limits, and network policy into sandlock-core.
     let mut sandbox = policy.to_sandbox().context("build Sandbox from OCI policy")?;

@@ -47,11 +47,16 @@ pub struct OciPolicy {
 
     /// CPU percentage limit, 1-100 (optional).
     pub max_cpu: Option<u8>,
+
+    /// Host directories backing emulated tmpfs mounts.  Created before launch
+    /// and removed with the container state dir on `delete`.
+    #[serde(default)]
+    pub scratch_dirs: Vec<PathBuf>,
 }
 
 impl OciPolicy {
     /// Build an OciPolicy from a parsed OCI Spec and its bundle directory.
-    pub fn from_spec(spec: &Spec, bundle: &Path) -> Result<Self> {
+    pub fn from_spec(spec: &Spec, bundle: &Path, id: &str) -> Result<Self> {
         let rootfs = rootfs_path(spec, bundle);
 
         // OCI `root.readonly`: when set, the container rootfs must be read-only,
@@ -65,6 +70,7 @@ impl OciPolicy {
         let mut fs_read = Vec::new();
         let mut fs_write = Vec::new();
         let mut fs_mount = Vec::new();
+        let mut scratch_dirs = Vec::new();
 
         if rootfs.is_some() {
             // The container owns its rootfs, so grant the whole chroot rather
@@ -79,9 +85,12 @@ impl OciPolicy {
             }
         }
 
-        // Process mounts — populate fs_mount, fs_read, fs_write
+        // Process mounts — populate fs_mount, fs_read, fs_write, scratch_dirs
         if let Some(mounts) = spec.mounts() {
-            map_mounts(mounts, bundle, &rootfs, &mut fs_mount, &mut fs_read, &mut fs_write);
+            map_mounts(
+                mounts, bundle, &rootfs, id,
+                &mut fs_mount, &mut fs_read, &mut fs_write, &mut scratch_dirs,
+            );
         }
 
         // oci-spec 0.7: sub-struct getters (via #[getset]) return &T / &Option<T>.
@@ -146,6 +155,7 @@ impl OciPolicy {
             max_memory,
             max_processes,
             max_cpu,
+            scratch_dirs,
         })
     }
 
@@ -216,66 +226,86 @@ fn rootfs_path(spec: &Spec, bundle: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Process OCI mounts into fs_mount, fs_read, and fs_write lists.
+/// Translate OCI mounts into sandlock primitives by intent:
 ///
-/// Skips kernel-only mount types (proc, sysfs, etc.) and applies
-/// read/write permissions from mount options to the fs_read/fs_write
-/// vectors rather than hardcoding paths.
+/// - **bind** (real source): `fs_mount(dest, source)`, ro/rw from options.
+/// - **tmpfs** writable scratch (`/tmp`, `/run`, `/dev/shm`, …): backed by a
+///   host directory under the container state dir and bind-mounted read-write,
+///   so it works on a read-only root and stays isolated from the rootfs.
+/// - **tmpfs at `/dev`, proc, sysfs**: passed through read-only so sandlock's
+///   `/dev` interception and `/proc` virtualization service them; an empty
+///   backing dir would shadow `/dev/null`, `/proc/*`, etc.
+/// - **devpts/mqueue/cgroup**: skipped (no safe namespace-less equivalent).
 fn map_mounts(
     mounts: &[oci_spec::runtime::Mount],
     bundle: &Path,
     rootfs: &Option<PathBuf>,
+    id: &str,
     fs_mount: &mut Vec<(PathBuf, PathBuf)>,
     fs_read: &mut Vec<PathBuf>,
     fs_write: &mut Vec<PathBuf>,
+    scratch_dirs: &mut Vec<PathBuf>,
 ) {
     for mount in mounts {
         let dest = mount.destination();
-
-        // Detect read-only option from mount options.
-        let read_only = mount
-            .options()
-            .as_ref()
-            .map(|opts| opts.iter().any(|o| o == "ro"))
-            .unwrap_or(false);
-
-        // Resolve source — relative paths are relative to the bundle.
-        let source: Option<PathBuf> = mount.source().as_ref().map(|s| {
-            if s.is_absolute() {
-                s.clone()
-            } else {
-                bundle.join(s)
-            }
-        });
-
-        // Skip kernel-provided virtual filesystems.
-        // These don't need Landlock rules and can't be bind-mounted.
         let mount_type = mount.typ().as_deref().unwrap_or("bind");
+
         match mount_type {
-            "proc" | "sysfs" | "devpts" | "tmpfs" | "mqueue" | "cgroup" | "cgroup2" => {
-                continue;
-            }
-            _ => {}
-        }
+            // Kernel interfaces: pass the host's through read-only.  sandlock
+            // virtualizes /proc and intercepts /dev/{null,urandom,random,…}.
+            "proc" => fs_read.push(PathBuf::from("/proc")),
+            "sysfs" => fs_read.push(PathBuf::from("/sys")),
 
-        // Bind mounts: record the mapping and set read/write permissions.
-        if let Some(src) = source {
-            if let Some(ref rootfs_path) = rootfs {
-                // Resolve the destination relative to the chroot.
-                let chroot_dest = rootfs_path.join(dest.strip_prefix("/").unwrap_or(dest));
-                if chroot_dest.exists() || src.exists() {
-                    fs_mount.push((dest.to_path_buf(), src));
-                }
-            } else {
-                if src.exists() {
-                    fs_mount.push((dest.to_path_buf(), src));
+            "tmpfs" => {
+                if dest.to_str() == Some("/dev") {
+                    // The device filesystem — pass through; nodes are served by
+                    // interception, an empty backing dir would hide them.
+                    fs_read.push(PathBuf::from("/dev"));
+                } else {
+                    // Writable scratch (e.g. /tmp, /run, /dev/shm).  Back it with
+                    // a host dir under the state dir so writes are isolated from a
+                    // read-only rootfs and cleaned up with the state dir on delete.
+                    let backing = Path::new(&crate::state::state_dir())
+                        .join(id)
+                        .join("tmpfs")
+                        .join(dest.strip_prefix("/").unwrap_or(dest));
+                    fs_mount.push((dest.to_path_buf(), backing.clone()));
+                    fs_write.push(dest.to_path_buf());
+                    scratch_dirs.push(backing);
                 }
             }
 
-            if read_only {
-                fs_read.push(dest.clone());
-            } else {
-                fs_write.push(dest.clone());
+            // No safe namespace-less equivalent.
+            "devpts" | "mqueue" | "cgroup" | "cgroup2" => {}
+
+            // Bind mounts (and any other type carrying a real source).
+            _ => {
+                let read_only = mount
+                    .options()
+                    .as_ref()
+                    .map(|opts| opts.iter().any(|o| o == "ro"))
+                    .unwrap_or(false);
+                let source: Option<PathBuf> = mount.source().as_ref().map(|s| {
+                    if s.is_absolute() { s.clone() } else { bundle.join(s) }
+                });
+                if let Some(src) = source {
+                    let keep = match rootfs {
+                        Some(rootfs_path) => {
+                            let chroot_dest =
+                                rootfs_path.join(dest.strip_prefix("/").unwrap_or(dest));
+                            chroot_dest.exists() || src.exists()
+                        }
+                        None => src.exists(),
+                    };
+                    if keep {
+                        fs_mount.push((dest.to_path_buf(), src));
+                        if read_only {
+                            fs_read.push(dest.to_path_buf());
+                        } else {
+                            fs_write.push(dest.to_path_buf());
+                        }
+                    }
+                }
             }
         }
     }
@@ -311,7 +341,7 @@ mod tests {
         fs::create_dir_all(bundle.join("rootfs")).unwrap();
 
         let spec = minimal_spec();
-        let policy = OciPolicy::from_spec(&spec, bundle).unwrap();
+        let policy = OciPolicy::from_spec(&spec, bundle, "test").unwrap();
 
         assert!(policy.rootfs.is_some());
         assert!(policy.rootfs.as_ref().unwrap().ends_with("rootfs"));
@@ -325,7 +355,7 @@ mod tests {
         fs::create_dir_all(bundle.join("rootfs")).unwrap();
 
         let spec = minimal_spec();
-        let policy = OciPolicy::from_spec(&spec, bundle).unwrap();
+        let policy = OciPolicy::from_spec(&spec, bundle, "test").unwrap();
 
         assert!(policy.env.contains_key("PATH"));
         assert_eq!(policy.env.get("FOO"), Some(&"bar".to_string()));
@@ -337,7 +367,7 @@ mod tests {
         let bundle = dir.path();
         fs::create_dir_all(bundle.join("rootfs")).unwrap();
 
-        let policy = OciPolicy::from_spec(&minimal_spec(), bundle).unwrap();
+        let policy = OciPolicy::from_spec(&minimal_spec(), bundle, "test").unwrap();
         // No resources set in minimal_spec, so these should be None
         assert!(policy.max_memory.is_none());
         assert!(policy.max_processes.is_none());
@@ -362,7 +392,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let policy = OciPolicy::from_spec(&spec, bundle).unwrap();
+        let policy = OciPolicy::from_spec(&spec, bundle, "test").unwrap();
         assert!(policy.fs_read.contains(&PathBuf::from("/")));
         assert!(!policy.fs_write.contains(&PathBuf::from("/")));
     }
@@ -374,9 +404,47 @@ mod tests {
         fs::create_dir_all(bundle.join("rootfs")).unwrap();
 
         // minimal_spec() sets readonly(false).
-        let policy = OciPolicy::from_spec(&minimal_spec(), bundle).unwrap();
+        let policy = OciPolicy::from_spec(&minimal_spec(), bundle, "test").unwrap();
         assert!(policy.fs_write.contains(&PathBuf::from("/")));
         assert!(!policy.fs_read.contains(&PathBuf::from("/")));
+    }
+
+    #[test]
+    fn tmpfs_scratch_backed_proc_dev_passthrough() {
+        std::env::set_var("SANDLOCK_OCI_STATE_DIR", "/tmp/sandlock-oci-test-mounts");
+        let dir = tempdir().unwrap();
+        let bundle = dir.path();
+        fs::create_dir_all(bundle.join("rootfs")).unwrap();
+
+        let json = serde_json::json!({
+            "ociVersion": "1.0.2",
+            "root": { "path": "rootfs", "readonly": true },
+            "process": { "user": { "uid": 0, "gid": 0 }, "cwd": "/", "args": ["sh"] },
+            "mounts": [
+                { "destination": "/tmp",  "type": "tmpfs", "source": "tmpfs" },
+                { "destination": "/proc", "type": "proc",  "source": "proc" },
+                { "destination": "/dev",  "type": "tmpfs", "source": "tmpfs" }
+            ]
+        });
+        let spec: Spec = serde_json::from_value(json).unwrap();
+
+        let policy = OciPolicy::from_spec(&spec, bundle, "ctr1").unwrap();
+
+        // /tmp is writable scratch: bind-mounted to a backing dir under the
+        // state dir, recorded for creation, and marked writable.
+        assert!(policy
+            .fs_mount
+            .iter()
+            .any(|(d, h)| d == Path::new("/tmp") && h.ends_with("ctr1/tmpfs/tmp")));
+        assert!(policy.scratch_dirs.iter().any(|d| d.ends_with("ctr1/tmpfs/tmp")));
+        assert!(policy.fs_write.contains(&PathBuf::from("/tmp")));
+
+        // /proc and /dev are passed through read-only, not emulated.
+        assert!(policy.fs_read.contains(&PathBuf::from("/proc")));
+        assert!(policy.fs_read.contains(&PathBuf::from("/dev")));
+        assert!(!policy.fs_mount.iter().any(|(d, _)| d == Path::new("/dev")));
+
+        std::env::remove_var("SANDLOCK_OCI_STATE_DIR");
     }
 
     #[test]
@@ -386,7 +454,7 @@ mod tests {
         fs::create_dir_all(bundle.join("rootfs")).unwrap();
 
         let spec = minimal_spec();
-        let policy = OciPolicy::from_spec(&spec, bundle).unwrap();
+        let policy = OciPolicy::from_spec(&spec, bundle, "test").unwrap();
         let sandbox = policy.to_sandbox().unwrap();
 
         assert!(sandbox.chroot.is_some());
@@ -407,7 +475,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let policy = OciPolicy::from_spec(&spec, Path::new("/tmp")).unwrap();
+        let policy = OciPolicy::from_spec(&spec, Path::new("/tmp"), "test").unwrap();
         assert!(policy.rootfs.is_none());
     }
 }
