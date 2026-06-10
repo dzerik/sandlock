@@ -207,6 +207,14 @@ fn main() -> Result<()> {
 /// 4. Fork a Supervisor (double-fork daemon) which forks the Child.
 /// 5. Child is SIGSTOP'd; supervisor writes PID to CLI via pipe (no sleep/race).
 fn cmd_create(id: &str, bundle: &PathBuf, pid_file: Option<&std::path::Path>) -> Result<()> {
+    // OCI requires the container ID to be unique within the runtime root.
+    // Reject a re-used ID up front rather than overwriting the existing
+    // container's state and orphaning its supervisor + parked child.  The
+    // caller must `delete` the old container first.
+    if ContainerState::load(id).is_ok() {
+        bail!("container {} already exists", id);
+    }
+
     let bundle = bundle
         .canonicalize()
         .with_context(|| format!("bundle path {:?} does not exist", bundle))?;

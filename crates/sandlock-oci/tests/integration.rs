@@ -188,3 +188,42 @@ fn oci_delete_nonexistent_is_ok() {
     let out = run_oci(&["delete", "ghost-container-xyz-99"]);
     assert!(out.status.success());
 }
+
+#[test]
+fn oci_create_rejects_duplicate_id() {
+    if !oci_bin().exists() {
+        eprintln!("sandlock-oci binary not built — skipping");
+        return;
+    }
+    // The uniqueness guard fires before any fork, so a pre-existing state.json
+    // under --root is enough to trigger it — no rootfs or Landlock needed.
+    let root = tempdir().unwrap();
+    let id = "dup-id-test";
+    let cdir = root.path().join(id);
+    fs::create_dir_all(&cdir).unwrap();
+    fs::write(
+        cdir.join("state.json"),
+        r#"{"ociVersion":"1.0.2","id":"dup-id-test","status":"created","pid":12345,"bundle":"/tmp","created":0}"#,
+    )
+    .unwrap();
+
+    let out = Command::new(oci_bin())
+        .args([
+            "--root",
+            root.path().to_str().unwrap(),
+            "create",
+            id,
+            "-b",
+            "/tmp",
+        ])
+        .output()
+        .expect("failed to run sandlock-oci");
+
+    assert!(!out.status.success(), "duplicate create should fail");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("already exists"),
+        "expected 'already exists' error, got: {}",
+        stderr
+    );
+}
