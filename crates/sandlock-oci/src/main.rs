@@ -35,10 +35,6 @@ use std::path::PathBuf;
     version
 )]
 struct Cli {
-    /// Enable debug logging to stderr.
-    #[arg(long, global = true)]
-    debug: bool,
-
     #[command(subcommand)]
     command: Command,
 }
