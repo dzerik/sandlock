@@ -35,6 +35,14 @@ use std::path::PathBuf;
     version
 )]
 struct Cli {
+    /// Root directory for container state (one subdir per container).
+    ///
+    /// The OCI-standard knob that containerd/CRI-O pass. When omitted,
+    /// defaults to `$XDG_RUNTIME_DIR/sandlock-oci` for unprivileged users
+    /// and `/run/sandlock-oci` for root.
+    #[arg(long, global = true)]
+    root: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -116,6 +124,10 @@ enum Command {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Resolve the state-dir root once, before any state I/O or fork, so the
+    // supervisor child inherits the same location.
+    state::init_state_dir(cli.root.as_deref().and_then(|p| p.to_str()));
 
     match cli.command {
         Command::Create { id, bundle, pid_file, console_socket: _ } => {

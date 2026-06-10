@@ -88,10 +88,6 @@ fn spec_load_and_policy_mapping() {
 #[test]
 fn state_created_lifecycle() {
     use sandlock_oci::state::{ContainerState, Status};
-    use std::env;
-
-    // Use a temp-friendly state dir for tests
-    env::set_var("SANDLOCK_OCI_STATE_DIR", "/tmp/sandlock-oci-test-state");
 
     let dir = tempdir().unwrap();
     let mut state = ContainerState::new("test-lifecycle", dir.path(), "1.0.2");
@@ -112,8 +108,6 @@ fn state_created_lifecycle() {
     assert_eq!(state.status, Status::Stopped);
     assert!(state.exit_info.is_some());
     assert_eq!(state.exit_info.as_ref().unwrap().code, Some(0));
-
-    env::remove_var("SANDLOCK_OCI_STATE_DIR");
 }
 
 #[test]

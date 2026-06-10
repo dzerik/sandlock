@@ -411,7 +411,6 @@ mod tests {
 
     #[test]
     fn tmpfs_scratch_backed_proc_dev_passthrough() {
-        std::env::set_var("SANDLOCK_OCI_STATE_DIR", "/tmp/sandlock-oci-test-mounts");
         let dir = tempdir().unwrap();
         let bundle = dir.path();
         fs::create_dir_all(bundle.join("rootfs")).unwrap();
@@ -443,8 +442,6 @@ mod tests {
         assert!(policy.fs_read.contains(&PathBuf::from("/proc")));
         assert!(policy.fs_read.contains(&PathBuf::from("/dev")));
         assert!(!policy.fs_mount.iter().any(|(d, _)| d == Path::new("/dev")));
-
-        std::env::remove_var("SANDLOCK_OCI_STATE_DIR");
     }
 
     #[test]

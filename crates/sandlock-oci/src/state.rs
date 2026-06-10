@@ -1,21 +1,68 @@
 //! Persistent state management for OCI container lifecycle.
 //!
-//! Implements Phase 2: state JSON stored at `/run/sandlock-oci/<id>/state.json`.
+//! State JSON is stored at `<root>/<id>/state.json`, where `<root>` is the
+//! `--root` directory (when given), `$XDG_RUNTIME_DIR/sandlock-oci` for
+//! unprivileged users, or `/run/sandlock-oci` for root. See [`state_dir`].
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Default state directory root — matches the OCI runtime spec.
+/// System-wide state directory root, used when running as root.
 ///
-/// Can be overridden at runtime with the `SANDLOCK_OCI_STATE_DIR` environment
-/// variable (useful for integration tests that don't run as root).
+/// Matches the runc/containerd convention. Unprivileged users default to a
+/// per-user runtime directory instead (see [`resolve_state_dir`]), keeping
+/// sandlock usable without root.
 pub const STATE_DIR: &str = "/run/sandlock-oci";
 
-/// Return the effective state directory, respecting the env override.
+/// Process-wide state-dir root, resolved once in `main` via [`init_state_dir`].
+///
+/// Set before any `fork`, so the supervisor child inherits the same value.
+static STATE_DIR_ROOT: OnceLock<String> = OnceLock::new();
+
+/// Resolve and cache the state directory root for this process.
+///
+/// Precedence (highest first):
+/// 1. the explicit `--root` CLI flag (`root_flag`), the OCI-standard knob
+///    that containerd/CRI-O pass,
+/// 2. `$XDG_RUNTIME_DIR/sandlock-oci` for unprivileged users,
+/// 3. `/run/sandlock-oci` for root (or when no per-user runtime dir exists).
+///
+/// Call once, early in `main`, before any state I/O or `fork`.
+pub fn init_state_dir(root_flag: Option<&str>) {
+    let _ = STATE_DIR_ROOT.set(resolve_state_dir(root_flag));
+}
+
+/// Compute the state directory root without caching. See [`init_state_dir`]
+/// for the precedence rules.
+fn resolve_state_dir(root_flag: Option<&str>) -> String {
+    if let Some(root) = root_flag {
+        return root.to_string();
+    }
+    // Unprivileged default: a per-user, user-owned runtime dir, mirroring
+    // rootless runc/crun/podman. This is what keeps sandlock-oci runnable
+    // without root, which is the project's core design goal.
+    if unsafe { libc::geteuid() } != 0 {
+        if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
+            if !xdg.is_empty() {
+                return format!("{}/sandlock-oci", xdg);
+            }
+        }
+    }
+    STATE_DIR.to_string()
+}
+
+/// Return the effective state directory root.
+///
+/// Returns the value cached by [`init_state_dir`] when set; otherwise resolves
+/// the default (library and test callers that never call `init_state_dir`).
 pub fn state_dir() -> String {
-    std::env::var("SANDLOCK_OCI_STATE_DIR").unwrap_or_else(|_| STATE_DIR.to_string())
+    if let Some(dir) = STATE_DIR_ROOT.get() {
+        return dir.clone();
+    }
+    resolve_state_dir(None)
 }
 
 /// OCI container status as defined by the runtime spec.
@@ -250,9 +297,16 @@ mod tests {
     }
 
     #[test]
-    fn state_dir_respects_env_override() {
-        env::set_var("SANDLOCK_OCI_STATE_DIR", "/tmp/sandlock-test-dir");
-        assert_eq!(state_dir(), "/tmp/sandlock-test-dir");
-        env::remove_var("SANDLOCK_OCI_STATE_DIR");
+    fn state_dir_resolution_precedence() {
+        // The --root flag takes precedence over the computed default.
+        assert_eq!(resolve_state_dir(Some("/custom/root")), "/custom/root");
+
+        // Unprivileged users default to a per-user runtime dir; root falls
+        // back to the system-wide STATE_DIR.
+        if unsafe { libc::geteuid() } != 0 {
+            env::set_var("XDG_RUNTIME_DIR", "/run/user/4242");
+            assert_eq!(resolve_state_dir(None), "/run/user/4242/sandlock-oci");
+            env::remove_var("XDG_RUNTIME_DIR");
+        }
     }
 }
