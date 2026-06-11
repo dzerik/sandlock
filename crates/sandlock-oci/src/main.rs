@@ -25,7 +25,7 @@ mod supervisor;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use state::{ContainerState, Status};
+use state::{SandboxState, Status};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -35,9 +35,13 @@ use std::path::PathBuf;
     version
 )]
 struct Cli {
-    /// Enable debug logging to stderr.
+    /// Root directory for sandbox state (one subdir per sandbox).
+    ///
+    /// The OCI-standard knob that containerd/CRI-O pass. When omitted,
+    /// defaults to `$XDG_RUNTIME_DIR/sandlock-oci` for unprivileged users
+    /// and `/run/sandlock-oci` for root.
     #[arg(long, global = true)]
-    debug: bool,
+    root: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Command,
@@ -45,15 +49,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Create a container. Spawns the Supervisor and forks the child in a
+    /// Create a sandbox. Spawns the Supervisor and forks the child in a
     /// paused state. Saves state to /run/sandlock-oci/<id>/state.json.
     Create {
-        /// Unique container identifier.
+        /// Unique sandbox identifier.
         id: String,
         /// Path to the OCI bundle directory.
         #[arg(short = 'b', long)]
         bundle: PathBuf,
-        /// File descriptor to write the container PID to (optional, for CRI).
+        /// File descriptor to write the sandbox PID to (optional, for CRI).
         #[arg(long = "pid-file")]
         pid_file: Option<PathBuf>,
         /// Console socket path (ignored — sandlock doesn't use PTYs by default).
@@ -61,57 +65,57 @@ enum Command {
         console_socket: Option<PathBuf>,
     },
 
-    /// Start a previously created container.
+    /// Start a previously created sandbox.
     Start {
-        /// Container identifier.
+        /// Sandbox identifier.
         id: String,
     },
 
-    /// Output the state of a container as JSON.
+    /// Output the state of a sandbox as JSON.
     State {
-        /// Container identifier.
+        /// Sandbox identifier.
         id: String,
     },
 
-    /// Send a signal to a container's init process.
+    /// Send a signal to a sandbox's init process.
     Kill {
-        /// Container identifier.
+        /// Sandbox identifier.
         id: String,
         /// Signal name or number (e.g. SIGTERM or 15).
         #[arg(default_value = "SIGTERM")]
         signal: String,
-        /// Send signal to all processes in the container (not just init).
+        /// Send signal to all processes in the sandbox (not just init).
         #[arg(short, long)]
         all: bool,
     },
 
-    /// Delete a container and its state.
+    /// Delete a sandbox and its state.
     Delete {
-        /// Container identifier.
+        /// Sandbox identifier.
         id: String,
-        /// Force deletion even if the container is still running.
+        /// Force deletion even if the sandbox is still running.
         #[arg(short, long)]
         force: bool,
     },
 
-    /// List all containers managed by sandlock-oci.
+    /// List all sandboxes managed by sandlock-oci.
     List,
 
     /// Check kernel feature support (delegates to sandlock-core checks).
     Check,
 
-    /// Execute a process inside a running container.
+    /// Execute a process inside a running sandbox.
     ///
     /// **Not yet implemented.** Required for `kubectl exec` and exec-based
     /// liveness/readiness probes.  Tracked as a known limitation.
     ///
     /// All arguments are accepted without validation so that containerd/CRI-O
     /// invocations (which pass flags like `--process`, `--detach`, `--pid-file`
-    /// *before* the container-id) parse cleanly and receive a clear error.
+    /// *before* the sandbox-id) parse cleanly and receive a clear error.
     Exec {
         /// All exec arguments captured as-is (id, flags, command).
         /// `allow_hyphen_values` + `trailing_var_arg` ensure that runc-style
-        /// flags preceding the container-id do not trigger an "unexpected
+        /// flags preceding the sandbox-id do not trigger an "unexpected
         /// argument" error.
         #[arg(num_args = 0.., trailing_var_arg = true, allow_hyphen_values = true)]
         _args: Vec<String>,
@@ -121,6 +125,10 @@ enum Command {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // Resolve the state-dir root once, before any state I/O or fork, so the
+    // supervisor child inherits the same location.
+    state::init_state_dir(cli.root.as_deref().and_then(|p| p.to_str()));
+
     match cli.command {
         Command::Create { id, bundle, pid_file, console_socket: _ } => {
             cmd_create(&id, &bundle, pid_file.as_deref())?;
@@ -129,9 +137,9 @@ fn main() -> Result<()> {
             cmd_start(&id)?;
         }
         Command::State { id } => {
-            let mut state = ContainerState::load(&id)
-                .with_context(|| format!("no such container: {}", id))?;
-            // Reconcile: if we believe the container is running but the process
+            let mut state = SandboxState::load(&id)
+                .with_context(|| format!("no such sandbox: {}", id))?;
+            // Reconcile: if we believe the sandbox is running but the process
             // is gone (killed out-of-band), transition to stopped so callers
             // see the current truth rather than stale state.
             if state.status == Status::Running && !state.is_alive() {
@@ -147,13 +155,13 @@ fn main() -> Result<()> {
             cmd_delete(&id, force)?;
         }
         Command::List => {
-            let ids = state::list_containers()?;
+            let ids = state::list_sandboxes()?;
             if ids.is_empty() {
-                println!("No sandlock-oci containers.");
+                println!("No sandlock-oci sandboxes.");
             } else {
                 println!("{:<40} {:<10} {}", "ID", "STATUS", "PID");
                 for id in ids {
-                    if let Ok(s) = ContainerState::load(&id) {
+                    if let Ok(s) = SandboxState::load(&id) {
                         println!("{:<40} {:<10} {}", s.id, s.status, s.pid);
                     }
                 }
@@ -199,13 +207,21 @@ fn main() -> Result<()> {
 /// 4. Fork a Supervisor (double-fork daemon) which forks the Child.
 /// 5. Child is SIGSTOP'd; supervisor writes PID to CLI via pipe (no sleep/race).
 fn cmd_create(id: &str, bundle: &PathBuf, pid_file: Option<&std::path::Path>) -> Result<()> {
+    // OCI requires the sandbox ID to be unique within the runtime root.
+    // Reject a re-used ID up front rather than overwriting the existing
+    // sandbox's state and orphaning its supervisor + parked child.  The
+    // caller must `delete` the old sandbox first.
+    if SandboxState::load(id).is_ok() {
+        bail!("sandbox {} already exists", id);
+    }
+
     let bundle = bundle
         .canonicalize()
         .with_context(|| format!("bundle path {:?} does not exist", bundle))?;
 
     // Load and validate spec
     let spec = spec::load_spec(&bundle)?;
-    let policy = spec::spec_to_policy(&spec, &bundle)?;
+    let policy = spec::spec_to_policy(&spec, &bundle, id)?;
 
     // Extract the command from the spec — OCI requires non-empty args
     let cmd_args: Vec<String> = spec
@@ -215,13 +231,13 @@ fn cmd_create(id: &str, bundle: &PathBuf, pid_file: Option<&std::path::Path>) ->
         .filter(|args| !args.is_empty())
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "OCI spec process.args is empty; cannot create container without a command"
+                "OCI spec process.args is empty; cannot create sandbox without a command"
             )
         })?;
 
     // Create initial state
-    let state = ContainerState::new(id, &bundle, spec.version());
-    state.save().with_context(|| format!("save state for container {}", id))?;
+    let state = SandboxState::new(id, &bundle, spec.version());
+    state.save().with_context(|| format!("save state for sandbox {}", id))?;
 
     // ── Pipe for synchronous PID notification ────────────────────────────────
     // Supervisor writes the child PID here immediately after forking, so the
@@ -275,11 +291,17 @@ fn cmd_create(id: &str, bundle: &PathBuf, pid_file: Option<&std::path::Path>) ->
         // Close the read end (inherited from intermediate, not needed here)
         unsafe { libc::close(read_fd); }
 
+        // Detach the daemon's working directory from the caller's so we don't
+        // pin a filesystem the caller may later want to unmount.  The
+        // sandbox's own cwd comes from the OCI spec via the sandbox policy,
+        // independent of the supervisor's cwd.
+        unsafe { libc::chdir(b"/\0".as_ptr() as *const libc::c_char); }
+
         // Redirect only stdin to /dev/null — the supervisor daemon doesn't
         // need input.  stdout/stderr are intentionally *not* redirected:
-        // containerd/CRI-O wire the runtime's stdio to the container's log
+        // containerd/CRI-O wire the runtime's stdio to the sandbox's log
         // FIFOs, so fds 1 and 2 must be passed through to the child process
-        // so that container output reaches `kubectl logs`.
+        // so that sandbox output reaches `kubectl logs`.
         unsafe {
             let devnull = libc::open(
                 b"/dev/null\0".as_ptr() as *const libc::c_char,
@@ -312,8 +334,8 @@ fn cmd_create(id: &str, bundle: &PathBuf, pid_file: Option<&std::path::Path>) ->
     // Read the supervisor's response from the pipe.
     //
     // Protocol: supervisor writes one of:
-    //   `OK <pid>\n`   — sandbox created, <pid> is the container's init PID
-    //   `ERR <msg>\n`  — setup failed; the container was never created
+    //   `OK <pid>\n`   — sandbox created, <pid> is the sandbox's init PID
+    //   `ERR <msg>\n`  — setup failed; the sandbox was never created
     //   (EOF)          — supervisor crashed before writing; treated as error
     let child_pid = {
         let mut buf = [0u8; 512];
@@ -330,7 +352,7 @@ fn cmd_create(id: &str, bundle: &PathBuf, pid_file: Option<&std::path::Path>) ->
             rest.parse::<i32>()
                 .with_context(|| format!("invalid PID in supervisor response: {:?}", response))?
         } else if let Some(msg) = response.strip_prefix("ERR ") {
-            bail!("container create failed: {}", msg);
+            bail!("sandbox create failed: {}", msg);
         } else {
             bail!("unexpected supervisor response: {:?}", response);
         }
@@ -338,7 +360,7 @@ fn cmd_create(id: &str, bundle: &PathBuf, pid_file: Option<&std::path::Path>) ->
 
     // Update the state file with the actual PID.
     {
-        let mut state = ContainerState::load(id)?;
+        let mut state = SandboxState::load(id)?;
         state.set_created(child_pid);
         state.save()?;
     }
@@ -356,15 +378,15 @@ fn cmd_create(id: &str, bundle: &PathBuf, pid_file: Option<&std::path::Path>) ->
 ///
 /// Signals the Supervisor to release the paused child (SIGCONT → execve).
 fn cmd_start(id: &str) -> Result<()> {
-    // Verify the container exists and is in Created state.
-    let state = ContainerState::load(id)
-        .with_context(|| format!("no such container: {}", id))?;
+    // Verify the sandbox exists and is in Created state.
+    let state = SandboxState::load(id)
+        .with_context(|| format!("no such sandbox: {}", id))?;
 
     match state.status {
         Status::Created => {} // expected
-        Status::Creating => bail!("container {} is still being created", id),
-        Status::Running => bail!("container {} is already running", id),
-        Status::Stopped => bail!("container {} has already stopped", id),
+        Status::Creating => bail!("sandbox {} is still being created", id),
+        Status::Running => bail!("sandbox {} is already running", id),
+        Status::Stopped => bail!("sandbox {} has already stopped", id),
     }
 
     // Send Start command to supervisor.
@@ -377,14 +399,14 @@ fn cmd_start(id: &str) -> Result<()> {
 
 /// `sandlock-oci kill <id> <signal>`
 ///
-/// Forwards a signal to the container's init process.
+/// Forwards a signal to the sandbox's init process.
 fn cmd_kill(id: &str, signal: &str, all: bool) -> Result<()> {
-    let state = ContainerState::load(id)
-        .with_context(|| format!("no such container: {}", id))?;
+    let state = SandboxState::load(id)
+        .with_context(|| format!("no such sandbox: {}", id))?;
 
     if state.pid <= 0 {
         bail!(
-            "container {} has no PID (status: {})",
+            "sandbox {} has no PID (status: {})",
             id,
             state.status
         );
@@ -411,15 +433,15 @@ fn cmd_kill(id: &str, signal: &str, all: bool) -> Result<()> {
 
 /// `sandlock-oci delete <id>`
 ///
-/// Kills the container (if running) and removes the state directory.
+/// Kills the sandbox (if running) and removes the state directory.
 fn cmd_delete(id: &str, force: bool) -> Result<()> {
-    let state = match ContainerState::load(id) {
+    let state = match SandboxState::load(id) {
         Ok(s) => s,
         Err(_) => return Ok(()),
     };
 
     if state.status == Status::Running && !force {
-        bail!("container {} is still running; use --force or kill it first", id);
+        bail!("sandbox {} is still running; use --force or kill it first", id);
     }
 
     // If the supervisor is blocked waiting for `start`, send Shutdown so it
@@ -429,7 +451,7 @@ fn cmd_delete(id: &str, force: bool) -> Result<()> {
         let _ = supervisor::send_command(id, supervisor::SupervisorCmd::Shutdown);
     }
 
-    // Kill the container process if it's still alive (Running + force, or any
+    // Kill the sandbox process if it's still alive (Running + force, or any
     // state where the child is alive).
     if state.pid > 0 && state.is_alive() {
         unsafe { libc::killpg(state.pid, libc::SIGKILL) };

@@ -64,6 +64,7 @@ jobs:
         run: |
           mkdir -p dist
           cp target/${{ matrix.target }}/release/sandlock dist/ 2>/dev/null || true
+          cp target/${{ matrix.target }}/release/sandlock-oci dist/ 2>/dev/null || true
           cp target/${{ matrix.target }}/release/libsandlock_ffi.so dist/ 2>/dev/null || true
           tar -czf sandlock-${{ matrix.target }}.tar.gz -C dist .
 
@@ -176,10 +177,13 @@ jobs:
       - name: Publish crates
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        # Order matters: dependents publish after their dependencies. core
+        # goes first; oci depends on core, so it follows.
         run: |
           cargo publish -p sandlock-core
           cargo publish -p sandlock-ffi
           cargo publish -p sandlock-cli
+          cargo publish -p sandlock-oci
 
   # Publish Python package to PyPI
   publish-pypi:

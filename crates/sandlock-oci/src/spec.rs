@@ -39,8 +39,8 @@ pub fn load_spec(bundle: &Path) -> Result<Spec> {
 ///   `pids.limit` → `max_processes`.
 /// - **Process**: `process.cwd` → `cwd`, environment forwarded.
 /// - **Namespaces**: Ignored — sandlock avoids namespaces by design.
-pub fn spec_to_policy(spec: &Spec, bundle: &Path) -> Result<OciPolicy> {
-    let policy = OciPolicy::from_spec(spec, bundle)
+pub fn spec_to_policy(spec: &Spec, bundle: &Path, id: &str) -> Result<OciPolicy> {
+    let policy = OciPolicy::from_spec(spec, bundle, id)
         .with_context(|| "failed to map OCI spec to sandlock policy")?;
     Ok(policy)
 }
@@ -89,7 +89,7 @@ mod tests {
         fs::create_dir_all(bundle.join("rootfs")).unwrap();
 
         let spec = minimal_spec();
-        let policy = spec_to_policy(&spec, bundle).unwrap();
+        let policy = spec_to_policy(&spec, bundle, "test").unwrap();
         assert_eq!(policy.cwd.as_deref(), Some(std::path::Path::new("/app")));
     }
 
@@ -100,7 +100,7 @@ mod tests {
         fs::create_dir_all(bundle.join("rootfs")).unwrap();
 
         let spec = minimal_spec();
-        let policy = spec_to_policy(&spec, bundle).unwrap();
+        let policy = spec_to_policy(&spec, bundle, "test").unwrap();
         assert!(policy.env.contains_key("PATH"));
     }
 
@@ -111,7 +111,7 @@ mod tests {
         fs::create_dir_all(bundle.join("rootfs")).unwrap();
 
         let spec = minimal_spec();
-        let policy = spec_to_policy(&spec, bundle).unwrap();
+        let policy = spec_to_policy(&spec, bundle, "test").unwrap();
         assert!(policy.rootfs.is_some());
         assert!(policy.rootfs.as_ref().unwrap().ends_with("rootfs"));
     }

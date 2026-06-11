@@ -1,34 +1,81 @@
-//! Persistent state management for OCI container lifecycle.
+//! Persistent state management for the OCI container lifecycle.
 //!
-//! Implements Phase 2: state JSON stored at `/run/sandlock-oci/<id>/state.json`.
+//! State JSON is stored at `<root>/<id>/state.json`, where `<root>` is the
+//! `--root` directory (when given), `$XDG_RUNTIME_DIR/sandlock-oci` for
+//! unprivileged users, or `/run/sandlock-oci` for root. See [`state_dir`].
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Default state directory root — matches the OCI runtime spec.
+/// System-wide state directory root, used when running as root.
 ///
-/// Can be overridden at runtime with the `SANDLOCK_OCI_STATE_DIR` environment
-/// variable (useful for integration tests that don't run as root).
+/// Matches the runc/containerd convention. Unprivileged users default to a
+/// per-user runtime directory instead (see [`resolve_state_dir`]), keeping
+/// sandlock usable without root.
 pub const STATE_DIR: &str = "/run/sandlock-oci";
 
-/// Return the effective state directory, respecting the env override.
+/// Process-wide state-dir root, resolved once in `main` via [`init_state_dir`].
+///
+/// Set before any `fork`, so the supervisor child inherits the same value.
+static STATE_DIR_ROOT: OnceLock<String> = OnceLock::new();
+
+/// Resolve and cache the state directory root for this process.
+///
+/// Precedence (highest first):
+/// 1. the explicit `--root` CLI flag (`root_flag`), the OCI-standard knob
+///    that containerd/CRI-O pass,
+/// 2. `$XDG_RUNTIME_DIR/sandlock-oci` for unprivileged users,
+/// 3. `/run/sandlock-oci` for root (or when no per-user runtime dir exists).
+///
+/// Call once, early in `main`, before any state I/O or `fork`.
+pub fn init_state_dir(root_flag: Option<&str>) {
+    let _ = STATE_DIR_ROOT.set(resolve_state_dir(root_flag));
+}
+
+/// Compute the state directory root without caching. See [`init_state_dir`]
+/// for the precedence rules.
+fn resolve_state_dir(root_flag: Option<&str>) -> String {
+    if let Some(root) = root_flag {
+        return root.to_string();
+    }
+    // Unprivileged default: a per-user, user-owned runtime dir, mirroring
+    // rootless runc/crun/podman. This is what keeps sandlock-oci runnable
+    // without root, which is the project's core design goal.
+    if unsafe { libc::geteuid() } != 0 {
+        if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
+            if !xdg.is_empty() {
+                return format!("{}/sandlock-oci", xdg);
+            }
+        }
+    }
+    STATE_DIR.to_string()
+}
+
+/// Return the effective state directory root.
+///
+/// Returns the value cached by [`init_state_dir`] when set; otherwise resolves
+/// the default (library and test callers that never call `init_state_dir`).
 pub fn state_dir() -> String {
-    std::env::var("SANDLOCK_OCI_STATE_DIR").unwrap_or_else(|_| STATE_DIR.to_string())
+    if let Some(dir) = STATE_DIR_ROOT.get() {
+        return dir.clone();
+    }
+    resolve_state_dir(None)
 }
 
 /// OCI container status as defined by the runtime spec.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Status {
-    /// Transient state while the supervisor is setting up the container.
+    /// Transient state while the supervisor is setting up the sandbox.
     Creating,
-    /// Container has been created (child parked) but not yet started.
+    /// Sandbox has been created (child parked) but not yet started.
     Created,
-    /// Container is currently running.
+    /// Sandbox is currently running.
     Running,
-    /// Container process has exited.
+    /// Sandbox process has exited.
     Stopped,
 }
 
@@ -43,34 +90,34 @@ impl std::fmt::Display for Status {
     }
 }
 
-/// The on-disk state blob for a sandlock-oci container.
+/// The on-disk state blob for a sandlock-oci sandbox.
 ///
 /// Fields match the OCI Runtime State specification.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ContainerState {
+pub struct SandboxState {
     /// OCI spec version.
     #[serde(rename = "ociVersion")]
     pub oci_version: String,
-    /// Container identifier (unique on this host).
+    /// Sandbox identifier (unique on this host).
     pub id: String,
     /// Current lifecycle status.
     pub status: Status,
-    /// PID of the container's init process (0 = not yet started).
+    /// PID of the sandbox's init process (0 = not yet started).
     pub pid: i32,
     /// Absolute path to the bundle directory.
     pub bundle: PathBuf,
-    /// Unix timestamp (seconds) when the container was created.
+    /// Unix timestamp (seconds) when the sandbox was created.
     pub created: u64,
     /// Optional annotations from the OCI spec.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub annotations: std::collections::HashMap<String, String>,
-    /// Exit code or signal that terminated the container.
-    /// `None` while the container is Created or Running.
+    /// Exit code or signal that terminated the sandbox.
+    /// `None` while the sandbox is Created or Running.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_info: Option<ExitInfo>,
 }
 
-/// Captures how the container's init process exited.
+/// Captures how the sandbox's init process exited.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExitInfo {
     /// Exit code if the process exited normally.
@@ -79,36 +126,14 @@ pub struct ExitInfo {
     pub signal: Option<i32>,
 }
 
-impl ExitInfo {
-    /// Create from a raw waitpid status value.
-    pub fn from_status(status: i32) -> Self {
-        if libc::WIFEXITED(status) {
-            ExitInfo {
-                code: Some(unsafe { libc::WEXITSTATUS(status) }),
-                signal: None,
-            }
-        } else if libc::WIFSIGNALED(status) {
-            ExitInfo {
-                code: None,
-                signal: Some(unsafe { libc::WTERMSIG(status) }),
-            }
-        } else {
-            ExitInfo {
-                code: None,
-                signal: None,
-            }
-        }
-    }
-}
-
-impl ContainerState {
+impl SandboxState {
     /// Create a new state in the `Created` status.
     pub fn new(id: &str, bundle: &Path, oci_version: &str) -> Self {
         let created = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        ContainerState {
+        SandboxState {
             oci_version: oci_version.to_string(),
             id: id.to_string(),
             status: Status::Creating,
@@ -120,7 +145,7 @@ impl ContainerState {
         }
     }
 
-    /// Path to the state directory for this container.
+    /// Path to the state directory for this sandbox.
     pub fn state_dir(&self) -> PathBuf {
         Path::new(&state_dir()).join(&self.id)
     }
@@ -136,7 +161,7 @@ impl ContainerState {
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("create state dir {:?}", dir))?;
         let data = serde_json::to_string_pretty(self)
-            .context("serialize container state")?;
+            .context("serialize sandbox state")?;
         std::fs::write(self.state_file(), data)
             .with_context(|| format!("write state to {:?}", self.state_file()))
     }
@@ -160,13 +185,13 @@ impl ContainerState {
         Ok(())
     }
 
-    /// Record the PID in Created state (SIGSTOP'd child).
+    /// Transition `Creating` -> `Created`, recording the parked child's init PID.
     pub fn set_created(&mut self, pid: i32) {
         self.status = Status::Created;
         self.pid = pid;
     }
 
-    /// Mark the container as running.
+    /// Mark the sandbox as running.
     pub fn set_running(&mut self) {
         self.status = Status::Running;
     }
@@ -177,7 +202,7 @@ impl ContainerState {
         self.exit_info = exit_info;
     }
 
-    /// Returns true if the container process is still alive.
+    /// Returns true if the sandbox process is still alive.
     pub fn is_alive(&self) -> bool {
         if self.pid <= 0 {
             return false;
@@ -187,8 +212,8 @@ impl ContainerState {
     }
 }
 
-/// List all container IDs currently tracked in STATE_DIR.
-pub fn list_containers() -> Result<Vec<String>> {
+/// List all sandbox IDs currently tracked in STATE_DIR.
+pub fn list_sandboxes() -> Result<Vec<String>> {
     let dir_str = state_dir();
     let dir = Path::new(&dir_str);
     if !dir.exists() {
@@ -213,8 +238,8 @@ mod tests {
     use super::*;
     use std::env;
 
-    fn _make_state(id: &str) -> ContainerState {
-        ContainerState::new(id, Path::new("/tmp"), "1.0.2")
+    fn _make_state(id: &str) -> SandboxState {
+        SandboxState::new(id, Path::new("/tmp"), "1.0.2")
     }
 
     #[test]
@@ -226,9 +251,9 @@ mod tests {
 
     #[test]
     fn state_roundtrip_json() {
-        let state = ContainerState::new("test-ctr", Path::new("/tmp"), "1.0.2");
+        let state = SandboxState::new("test-ctr", Path::new("/tmp"), "1.0.2");
         let json = serde_json::to_string(&state).unwrap();
-        let loaded: ContainerState = serde_json::from_str(&json).unwrap();
+        let loaded: SandboxState = serde_json::from_str(&json).unwrap();
         assert_eq!(loaded.id, "test-ctr");
         // new() begins in Creating; set_created() transitions to Created.
         assert_eq!(loaded.status, Status::Creating);
@@ -236,7 +261,7 @@ mod tests {
 
     #[test]
     fn is_alive_returns_false_for_zero_pid() {
-        let state = ContainerState::new("dead-ctr", Path::new("/tmp"), "1.0.2");
+        let state = SandboxState::new("dead-ctr", Path::new("/tmp"), "1.0.2");
         assert!(!state.is_alive());
     }
 
@@ -272,23 +297,16 @@ mod tests {
     }
 
     #[test]
-    fn exit_info_from_status_exited() {
-        let info = ExitInfo::from_status(0 << 8); // exit code 0
-        assert_eq!(info.code, Some(0));
-        assert!(info.signal.is_none());
-    }
+    fn state_dir_resolution_precedence() {
+        // The --root flag takes precedence over the computed default.
+        assert_eq!(resolve_state_dir(Some("/custom/root")), "/custom/root");
 
-    #[test]
-    fn exit_info_from_status_signaled() {
-        let info = ExitInfo::from_status(libc::SIGKILL); // killed by SIGKILL
-        assert!(info.code.is_none());
-        assert_eq!(info.signal, Some(libc::SIGKILL));
-    }
-
-    #[test]
-    fn state_dir_respects_env_override() {
-        env::set_var("SANDLOCK_OCI_STATE_DIR", "/tmp/sandlock-test-dir");
-        assert_eq!(state_dir(), "/tmp/sandlock-test-dir");
-        env::remove_var("SANDLOCK_OCI_STATE_DIR");
+        // Unprivileged users default to a per-user runtime dir; root falls
+        // back to the system-wide STATE_DIR.
+        if unsafe { libc::geteuid() } != 0 {
+            env::set_var("XDG_RUNTIME_DIR", "/run/user/4242");
+            assert_eq!(resolve_state_dir(None), "/run/user/4242/sandlock-oci");
+            env::remove_var("XDG_RUNTIME_DIR");
+        }
     }
 }
