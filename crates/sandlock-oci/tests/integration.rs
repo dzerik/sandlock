@@ -5,28 +5,20 @@
 //!
 //! To run: `cargo test -p sandlock-oci -- --test-threads=1`
 //!
-//! **Note**: these tests require root or a kernel with Landlock v1+ support.
-//! They are skipped automatically when not running as root.
+//! **Note**: the lifecycle commands that fork a sandboxed child need root or a
+//! Landlock-capable kernel, but the smoke tests here only exercise argument
+//! handling and error paths, so they run unprivileged (including in CI).
 
 use std::fs;
 use std::path::Path;
 use std::process::Command;
 use tempfile::tempdir;
 
-/// Build the binary path for sandlock-oci.
-fn oci_bin() -> std::path::PathBuf {
-    let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-    // Use the workspace target directory.
-    let workspace_root = Path::new(&manifest)
-        .parent() // crates/
-        .unwrap()
-        .parent() // workspace root
-        .unwrap()
-        .to_path_buf();
-    workspace_root
-        .join("target")
-        .join("debug")
-        .join("sandlock-oci")
+/// Path to the sandlock-oci binary under test. Cargo builds it before running
+/// the integration target and exposes its path here, so this resolves to the
+/// correct profile (debug or release) automatically.
+fn oci_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_sandlock-oci")
 }
 
 /// Create a minimal OCI bundle with a rootfs and config.json.
@@ -135,10 +127,6 @@ fn run_oci(args: &[&str]) -> std::process::Output {
 
 #[test]
 fn oci_check_exits_zero() {
-    if !oci_bin().exists() {
-        eprintln!("sandlock-oci binary not built — skipping");
-        return;
-    }
     let out = run_oci(&["check"]);
     assert!(
         out.status.success(),
@@ -149,20 +137,12 @@ fn oci_check_exits_zero() {
 
 #[test]
 fn oci_state_unknown_sandbox_errors() {
-    if !oci_bin().exists() {
-        eprintln!("sandlock-oci binary not built — skipping");
-        return;
-    }
     let out = run_oci(&["state", "this-does-not-exist-xyz-12345"]);
     assert!(!out.status.success(), "expected failure for unknown sandbox");
 }
 
 #[test]
 fn oci_list_no_sandboxes() {
-    if !oci_bin().exists() {
-        eprintln!("sandlock-oci binary not built — skipping");
-        return;
-    }
     // List should succeed even with no state dir.
     let out = run_oci(&["list"]);
     assert!(out.status.success());
@@ -170,20 +150,12 @@ fn oci_list_no_sandboxes() {
 
 #[test]
 fn oci_kill_unknown_sandbox_errors() {
-    if !oci_bin().exists() {
-        eprintln!("sandlock-oci binary not built — skipping");
-        return;
-    }
     let out = run_oci(&["kill", "no-such-sandbox-xyz", "SIGTERM"]);
     assert!(!out.status.success());
 }
 
 #[test]
 fn oci_delete_nonexistent_is_ok() {
-    if !oci_bin().exists() {
-        eprintln!("sandlock-oci binary not built — skipping");
-        return;
-    }
     // Deleting a sandbox that doesn't exist should not fail.
     let out = run_oci(&["delete", "ghost-sandbox-xyz-99"]);
     assert!(out.status.success());
@@ -191,10 +163,6 @@ fn oci_delete_nonexistent_is_ok() {
 
 #[test]
 fn oci_create_rejects_duplicate_id() {
-    if !oci_bin().exists() {
-        eprintln!("sandlock-oci binary not built — skipping");
-        return;
-    }
     // The uniqueness guard fires before any fork, so a pre-existing state.json
     // under --root is enough to trigger it — no rootfs or Landlock needed.
     let root = tempdir().unwrap();
