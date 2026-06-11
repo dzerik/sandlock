@@ -329,12 +329,19 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
     let real_uid = unsafe { libc::getuid() };
     let real_gid = unsafe { libc::getgid() };
 
-    // 5b. User namespace for --uid mapping.
-    if let Some(target_uid) = sandbox.uid {
-        if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
-            fail!("unshare(CLONE_NEWUSER)");
+    // 5b. User namespace for --user (run-as uid/gid) mapping.
+    //
+    // Skip entirely when the requested identity already matches the current
+    // uid/gid: there's no point unsharing a user namespace to map an identity
+    // the process already has, and skipping avoids imposing an
+    // unprivileged-userns requirement on callers that don't need a remap.
+    if let Some(run_as) = sandbox.user {
+        if run_as.uid != real_uid || run_as.gid != real_gid {
+            if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
+                fail!("unshare(CLONE_NEWUSER)");
+            }
+            write_id_maps(real_uid, real_gid, run_as.uid, run_as.gid);
         }
-        write_id_maps(real_uid, real_gid, target_uid, target_uid);
     }
 
     // 6. Optional: change working directory
