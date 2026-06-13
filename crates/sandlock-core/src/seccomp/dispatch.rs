@@ -276,14 +276,14 @@ pub(crate) fn build_dispatch_table(
     // ------------------------------------------------------------------
     for nr in arch::fork_like_syscalls() {
         let policy_for_fork = Arc::clone(policy);
-        let resource_for_fork = Arc::clone(resource);
+        let ctx_for_fork = Arc::clone(ctx);
         table.register(nr, move |cx: &HandlerCtx| {
             let notif = cx.notif;
             let notif_fd = cx.notif_fd;
             let policy = Arc::clone(&policy_for_fork);
-            let resource = Arc::clone(&resource_for_fork);
+            let ctx = Arc::clone(&ctx_for_fork);
             async move {
-                crate::resource::handle_fork(&notif, notif_fd, &resource, &policy).await
+                crate::resource::handle_fork(&notif, notif_fd, &ctx, &policy).await
             }
         });
     }

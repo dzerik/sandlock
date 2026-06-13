@@ -85,7 +85,7 @@ fn is_thread_create(notif: &SeccompNotif, notif_fd: RawFd) -> bool {
 pub(crate) async fn handle_fork(
     notif: &SeccompNotif,
     notif_fd: RawFd,
-    resource: &Arc<Mutex<ResourceState>>,
+    ctx: &Arc<SupervisorCtx>,
     _policy: &NotifPolicy,
 ) -> NotifAction {
     let nr = notif.data.nr as i64;
@@ -102,7 +102,18 @@ pub(crate) async fn handle_fork(
         return NotifAction::Continue;
     }
 
-    let mut rs = resource.lock().await;
+    // Effective process limit. A policy_fn can tighten the static limit at
+    // runtime (`restrict_max_processes`), so read the live value when a
+    // callback is active; otherwise use the static one. (Lock policy_fn before
+    // the resource lock to keep a consistent order.)
+    let live_max = {
+        let pfs = ctx.policy_fn.lock().await;
+        pfs.live_policy
+            .as_ref()
+            .and_then(|lp| lp.read().ok().map(|l| l.max_processes))
+    };
+
+    let mut rs = ctx.resource.lock().await;
 
     // Checkpoint/freeze: hold the fork notification.
     if rs.hold_forks {
@@ -111,7 +122,8 @@ pub(crate) async fn handle_fork(
     }
 
     // Enforce concurrent process limit.
-    if rs.proc_count >= rs.max_processes {
+    let limit = live_max.unwrap_or(rs.max_processes);
+    if rs.proc_count >= limit {
         return NotifAction::Errno(EAGAIN);
     }
 
