@@ -518,7 +518,18 @@ pub(crate) async fn handle_memory(
 ) -> NotifAction {
     let nr = notif.data.nr as i64;
     let args = &notif.data.args;
-    let limit = policy.max_memory_bytes;
+    // Effective limit. A policy_fn can tighten the static ceiling at runtime
+    // (`restrict_max_memory`), so read the live value when a callback is
+    // active; otherwise use the static limit. The live value is seeded from
+    // the static `max_memory` ceiling, and this handler is only registered
+    // when that ceiling exists, so it is never the 0/unlimited sentinel.
+    let limit = {
+        let pfs = ctx.policy_fn.lock().await;
+        pfs.live_policy
+            .as_ref()
+            .and_then(|lp| lp.read().ok().map(|l| l.max_memory_bytes))
+            .unwrap_or(policy.max_memory_bytes)
+    };
 
     let mut st = ctx.resource.lock().await;
 

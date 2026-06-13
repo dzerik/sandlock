@@ -188,15 +188,41 @@ class TestPolicyFnRestrict:
         assert "denied=ERR111" in out, out        # non-listed IP refused
 
     def test_restrict_max_memory(self):
-        """Restrict memory limit dynamically."""
-        def on_event(event, ctx):
-            if event.syscall in ("execve", "execveat"):
-                ctx.restrict_max_memory(32 * 1024 * 1024)
+        """restrict_max_memory tightens the static ceiling and is enforced.
 
-        result = _policy(policy_fn=on_event).run(
-            ["echo", "ok"]
+        The old version restricted memory then ran ``echo`` and asserted
+        nothing, so it never exercised the limit. dynamic restriction works by
+        tightening a static ``max_memory`` ceiling: set a 256 MiB ceiling,
+        restrict to 64 MiB, then allocate 128 MiB. With enforcement the process
+        is killed; the un-restricted ceiling (control) allows the same 128 MiB,
+        proving the kill is due to the dynamic restriction, not the ceiling.
+        """
+        alloc_128mb = (
+            "print('STARTED', flush=True)\n"
+            "b = bytearray(128 * 1024 * 1024)\n"
+            "b[::4096] = b'\\x01' * (len(b) // 4096)\n"   # commit the pages
+            "print('ALLOC_OK')\n"
         )
-        # Should still run (echo uses very little memory)
+
+        def restrict_to_64mb(event, ctx):
+            if event.syscall in ("execve", "execveat"):
+                ctx.restrict_max_memory(64 * 1024 * 1024)
+            return 0
+
+        # Restricted: 128 MiB exceeds the tightened 64 MiB limit -> killed.
+        restricted = _policy(max_memory="256M", policy_fn=restrict_to_64mb).run(
+            [sys.executable, "-c", alloc_128mb], timeout=15
+        )
+        assert b"STARTED" in restricted.stdout, restricted.stdout
+        assert b"ALLOC_OK" not in restricted.stdout, restricted.stdout
+        assert not restricted.success, "128 MiB must exceed the 64 MiB dynamic limit"
+
+        # Control: same 128 MiB under the un-restricted 256 MiB ceiling -> OK.
+        baseline = _policy(max_memory="256M").run(
+            [sys.executable, "-c", alloc_128mb], timeout=15
+        )
+        assert b"ALLOC_OK" in baseline.stdout, baseline.stdout
+        assert baseline.success, baseline.error
 
     def test_restrict_max_processes(self):
         """Restrict process limit dynamically."""
