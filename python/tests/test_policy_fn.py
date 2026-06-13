@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
+import socket
 import sys
 import threading
 
@@ -22,6 +24,25 @@ def _policy(**overrides):
     defaults = {"fs_readable": _PYTHON_READABLE, "fs_writable": ["/tmp"]}
     defaults.update(overrides)
     return Sandbox(**defaults)
+
+
+@contextlib.contextmanager
+def _loopback_listener(host="127.0.0.1"):
+    """Yield ``(host, port)`` for a live TCP listener on an ephemeral port.
+
+    A *live* listener is the baseline that makes a network deny-test
+    meaningful: a connect to it succeeds when allowed, so a failure can only
+    mean the sandbox denied it — as opposed to connecting to a dead port,
+    which fails with ``ECONNREFUSED`` regardless of any enforcement.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind((host, 0))
+    s.listen(8)
+    try:
+        yield host, s.getsockname()[1]
+    finally:
+        s.close()
 
 
 # ---------------------------------------------------------------------------
@@ -217,18 +238,35 @@ class TestPolicyFnVerdict:
         assert not result.success, "unrecognized verdict must fail closed (deny)"
 
     def test_deny_returns_true(self):
-        """Return True to deny with EPERM (backward compat)."""
-        def on_event(event, ctx):
-            if event.syscall == "connect":
-                return True
-            return False
+        """Returning True denies connect with EPERM — and the process keeps running.
 
-        result = _policy(net_allow=["127.0.0.1:443"], policy_fn=on_event).run(["python3", "-c",
-            "import socket; s=socket.socket(); s.settimeout(0.5); "
-            "s.connect_ex(('127.0.0.1', 1)); s.close(); print('ok')"
-        ])
-        # connect was denied but process should still run
-        assert result.success
+        The target is a live listener on an allowlisted port, so without the
+        policy_fn deny the connect would *succeed*. EPERM (errno 1) therefore
+        proves the deny fired, and the trailing marker proves the deny did not
+        kill the process (the backward-compat contract).
+        """
+        def on_event(event, ctx):
+            # True only for connect (deny); allow everything else.
+            return event.syscall == "connect"
+
+        with _loopback_listener() as (host, port):
+            script = (
+                "import socket\n"
+                "s = socket.socket(); s.settimeout(2)\n"
+                "try:\n"
+                f"    s.connect(('{host}', {port})); print('ALLOWED')\n"
+                "except OSError as e: print('ERR', e.errno)\n"
+                "s.close(); print('SURVIVED')\n"
+            )
+            result = _policy(
+                net_allow=[f"{host}:{port}"], policy_fn=on_event
+            ).run([sys.executable, "-c", script])
+
+        out = result.stdout.decode()
+        assert "ALLOWED" not in out, out
+        assert "ERR 1" in out, out          # EPERM from the policy_fn deny
+        assert "SURVIVED" in out, out        # deny must not kill the process
+        assert result.success, result.error
 
     def test_deny_path_dynamic(self):
         """ctx.deny_path blocks file access."""
