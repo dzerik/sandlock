@@ -225,14 +225,44 @@ class TestPolicyFnRestrict:
         assert baseline.success, baseline.error
 
     def test_restrict_max_processes(self):
-        """Restrict process limit dynamically."""
-        def on_event(event, ctx):
+        """restrict_max_processes tightens the concurrent-process limit, enforced.
+
+        The old version restricted the limit then ran ``echo`` and asserted
+        nothing. Restrict to 1 (only the running process), then fork: the fork
+        must be denied with EAGAIN (errno 11). The control run (no restriction)
+        forks successfully, proving the denial is due to the dynamic limit, not
+        the fork itself.
+        """
+        fork_once = (
+            "import os\n"
+            "print('STARTED', flush=True)\n"
+            "try:\n"
+            "    pid = os.fork()\n"
+            "    if pid == 0: os._exit(0)\n"
+            "    os.waitpid(pid, 0); print('FORK_OK')\n"
+            "except OSError as e: print('FORK_DENIED', e.errno)\n"
+        )
+
+        def restrict_to_1(event, ctx):
             if event.syscall in ("execve", "execveat"):
                 ctx.restrict_max_processes(1)
+            return 0
 
-        result = _policy(policy_fn=on_event).run(
-            ["echo", "ok"]
+        restricted = _policy(policy_fn=restrict_to_1).run(
+            [sys.executable, "-c", fork_once], timeout=15
         )
+        out = restricted.stdout.decode()
+        assert restricted.success, restricted.error
+        assert "STARTED" in out, out
+        assert "FORK_OK" not in out, out
+        assert "FORK_DENIED 11" in out, out          # EAGAIN from the limit
+
+        # Control: no restriction -> the same fork succeeds.
+        baseline = _policy(policy_fn=lambda e, ctx: 0).run(
+            [sys.executable, "-c", fork_once], timeout=15
+        )
+        assert baseline.success, baseline.error
+        assert "FORK_OK" in baseline.stdout.decode(), baseline.stdout
 
 
 # ---------------------------------------------------------------------------
