@@ -188,32 +188,37 @@ class TestPolicyFnRestrict:
 
 class TestPolicyFnVerdict:
     def test_deny_with_errno(self):
-        """Return a positive int to deny with that errno."""
-        import errno
-        import tempfile, os
+        """Returning a positive int denies with *that* errno — attributable to policy_fn.
 
-        out = os.path.join(tempfile.gettempdir(), f"sandlock-test-denywith-{os.getpid()}")
+        The previous version connected to 127.0.0.1:1, which is outside the
+        ``net_allow`` allowlist, so Landlock denies it with the same errno 13 —
+        the test passed even if the policy_fn errno path were broken. Target a
+        live listener on an *allowlisted* port instead: Landlock permits it and
+        the listener accepts it, so errno 13 can only come from the policy_fn.
+        """
+        import errno
 
         def on_event(event, ctx):
             if event.syscall == "connect":
                 return errno.EACCES  # 13
             return 0
 
-        result = _policy(net_allow=["127.0.0.1:443"], policy_fn=on_event).run(["python3", "-c",
-            f"import socket\n"
-            f"s = socket.socket(); s.settimeout(0.5)\n"
-            f"try:\n"
-            f"  s.connect(('127.0.0.1', 1))\n"
-            f"  open('{out}', 'w').write('CONNECTED')\n"
-            f"except OSError as e:\n"
-            f"  open('{out}', 'w').write(f'ERR:{{e.errno}}')\n"
-            f"s.close()\n"
-        ])
-        assert result.success
-        with open(out) as f:
-            content = f.read()
-        assert content == "ERR:13", f"expected EACCES (13), got: {content}"
-        os.unlink(out)
+        with _loopback_listener() as (host, port):
+            script = (
+                "import socket\n"
+                "s = socket.socket(); s.settimeout(2)\n"
+                "try:\n"
+                f"    s.connect(('{host}', {port})); print('CONNECTED')\n"
+                "except OSError as e: print('ERR:%d' % e.errno)\n"
+                "s.close()\n"
+            )
+            result = _policy(
+                net_allow=[f"{host}:{port}"], policy_fn=on_event
+            ).run([sys.executable, "-c", script])
+
+        out = result.stdout.decode().strip()
+        assert result.success, result.error
+        assert out == "ERR:13", f"expected policy_fn EACCES (13), got: {out!r}"
 
     def test_audit_allows(self):
         """Return 'audit' or -2 to allow but flag."""
