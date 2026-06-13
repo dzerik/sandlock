@@ -329,9 +329,35 @@ class TestPolicyFnVerdict:
 
 class TestPolicyFnPerPid:
     def test_restrict_pid_network(self):
-        """Per-PID network restriction."""
+        """restrict_pid_network narrows a specific pid's outbound to the listed IPs.
+
+        The old version restricted the pid then ran ``echo ok`` — it never made
+        a network call, so it could not observe any restriction. Mirror
+        test_restrict_network_on_execve with two live loopback listeners, both
+        allowlisted: restricting the exec'd pid to ["127.0.0.1"] must permit the
+        first and refuse the second (errno 111).
+        """
         def on_event(event, ctx):
             if event.syscall in ("execve", "execveat"):
                 ctx.restrict_pid_network(event.pid, ["127.0.0.1"])
 
-        result = _policy(net_allow=["127.0.0.1:443"], policy_fn=on_event).run(["echo", "ok"])
+        with _loopback_listener("127.0.0.1") as (h1, p1), \
+                _loopback_listener("127.0.0.2") as (h2, p2):
+            script = (
+                "import socket\n"
+                "def probe(ip, port):\n"
+                "    s = socket.socket(); s.settimeout(2)\n"
+                "    try:\n"
+                "        s.connect((ip, port)); return 'OK'\n"
+                "    except OSError as e: return 'ERR%d' % e.errno\n"
+                "    finally: s.close()\n"
+                f"print('allowed=' + probe('{h1}', {p1}), 'denied=' + probe('{h2}', {p2}))\n"
+            )
+            result = _policy(
+                net_allow=[f"{h1}:{p1}", f"{h2}:{p2}"], policy_fn=on_event
+            ).run([sys.executable, "-c", script])
+
+        out = result.stdout.decode()
+        assert result.success, result.error
+        assert "allowed=OK" in out, out
+        assert "denied=ERR111" in out, out
