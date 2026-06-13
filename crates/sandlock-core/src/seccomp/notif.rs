@@ -1416,7 +1416,7 @@ async fn handle_notification(
     if matches!(action, NotifAction::Continue)
         && crate::resource::requires_process_creation_tracking(&notif, fd, policy)
     {
-        match crate::resource::prepare_process_creation_tracking(notif.pid as i32).await {
+        match crate::resource::prepare_process_creation_tracking(ctx, notif.pid as i32).await {
             Ok(trace) => {
                 creation_trace = Some(trace);
             }
@@ -1468,7 +1468,7 @@ async fn handle_notification(
 
     if let Some(trace) = creation_trace {
         if send_result.is_ok() {
-            match crate::resource::finish_process_creation_tracking(ctx, trace).await {
+            match crate::resource::finish_process_creation_tracking(trace).await {
                 Ok(true) => {}
                 Ok(false) => {
                     crate::resource::rollback_fork_count(&ctx.resource).await;
