@@ -7,7 +7,7 @@ use crate::error::{SandlockError, SandboxRuntimeError};
 // ptrace helpers -- PTRACE_SEIZE (doesn't auto-SIGSTOP like ATTACH)
 // ---------------------------------------------------------------------------
 
-fn ptrace_seize(pid: i32) -> io::Result<()> {
+pub(crate) fn ptrace_seize(pid: i32) -> io::Result<()> {
     let ret = unsafe {
         libc::ptrace(libc::PTRACE_SEIZE as libc::c_uint, pid, 0, 0)
     };
@@ -29,7 +29,7 @@ fn ptrace_seize(pid: i32) -> io::Result<()> {
     Ok(())
 }
 
-fn ptrace_detach(pid: i32) -> io::Result<()> {
+pub(crate) fn ptrace_detach(pid: i32) -> io::Result<()> {
     let ret = unsafe { libc::ptrace(libc::PTRACE_DETACH, pid, 0, 0) };
     if ret < 0 {
         return Err(io::Error::last_os_error());
@@ -37,7 +37,7 @@ fn ptrace_detach(pid: i32) -> io::Result<()> {
     Ok(())
 }
 
-fn ptrace_getregs(pid: i32) -> io::Result<Vec<u64>> {
+pub(crate) fn ptrace_getregs(pid: i32) -> io::Result<Vec<u64>> {
     #[cfg(target_arch = "x86_64")]
     {
         // user_regs_struct is 27 u64 fields on x86_64 (216 bytes)
