@@ -1,7 +1,6 @@
 use crate::checkpoint::{Checkpoint, FdInfo, MemoryMap, MemorySegment};
 
 /// One planned memory-restore action for a saved region.
-#[allow(dead_code)] // used by the restore path (added in a later change)
 #[derive(Debug)]
 pub(crate) enum RestoreRegion {
     /// mmap MAP_FIXED from `path` at `offset`, prot from `perms`.
@@ -15,7 +14,6 @@ pub(crate) enum RestoreRegion {
 /// fresh process and they must not be overwritten. A region with captured
 /// bytes becomes WriteBytes; otherwise a path-backed region becomes
 /// RemapFromFile. Regions that are neither are left to the kernel/ABI.
-#[allow(dead_code)] // used by the restore path (added in a later change)
 pub(crate) fn build_memory_plan(
     maps: &[MemoryMap],
     data: &[MemorySegment],
@@ -58,7 +56,6 @@ fn is_restorable_file_path(path: &str) -> bool {
 /// list is logged by the caller; those resources fall to the app_state hatch.
 /// memfd, "(deleted)", and pseudo-filesystem (/proc/, /sys/, /dev/) paths start
 /// with '/' but are not transparently reopenable, so they are skipped.
-#[allow(dead_code)] // used by the restore path (added in a later change)
 pub(crate) fn build_fd_plan(fds: &[FdInfo]) -> (Vec<FdInfo>, Vec<String>) {
     let mut restorable = Vec::new();
     let mut skipped = Vec::new();
@@ -72,7 +69,6 @@ pub(crate) fn build_fd_plan(fds: &[FdInfo]) -> (Vec<FdInfo>, Vec<String>) {
     (restorable, skipped)
 }
 
-#[allow(dead_code)] // used by the restore path (added in a later change)
 fn prot_from_perms(perms: &str) -> libc::c_int {
     let mut prot = 0;
     if perms.as_bytes().first() == Some(&b'r') { prot |= libc::PROT_READ; }
@@ -94,9 +90,6 @@ fn prot_from_perms(perms: &str) -> libc::c_int {
 /// Limitation: file-backed regions are restored `MAP_PRIVATE` from the on-disk
 /// file, so a checkpointed `MAP_SHARED` mapping is restored as private
 /// (documented M1 limitation).
-// `restore_into` is only invoked from tests and (later) the OCI restore path
-// (Task 11), so it is dead code in a plain library build.
-#[allow(dead_code)]
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn restore_into(
     pid: i32,
@@ -276,14 +269,38 @@ pub(crate) fn restore_into(
     // child is stopped exactly at the checkpoint's execution point.
     crate::checkpoint::regs::set_fp_regs(pid, &cp.process_state.fpregs)
         .map_err(|e| err(format!("restore set fp regs: {e}")))?;
-    crate::checkpoint::regs::set_gp_regs(pid, &cp.process_state.regs)
+
+    // Re-arm an interrupted, restartable syscall. When the checkpoint was taken
+    // (via PTRACE_INTERRUPT) while the process sat in a syscall, the kernel
+    // aborted it with a restart sentinel in rax (-ERESTARTSYS/-ERESTARTNOINTR/
+    // -ERESTARTNOHAND/-ERESTART_RESTARTBLOCK). At the ptrace stop, rip still
+    // points just PAST the `syscall` instruction (it equals rcx, the return
+    // address the CPU latched when `syscall` executed). The kernel's restart
+    // fixup -- rewind rip onto the 2-byte `syscall` instruction and reload rax
+    // with the original syscall number -- normally runs on the syscall-return /
+    // signal-delivery path, which a plain restore + detach bypasses. Without it,
+    // userspace would resume one instruction past the syscall with the raw
+    // sentinel (e.g. -514) in rax and fault. Apply the fixup ourselves so the
+    // syscall re-executes cleanly with its arguments still in registers (this is
+    // what CRIU does). x86_64 user_regs_struct layout: rax=10, orig_rax=15, rip=16.
+    const RAX: usize = 10;
+    const ORIG_RAX: usize = 15;
+    const RIP: usize = 16;
+    let mut regs = cp.process_state.regs.clone();
+    if let (Some(&rax), Some(&orig_rax)) = (regs.get(RAX), regs.get(ORIG_RAX)) {
+        // ERESTART_RESTARTBLOCK..=ERESTARTSYS == -516..=-512.
+        if (-516..=-512).contains(&(rax as i64)) {
+            regs[RAX] = orig_rax;
+            regs[RIP] = regs[RIP].wrapping_sub(2);
+        }
+    }
+    crate::checkpoint::regs::set_gp_regs(pid, &regs)
         .map_err(|e| err(format!("restore set gp regs: {e}")))?;
 
     Ok(skipped)
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-#[allow(dead_code)]
 pub(crate) fn restore_into(
     _pid: i32,
     _cp: &Checkpoint,
@@ -468,9 +485,23 @@ mod tests {
         );
 
         let read_regs = read_regs.expect("read stub regs");
+        // `restore_into` restores registers verbatim EXCEPT it re-arms an
+        // interrupted, restartable syscall: when the checkpoint's rax holds a
+        // restart sentinel (-516..=-512), it reloads rax with orig_rax and
+        // rewinds rip by 2 onto the `syscall` instruction so the call re-executes
+        // cleanly on resume. The donor here is captured in `pause()`, which is
+        // restartable, so apply the same fixup to build the expected register set.
+        let mut expected = cp.process_state.regs.clone();
+        const RAX: usize = 10;
+        const ORIG_RAX: usize = 15;
+        const RIP: usize = 16;
+        if (-516..=-512).contains(&(expected[RAX] as i64)) {
+            expected[RAX] = expected[ORIG_RAX];
+            expected[RIP] = expected[RIP].wrapping_sub(2);
+        }
         assert_eq!(
-            read_regs, cp.process_state.regs,
-            "restored GP registers must match the checkpoint exactly"
+            read_regs, expected,
+            "restored GP registers must match the checkpoint (with syscall-restart re-arm)"
         );
     }
 }

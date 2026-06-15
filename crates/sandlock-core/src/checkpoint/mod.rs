@@ -2,16 +2,16 @@ use serde::{Serialize, Deserialize};
 use std::path::PathBuf;
 use crate::sandbox::Sandbox;
 
-mod capture;
+pub(crate) mod capture;
 mod image;
 mod inject;
 mod regs;
-mod resume;
+pub(crate) mod resume;
 
 pub(crate) use capture::capture;
 
 /// A frozen snapshot of sandbox state.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Checkpoint {
     pub name: String,
     pub policy: Sandbox,
@@ -22,7 +22,7 @@ pub struct Checkpoint {
 }
 
 /// Captured process state via ptrace (registers) + process_vm_readv (memory) + /proc (metadata).
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessState {
     pub pid: i32,
     pub cwd: String,
@@ -33,13 +33,13 @@ pub struct ProcessState {
     pub memory_data: Vec<MemorySegment>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemorySegment {
     pub start: u64,
     pub data: Vec<u8>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryMap {
     pub start: u64,
     pub end: u64,

@@ -714,6 +714,68 @@ impl Sandbox {
         self.wait_until_exec().await
     }
 
+    /// Restore a checkpoint into a fresh, fully-sandboxed process.
+    ///
+    /// Reuses the normal create path to fork a child with the saved policy and the
+    /// full notify stack in place (the child parks before execve), then takes the
+    /// parked child over with ptrace and injects the checkpoint image over it via
+    /// `restore_into`, resuming it at the saved program counter. The process comes
+    /// up already sandboxed. Returns the list of non-transparently-restored fd
+    /// paths (skipped; the caller should log them). x86_64 restore engine only.
+    ///
+    /// On error the child may be left half-built; the caller should drop/kill the
+    /// Sandbox (Drop reaps it).
+    pub async fn restore_interactive(
+        &mut self,
+        cp: &crate::checkpoint::Checkpoint,
+    ) -> Result<Vec<String>, crate::error::SandlockError> {
+        use crate::error::SandboxRuntimeError;
+
+        // The exe to launch is the checkpoint's original binary (within the
+        // policy's fs_read/exec grant). It is never actually execve'd: the child
+        // parks blocked in read() on the ready-pipe, and we inject the checkpoint
+        // over it before it could ever be released. Fall back to a benign command
+        // only when the checkpoint recorded no exe path.
+        let exe = if cp.process_state.exe.is_empty() {
+            "/bin/true".to_string()
+        } else {
+            cp.process_state.exe.clone()
+        };
+        self.create_interactive(&[exe.as_str()]).await?;
+        let pid = self.pid().ok_or(SandboxRuntimeError::NotRunning)?;
+
+        // ptrace is per-thread: the seize, inject, and detach must all run on the
+        // SAME OS thread (the seizing thread becomes the tracer). Do the entire
+        // synchronous sequence inside one spawn_blocking closure with no awaits.
+        // `restore_into` borrows the checkpoint, and spawn_blocking requires a
+        // 'static closure, so move a clone of `cp` in. The clone resets the
+        // policy's runtime to None (Sandbox::clone), which is harmless here:
+        // restore_into reads only process_state + fd_table, never policy.
+        let cp = cp.clone();
+        let skipped = tokio::task::spawn_blocking(
+            move || -> Result<Vec<String>, crate::error::SandlockError> {
+                // PTRACE_SEIZE + PTRACE_INTERRUPT + waitpid to reach the ptrace-stop.
+                crate::checkpoint::capture::ptrace_seize(pid).map_err(|e| {
+                    SandboxRuntimeError::Child(format!("restore ptrace seize {pid}: {e}"))
+                })?;
+                // Inject the checkpoint image; leaves the child stopped with the
+                // saved registers (including rip at the checkpoint pc) loaded.
+                let skipped = crate::checkpoint::resume::restore_into(pid, &cp)?;
+                // PTRACE_DETACH resumes the child; because rip points at the
+                // checkpoint pc, it resumes the checkpointed program, abandoning
+                // the ready-pipe read, under the already-installed policy.
+                crate::checkpoint::capture::ptrace_detach(pid).map_err(|e| {
+                    SandboxRuntimeError::Child(format!("restore ptrace detach {pid}: {e}"))
+                })?;
+                Ok(skipped)
+            },
+        )
+        .await
+        .map_err(|e| SandboxRuntimeError::Child(format!("restore join error: {e}")))??;
+
+        Ok(skipped)
+    }
+
     /// Wait for the child to finish `execve`. Detected by `/proc/<pid>/exe`
     /// no longer matching `/proc/self/exe` (before execve the child still
     /// shares the supervisor's binary). The kernel offers no direct event
