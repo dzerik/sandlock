@@ -67,6 +67,69 @@ pub(crate) fn build_fd_plan(fds: &[FdInfo]) -> (Vec<FdInfo>, Vec<String>) {
     (restorable, skipped)
 }
 
+/// Apply the memory plan inside the restore child. Runs post-fork using only
+/// raw libc. `fds` reopens regular files onto their saved fd numbers. On any
+/// failure the child _exits with a distinct nonzero code so the supervising
+/// parent observes a failed restore.
+#[allow(dead_code)] // used by the restore path (added in a later change)
+pub(crate) fn apply_memory_plan_child(plan: &[RestoreRegion], fds: &[FdInfo]) {
+    for region in plan {
+        match region {
+            RestoreRegion::WriteBytes { start, end, perms, data } => {
+                let len = (end - start) as usize;
+                let prot = prot_from_perms(perms);
+                let p = unsafe {
+                    libc::mmap(*start as *mut libc::c_void, len,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED, -1, 0)
+                };
+                if p == libc::MAP_FAILED { unsafe { libc::_exit(101); } }
+                unsafe {
+                    std::ptr::copy_nonoverlapping(data.as_ptr(), *start as *mut u8, data.len());
+                    // Re-apply the recorded protection (e.g. drop +w if the region was read-only).
+                    libc::mprotect(*start as *mut libc::c_void, len, prot);
+                }
+            }
+            RestoreRegion::RemapFromFile { start, end, perms, offset, path } => {
+                let len = (end - start) as usize;
+                let prot = prot_from_perms(perms);
+                let cpath = match std::ffi::CString::new(path.as_str()) {
+                    Ok(c) => c, Err(_) => unsafe { libc::_exit(102) },
+                };
+                let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY) };
+                if fd < 0 { unsafe { libc::_exit(103); } }
+                let p = unsafe {
+                    libc::mmap(*start as *mut libc::c_void, len, prot,
+                        libc::MAP_PRIVATE | libc::MAP_FIXED, fd, *offset as libc::off_t)
+                };
+                unsafe { libc::close(fd); }
+                if p == libc::MAP_FAILED { unsafe { libc::_exit(104); } }
+            }
+        }
+    }
+    for f in fds {
+        let cpath = match std::ffi::CString::new(f.path.as_str()) {
+            Ok(c) => c, Err(_) => continue,
+        };
+        let opened = unsafe { libc::open(cpath.as_ptr(), f.flags) };
+        if opened < 0 { continue; }
+        if opened != f.fd {
+            unsafe { libc::dup2(opened, f.fd); libc::close(opened); }
+        }
+        unsafe { libc::lseek(f.fd, f.offset as libc::off_t, libc::SEEK_SET); }
+    }
+}
+
+#[allow(dead_code)] // used by the restore path (added in a later change)
+fn prot_from_perms(perms: &str) -> libc::c_int {
+    let mut prot = 0;
+    if perms.as_bytes().first() == Some(&b'r') { prot |= libc::PROT_READ; }
+    if perms.as_bytes().get(1) == Some(&b'w') { prot |= libc::PROT_WRITE; }
+    if perms.as_bytes().get(2) == Some(&b'x') { prot |= libc::PROT_EXEC; }
+    if prot == 0 { prot = libc::PROT_NONE; }
+    prot
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,5 +179,30 @@ mod tests {
         assert!(matches!(plan[0], RestoreRegion::RemapFromFile { .. }));
         assert!(matches!(plan[1], RestoreRegion::WriteBytes { .. }));
         assert_eq!(plan.len(), 2, "special regions are skipped, not planned");
+    }
+
+    #[test]
+    fn child_restore_maps_anon_page() {
+        let addr: u64 = 0x4000_0000;
+        let plan = vec![RestoreRegion::WriteBytes {
+            start: addr, end: addr + 4096, perms: "rw-p".into(), data: vec![0xABu8; 4096],
+        }];
+
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            // Child: apply the plan, then SIGSTOP so the parent can inspect.
+            apply_memory_plan_child(&plan, &[]);
+            unsafe { libc::raise(libc::SIGSTOP); libc::_exit(0); }
+        }
+        // Parent: wait for the stop, read the page back, then kill.
+        let mut st = 0i32;
+        unsafe { libc::waitpid(pid, &mut st, libc::WUNTRACED); }
+        let mut buf = vec![0u8; 4096];
+        let local = libc::iovec { iov_base: buf.as_mut_ptr() as *mut _, iov_len: 4096 };
+        let remote = libc::iovec { iov_base: addr as *mut _, iov_len: 4096 };
+        let n = unsafe { libc::process_vm_readv(pid, &local, 1, &remote, 1, 0) };
+        unsafe { libc::kill(pid, libc::SIGKILL); libc::waitpid(pid, &mut st, 0); }
+        assert_eq!(n, 4096);
+        assert!(buf.iter().all(|&b| b == 0xAB), "anon page pattern must be restored");
     }
 }
