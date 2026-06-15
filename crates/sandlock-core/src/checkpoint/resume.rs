@@ -1,4 +1,4 @@
-use crate::checkpoint::{MemoryMap, MemorySegment};
+use crate::checkpoint::{FdInfo, MemoryMap, MemorySegment};
 
 /// One planned memory-restore action for a saved region.
 #[allow(dead_code)] // used by the restore path (added in a later change)
@@ -39,10 +39,41 @@ pub(crate) fn build_memory_plan(
     plan
 }
 
+/// Split the saved fd table into transparently restorable regular files and a
+/// list of skipped non-regular fds (sockets, pipes, eventfd, ...). The skipped
+/// list is logged by the caller; those resources fall to the app_state hatch.
+#[allow(dead_code)] // used by the restore path (added in a later change)
+pub(crate) fn build_fd_plan(fds: &[FdInfo]) -> (Vec<FdInfo>, Vec<String>) {
+    let mut restorable = Vec::new();
+    let mut skipped = Vec::new();
+    for f in fds {
+        if f.path.starts_with('/') {
+            restorable.push(f.clone());
+        } else {
+            skipped.push(f.path.clone());
+        }
+    }
+    (restorable, skipped)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::checkpoint::{MemoryMap, MemorySegment};
+
+    #[test]
+    fn fd_plan_keeps_regular_files_only() {
+        use crate::checkpoint::FdInfo;
+        let fds = vec![
+            FdInfo { fd: 3, path: "/etc/hostname".into(), flags: 0, offset: 5 },
+            FdInfo { fd: 4, path: "socket:[12345]".into(), flags: 0, offset: 0 },
+            FdInfo { fd: 5, path: "pipe:[6789]".into(), flags: 0, offset: 0 },
+        ];
+        let (restorable, skipped) = build_fd_plan(&fds);
+        assert_eq!(restorable.len(), 1);
+        assert_eq!(restorable[0].fd, 3);
+        assert_eq!(skipped, vec!["socket:[12345]".to_string(), "pipe:[6789]".to_string()]);
+    }
 
     #[test]
     fn plan_classifies_regions() {

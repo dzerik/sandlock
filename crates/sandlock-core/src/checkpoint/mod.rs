@@ -63,7 +63,7 @@ impl MemoryMap {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FdInfo {
     pub fd: i32,
     pub path: String,
