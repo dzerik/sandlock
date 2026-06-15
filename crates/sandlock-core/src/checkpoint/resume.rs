@@ -67,59 +67,6 @@ pub(crate) fn build_fd_plan(fds: &[FdInfo]) -> (Vec<FdInfo>, Vec<String>) {
     (restorable, skipped)
 }
 
-/// Apply the memory plan inside the restore child. Runs post-fork using only
-/// raw libc. `fds` reopens regular files onto their saved fd numbers. On any
-/// failure the child _exits with a distinct nonzero code so the supervising
-/// parent observes a failed restore.
-#[allow(dead_code)] // used by the restore path (added in a later change)
-pub(crate) fn apply_memory_plan_child(plan: &[RestoreRegion], fds: &[FdInfo]) {
-    for region in plan {
-        match region {
-            RestoreRegion::WriteBytes { start, end, perms, data } => {
-                let len = (end - start) as usize;
-                let prot = prot_from_perms(perms);
-                let p = unsafe {
-                    libc::mmap(*start as *mut libc::c_void, len,
-                        libc::PROT_READ | libc::PROT_WRITE,
-                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED, -1, 0)
-                };
-                if p == libc::MAP_FAILED { unsafe { libc::_exit(101); } }
-                unsafe {
-                    std::ptr::copy_nonoverlapping(data.as_ptr(), *start as *mut u8, data.len());
-                    // Re-apply the recorded protection (e.g. drop +w if the region was read-only).
-                    libc::mprotect(*start as *mut libc::c_void, len, prot);
-                }
-            }
-            RestoreRegion::RemapFromFile { start, end, perms, offset, path } => {
-                let len = (end - start) as usize;
-                let prot = prot_from_perms(perms);
-                let cpath = match std::ffi::CString::new(path.as_str()) {
-                    Ok(c) => c, Err(_) => unsafe { libc::_exit(102) },
-                };
-                let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY) };
-                if fd < 0 { unsafe { libc::_exit(103); } }
-                let p = unsafe {
-                    libc::mmap(*start as *mut libc::c_void, len, prot,
-                        libc::MAP_PRIVATE | libc::MAP_FIXED, fd, *offset as libc::off_t)
-                };
-                unsafe { libc::close(fd); }
-                if p == libc::MAP_FAILED { unsafe { libc::_exit(104); } }
-            }
-        }
-    }
-    for f in fds {
-        let cpath = match std::ffi::CString::new(f.path.as_str()) {
-            Ok(c) => c, Err(_) => continue,
-        };
-        let opened = unsafe { libc::open(cpath.as_ptr(), f.flags) };
-        if opened < 0 { continue; }
-        if opened != f.fd {
-            unsafe { libc::dup2(opened, f.fd); libc::close(opened); }
-        }
-        unsafe { libc::lseek(f.fd, f.offset as libc::off_t, libc::SEEK_SET); }
-    }
-}
-
 #[allow(dead_code)] // used by the restore path (added in a later change)
 fn prot_from_perms(perms: &str) -> libc::c_int {
     let mut prot = 0;
@@ -128,6 +75,128 @@ fn prot_from_perms(perms: &str) -> libc::c_int {
     if perms.as_bytes().get(2) == Some(&b'x') { prot |= libc::PROT_EXEC; }
     if prot == 0 { prot = libc::PROT_NONE; }
     prot
+}
+
+/// A memory region prepared for restore, with the path pre-converted to a
+/// CString so the post-fork child performs no allocation.
+#[allow(dead_code)] // used by the restore path (added in a later change)
+pub(crate) enum PreparedRegion {
+    /// anonymous: mmap RW|FIXED|PRIVATE|ANON, copy `bytes`, then mprotect to `prot`.
+    Anon { start: u64, len: usize, prot: libc::c_int, bytes: Vec<u8> },
+    /// file-backed: open `path`, mmap `prot`|FIXED|PRIVATE at `offset`, close.
+    File { start: u64, len: usize, prot: libc::c_int, offset: i64, path: std::ffi::CString },
+}
+
+/// An fd prepared for restore (path pre-converted to CString).
+#[allow(dead_code)] // used by the restore path (added in a later change)
+pub(crate) struct PreparedFd {
+    pub fd: i32,
+    pub flags: i32,
+    pub offset: i64,
+    pub path: std::ffi::CString,
+}
+
+/// All restore actions, with every allocation done up front. Build this BEFORE
+/// forking the restore child; the child then calls `apply_prepared_child` which
+/// allocates nothing (only mmap/mprotect/open/close/dup2/lseek/_exit, all
+/// async-signal-safe).
+#[allow(dead_code)] // used by the restore path (added in a later change)
+pub(crate) struct PreparedRestore {
+    pub regions: Vec<PreparedRegion>,
+    pub fds: Vec<PreparedFd>,
+}
+
+/// Convert plans into a PreparedRestore. Runs in the parent before fork.
+/// Returns an error if any path cannot be converted to a CString (contains an
+/// interior NUL); paths from /proc never do, but we fail loud rather than drop.
+#[allow(dead_code)] // used by the restore path (added in a later change)
+pub(crate) fn prepare_restore(
+    plan: &[RestoreRegion],
+    fds: &[FdInfo],
+) -> Result<PreparedRestore, crate::error::SandlockError> {
+    use crate::error::{SandboxRuntimeError, SandlockError};
+    let cstr = |s: &str| -> Result<std::ffi::CString, SandlockError> {
+        std::ffi::CString::new(s).map_err(|e| {
+            SandlockError::Runtime(SandboxRuntimeError::Child(format!("bad restore path {s:?}: {e}")))
+        })
+    };
+    let mut regions = Vec::with_capacity(plan.len());
+    for r in plan {
+        match r {
+            RestoreRegion::WriteBytes { start, end, perms, data } => {
+                regions.push(PreparedRegion::Anon {
+                    start: *start,
+                    len: (end - start) as usize,
+                    prot: prot_from_perms(perms),
+                    bytes: data.clone(),
+                });
+            }
+            RestoreRegion::RemapFromFile { start, end, perms, offset, path } => {
+                regions.push(PreparedRegion::File {
+                    start: *start,
+                    len: (end - start) as usize,
+                    prot: prot_from_perms(perms),
+                    offset: *offset as i64,
+                    path: cstr(path)?,
+                });
+            }
+        }
+    }
+    let mut prepared_fds = Vec::with_capacity(fds.len());
+    for f in fds {
+        prepared_fds.push(PreparedFd {
+            fd: f.fd, flags: f.flags, offset: f.offset as i64, path: cstr(&f.path)?,
+        });
+    }
+    Ok(PreparedRestore { regions, fds: prepared_fds })
+}
+
+/// Apply a PreparedRestore inside the post-fork child. ALLOCATION-FREE: only
+/// async-signal-safe syscalls. On ANY failure it `_exit`s with a distinct code
+/// so the supervising parent observes a failed restore.
+///
+/// Exit codes: 101 anon mmap, 105 mprotect, 104 file mmap, 103 file open,
+/// 106 fd open, 108 lseek.
+#[allow(dead_code)] // used by the restore path (added in a later change)
+pub(crate) fn apply_prepared_child(prepared: &PreparedRestore) -> ! {
+    for region in &prepared.regions {
+        match region {
+            PreparedRegion::Anon { start, len, prot, bytes } => {
+                let p = unsafe {
+                    libc::mmap(*start as *mut libc::c_void, *len,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED, -1, 0)
+                };
+                if p == libc::MAP_FAILED { unsafe { libc::_exit(101); } }
+                let n = core::cmp::min(bytes.len(), *len);
+                unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), *start as *mut u8, n); }
+                if unsafe { libc::mprotect(*start as *mut libc::c_void, *len, *prot) } != 0 {
+                    unsafe { libc::_exit(105); }
+                }
+            }
+            PreparedRegion::File { start, len, prot, offset, path } => {
+                let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY) };
+                if fd < 0 { unsafe { libc::_exit(103); } }
+                let p = unsafe {
+                    libc::mmap(*start as *mut libc::c_void, *len, *prot,
+                        libc::MAP_PRIVATE | libc::MAP_FIXED, fd, *offset)
+                };
+                unsafe { libc::close(fd); }
+                if p == libc::MAP_FAILED { unsafe { libc::_exit(104); } }
+            }
+        }
+    }
+    for f in &prepared.fds {
+        let opened = unsafe { libc::open(f.path.as_ptr(), f.flags) };
+        if opened < 0 { unsafe { libc::_exit(106); } }
+        if opened != f.fd {
+            unsafe { libc::dup2(opened, f.fd); libc::close(opened); }
+        }
+        if unsafe { libc::lseek(f.fd, f.offset, libc::SEEK_SET) } < 0 {
+            unsafe { libc::_exit(108); }
+        }
+    }
+    unsafe { libc::_exit(0); }
 }
 
 #[cfg(test)]
@@ -182,27 +251,22 @@ mod tests {
     }
 
     #[test]
-    fn child_restore_maps_anon_page() {
+    fn child_restore_applies_plan_exit_zero() {
         let addr: u64 = 0x4000_0000;
         let plan = vec![RestoreRegion::WriteBytes {
             start: addr, end: addr + 4096, perms: "rw-p".into(), data: vec![0xABu8; 4096],
         }];
-
+        let prepared = prepare_restore(&plan, &[]).expect("prepare");
         let pid = unsafe { libc::fork() };
         if pid == 0 {
-            // Child: apply the plan, then SIGSTOP so the parent can inspect.
-            apply_memory_plan_child(&plan, &[]);
-            unsafe { libc::raise(libc::SIGSTOP); libc::_exit(0); }
+            apply_prepared_child(&prepared); // never returns; _exit(0) on success
         }
-        // Parent: wait for the stop, read the page back, then kill.
         let mut st = 0i32;
-        unsafe { libc::waitpid(pid, &mut st, libc::WUNTRACED); }
-        let mut buf = vec![0u8; 4096];
-        let local = libc::iovec { iov_base: buf.as_mut_ptr() as *mut _, iov_len: 4096 };
-        let remote = libc::iovec { iov_base: addr as *mut _, iov_len: 4096 };
-        let n = unsafe { libc::process_vm_readv(pid, &local, 1, &remote, 1, 0) };
-        unsafe { libc::kill(pid, libc::SIGKILL); libc::waitpid(pid, &mut st, 0); }
-        assert_eq!(n, 4096);
-        assert!(buf.iter().all(|&b| b == 0xAB), "anon page pattern must be restored");
+        unsafe { libc::waitpid(pid, &mut st, 0); }
+        // Decode wait status manually: low 7 bits 0 means exited normally.
+        let exited = (st & 0x7f) == 0;
+        let code = (st >> 8) & 0xff;
+        assert!(exited, "restore child should have exited normally; raw status {st:#x}");
+        assert_eq!(code, 0, "restore child should exit 0; got exit code {code}");
     }
 }
