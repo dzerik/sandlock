@@ -166,6 +166,7 @@ impl Checkpoint {
         write_json(&proc_dir.join("memory_map.json"), &maps)?;
 
         // process/threads/0.bin -- main thread register state
+        // NOTE: process_state.fpregs is not yet written here; persistence is added in the next change.
         let threads_dir = proc_dir.join("threads");
         std::fs::create_dir(&threads_dir)
             .map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
@@ -265,6 +266,7 @@ impl Checkpoint {
                 cwd: info.cwd,
                 exe: info.exe,
                 regs,
+                // fpregs persistence is added in the next change; load defaults to empty for now.
                 fpregs: Vec::new(),
                 memory_maps,
                 memory_data,

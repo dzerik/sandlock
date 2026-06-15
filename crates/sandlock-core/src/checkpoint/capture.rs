@@ -137,7 +137,7 @@ fn ptrace_getregset_bytes(pid: i32, set: libc::c_int, max: usize) -> io::Result<
     if ret < 0 {
         return Err(io::Error::last_os_error());
     }
-    buf.truncate(iov.iov_len);
+    buf.truncate(iov.iov_len.min(buf.len()));
     Ok(buf)
 }
 
@@ -409,7 +409,7 @@ mod tests {
 
     #[test]
     fn ptrace_getfpregs_captures_nonempty_state() {
-        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
         let pid = child.id() as i32;
         let res = (|| -> io::Result<Vec<u8>> {
             ptrace_seize(pid)?;
