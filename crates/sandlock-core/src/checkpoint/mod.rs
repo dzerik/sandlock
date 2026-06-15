@@ -4,6 +4,7 @@ use crate::sandbox::Sandbox;
 
 mod capture;
 mod image;
+mod inject;
 mod regs;
 mod resume;
 
