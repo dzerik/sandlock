@@ -39,15 +39,26 @@ pub(crate) fn build_memory_plan(
     plan
 }
 
+/// Return true only for paths that refer to a reopenable regular file.
+/// memfd and "(deleted)" paths start with '/' but are not reopenable, so they
+/// are skipped.
+fn is_restorable_file_path(path: &str) -> bool {
+    path.starts_with('/')
+        && !path.starts_with("/memfd:")
+        && !path.ends_with(" (deleted)")
+}
+
 /// Split the saved fd table into transparently restorable regular files and a
 /// list of skipped non-regular fds (sockets, pipes, eventfd, ...). The skipped
 /// list is logged by the caller; those resources fall to the app_state hatch.
+/// memfd and "(deleted)" paths start with '/' but are not reopenable, so they
+/// are skipped.
 #[allow(dead_code)] // used by the restore path (added in a later change)
 pub(crate) fn build_fd_plan(fds: &[FdInfo]) -> (Vec<FdInfo>, Vec<String>) {
     let mut restorable = Vec::new();
     let mut skipped = Vec::new();
     for f in fds {
-        if f.path.starts_with('/') {
+        if is_restorable_file_path(&f.path) {
             restorable.push(f.clone());
         } else {
             skipped.push(f.path.clone());
@@ -59,11 +70,10 @@ pub(crate) fn build_fd_plan(fds: &[FdInfo]) -> (Vec<FdInfo>, Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::checkpoint::{MemoryMap, MemorySegment};
+    use crate::checkpoint::{FdInfo, MemoryMap, MemorySegment};
 
     #[test]
     fn fd_plan_keeps_regular_files_only() {
-        use crate::checkpoint::FdInfo;
         let fds = vec![
             FdInfo { fd: 3, path: "/etc/hostname".into(), flags: 0, offset: 5 },
             FdInfo { fd: 4, path: "socket:[12345]".into(), flags: 0, offset: 0 },
@@ -73,6 +83,22 @@ mod tests {
         assert_eq!(restorable.len(), 1);
         assert_eq!(restorable[0].fd, 3);
         assert_eq!(skipped, vec!["socket:[12345]".to_string(), "pipe:[6789]".to_string()]);
+    }
+
+    #[test]
+    fn fd_plan_skips_deleted_and_memfd() {
+        let fds = vec![
+            FdInfo { fd: 3, path: "/etc/hostname".into(), flags: 0, offset: 5 },
+            FdInfo { fd: 6, path: "/tmp/gone (deleted)".into(), flags: 0, offset: 0 },
+            FdInfo { fd: 7, path: "/memfd:scratch (deleted)".into(), flags: 0, offset: 0 },
+        ];
+        let (restorable, skipped) = build_fd_plan(&fds);
+        assert_eq!(restorable.len(), 1);
+        assert_eq!(restorable[0].fd, 3);
+        assert!(restorable.iter().all(|f| f.fd != 6 && f.fd != 7),
+            "deleted and memfd fds must not appear in restorable");
+        assert!(skipped.contains(&"/tmp/gone (deleted)".to_string()));
+        assert!(skipped.contains(&"/memfd:scratch (deleted)".to_string()));
     }
 
     #[test]
