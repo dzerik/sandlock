@@ -1,4 +1,4 @@
-use crate::checkpoint::{FdInfo, MemoryMap, MemorySegment};
+use crate::checkpoint::{Checkpoint, FdInfo, MemoryMap, MemorySegment};
 
 /// One planned memory-restore action for a saved region.
 #[allow(dead_code)] // used by the restore path (added in a later change)
@@ -77,126 +77,191 @@ fn prot_from_perms(perms: &str) -> libc::c_int {
     prot
 }
 
-/// A memory region prepared for restore, with the path pre-converted to a
-/// CString so the post-fork child performs no allocation.
-#[allow(dead_code)] // used by the restore path (added in a later change)
-pub(crate) enum PreparedRegion {
-    /// anonymous: mmap RW|FIXED|PRIVATE|ANON, copy `bytes`, then mprotect to `prot`.
-    Anon { start: u64, len: usize, prot: libc::c_int, bytes: Vec<u8> },
-    /// file-backed: open `path`, mmap `prot`|FIXED|PRIVATE at `offset`, close.
-    File { start: u64, len: usize, prot: libc::c_int, offset: i64, path: std::ffi::CString },
-}
-
-/// An fd prepared for restore (path pre-converted to CString).
-#[allow(dead_code)] // used by the restore path (added in a later change)
-pub(crate) struct PreparedFd {
-    pub fd: i32,
-    pub flags: i32,
-    pub offset: i64,
-    pub path: std::ffi::CString,
-}
-
-/// All restore actions, with every allocation done up front. Build this BEFORE
-/// forking the restore child; the child then calls `apply_prepared_child` which
-/// allocates nothing (only mmap/mprotect/open/close/dup2/lseek/_exit, all
-/// async-signal-safe).
-#[allow(dead_code)] // used by the restore path (added in a later change)
-pub(crate) struct PreparedRestore {
-    pub regions: Vec<PreparedRegion>,
-    pub fds: Vec<PreparedFd>,
-}
-
-/// Convert plans into a PreparedRestore. Runs in the parent before fork.
-/// Returns an error if any path cannot be converted to a CString (contains an
-/// interior NUL); paths from /proc never do, but we fail loud rather than drop.
-#[allow(dead_code)] // used by the restore path (added in a later change)
-pub(crate) fn prepare_restore(
-    plan: &[RestoreRegion],
-    fds: &[FdInfo],
-) -> Result<PreparedRestore, crate::error::SandlockError> {
+/// Reconstruct the process image of `cp` into an already-ptrace-stopped child
+/// `pid` (the calling process must be its tracer; the child must be stopped at
+/// a valid executable rip). Drives the rebuild entirely via ptrace syscall
+/// injection through a trampoline placed in a hole of the CHECKPOINT's layout.
+/// Leaves the child stopped with the saved registers loaded; the caller resumes
+/// it (PTRACE_CONT / detach). Returns the list of non-transparently-restored
+/// resource names (skipped fds) for the caller to log.
+// `restore_into` is only invoked from tests and (later) the OCI restore path
+// (Task 11), so it is dead code in a plain library build.
+#[allow(dead_code)]
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn restore_into(
+    pid: i32,
+    cp: &Checkpoint,
+) -> Result<Vec<String>, crate::error::SandlockError> {
+    use crate::checkpoint::inject;
     use crate::error::{SandboxRuntimeError, SandlockError};
-    let cstr = |s: &str| -> Result<std::ffi::CString, SandlockError> {
-        std::ffi::CString::new(s).map_err(|e| {
-            SandlockError::Runtime(SandboxRuntimeError::Child(format!("bad restore path {s:?}: {e}")))
-        })
-    };
-    let mut regions = Vec::with_capacity(plan.len());
-    for r in plan {
-        match r {
-            RestoreRegion::WriteBytes { start, end, perms, data } => {
-                regions.push(PreparedRegion::Anon {
-                    start: *start,
-                    len: (end - start) as usize,
-                    prot: prot_from_perms(perms),
-                    bytes: data.clone(),
-                });
-            }
-            RestoreRegion::RemapFromFile { start, end, perms, offset, path } => {
-                regions.push(PreparedRegion::File {
-                    start: *start,
-                    len: (end - start) as usize,
-                    prot: prot_from_perms(perms),
-                    offset: *offset as i64,
-                    path: cstr(path)?,
-                });
-            }
-        }
-    }
-    let mut prepared_fds = Vec::with_capacity(fds.len());
-    for f in fds {
-        prepared_fds.push(PreparedFd {
-            fd: f.fd, flags: f.flags, offset: f.offset as i64, path: cstr(&f.path)?,
-        });
-    }
-    Ok(PreparedRestore { regions, fds: prepared_fds })
-}
 
-/// Apply a PreparedRestore inside the post-fork child. ALLOCATION-FREE: only
-/// async-signal-safe syscalls. On ANY failure it `_exit`s with a distinct code
-/// so the supervising parent observes a failed restore.
-///
-/// Exit codes: 101 anon mmap, 105 mprotect, 104 file mmap, 103 file open,
-/// 106 fd open, 108 lseek.
-#[allow(dead_code)] // used by the restore path (added in a later change)
-pub(crate) fn apply_prepared_child(prepared: &PreparedRestore) -> ! {
-    for region in &prepared.regions {
+    // x86_64 syscall numbers used by the rebuild.
+    const MMAP: u64 = 9;
+    const MPROTECT: u64 = 10;
+    const OPEN: u64 = 2;
+    const CLOSE: u64 = 3;
+    const LSEEK: u64 = 8;
+    const DUP2: u64 = 33;
+
+    // Build SandlockError::Runtime(Child(..)) the same way capture.rs does.
+    let err = |msg: String| SandlockError::Runtime(SandboxRuntimeError::Child(msg));
+
+    let plan = build_memory_plan(&cp.process_state.memory_maps, &cp.process_state.memory_data);
+    let (restorable_fds, skipped) = build_fd_plan(&cp.fd_table);
+
+    // CONTRACT: pass the CHECKPOINT's maps so the trampoline lands in a hole of
+    // the TARGET layout. That hole is, by construction, never a restored region,
+    // so no mmap below can ever clobber the trampoline page.
+    let tramp = inject::setup_trampoline(pid, &cp.process_state.memory_maps)
+        .map_err(|e| err(format!("restore setup trampoline: {e}")))?;
+
+    // Scratch area for NUL-terminated path strings. The 2-byte gadget lives at
+    // `tramp`; the rest of the RWX page (4096 bytes) is free for scratch.
+    let scratch = tramp + 64;
+    const SCRATCH_MAX: usize = 4096 - 64;
+    let write_path = |path: &str| -> Result<(), SandlockError> {
+        let mut p = path.as_bytes().to_vec();
+        p.push(0);
+        if p.len() > SCRATCH_MAX {
+            return Err(err("restore path too long for scratch".into()));
+        }
+        inject::write_child_mem(pid, scratch, &p)
+            .map_err(|e| err(format!("restore write path {path}: {e}")))
+    };
+
+    // Rebuild every planned memory region. Invariant: none of these regions is
+    // the trampoline page -- the trampoline sits in a hole of cp.memory_maps,
+    // a region that does not exist in the checkpoint, so it is never restored.
+    for region in &plan {
         match region {
-            PreparedRegion::Anon { start, len, prot, bytes } => {
-                let p = unsafe {
-                    libc::mmap(*start as *mut libc::c_void, *len,
-                        libc::PROT_READ | libc::PROT_WRITE,
-                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED, -1, 0)
-                };
-                if p == libc::MAP_FAILED { unsafe { libc::_exit(101); } }
-                let n = core::cmp::min(bytes.len(), *len);
-                unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), *start as *mut u8, n); }
-                if unsafe { libc::mprotect(*start as *mut libc::c_void, *len, *prot) } != 0 {
-                    unsafe { libc::_exit(105); }
+            RestoreRegion::WriteBytes { start, end, perms, data } => {
+                let len = (end - start) as usize;
+                let r = inject::inject_syscall_at(
+                    pid,
+                    tramp,
+                    MMAP,
+                    [
+                        *start,
+                        len as u64,
+                        (libc::PROT_READ | libc::PROT_WRITE) as u64,
+                        (libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED) as u64,
+                        (-1i64) as u64,
+                        0,
+                    ],
+                )
+                .map_err(|e| err(format!("restore anon mmap at {start:#x}: {e}")))?;
+                if r as u64 != *start {
+                    return Err(err(format!("restore anon mmap at {start:#x} -> {r:#x}")));
+                }
+                let n = data.len().min(len);
+                inject::write_child_mem(pid, *start, &data[..n])
+                    .map_err(|e| err(format!("restore write bytes at {start:#x}: {e}")))?;
+                let prot = prot_from_perms(perms);
+                if prot != (libc::PROT_READ | libc::PROT_WRITE) {
+                    let m = inject::inject_syscall_at(
+                        pid,
+                        tramp,
+                        MPROTECT,
+                        [*start, len as u64, prot as u64, 0, 0, 0],
+                    )
+                    .map_err(|e| err(format!("restore mprotect {start:#x}: {e}")))?;
+                    if m != 0 {
+                        return Err(err(format!("restore mprotect {start:#x}")));
+                    }
                 }
             }
-            PreparedRegion::File { start, len, prot, offset, path } => {
-                let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY) };
-                if fd < 0 { unsafe { libc::_exit(103); } }
-                let p = unsafe {
-                    libc::mmap(*start as *mut libc::c_void, *len, *prot,
-                        libc::MAP_PRIVATE | libc::MAP_FIXED, fd, *offset)
-                };
-                unsafe { libc::close(fd); }
-                if p == libc::MAP_FAILED { unsafe { libc::_exit(104); } }
+            RestoreRegion::RemapFromFile { start, end, perms, offset, path } => {
+                let len = (end - start) as usize;
+                let prot = prot_from_perms(perms);
+                write_path(path)?;
+                let fd = inject::inject_syscall_at(
+                    pid,
+                    tramp,
+                    OPEN,
+                    [scratch, libc::O_RDONLY as u64, 0, 0, 0, 0],
+                )
+                .map_err(|e| err(format!("restore open {path}: {e}")))?;
+                if fd < 0 {
+                    return Err(err(format!("restore open {path} -> {fd}")));
+                }
+                let r = inject::inject_syscall_at(
+                    pid,
+                    tramp,
+                    MMAP,
+                    [
+                        *start,
+                        len as u64,
+                        prot as u64,
+                        (libc::MAP_PRIVATE | libc::MAP_FIXED) as u64,
+                        fd as u64,
+                        *offset,
+                    ],
+                )
+                .map_err(|e| err(format!("restore file mmap at {start:#x}: {e}")))?;
+                if r as u64 != *start {
+                    return Err(err(format!("restore file mmap at {start:#x} -> {r:#x}")));
+                }
+                inject::inject_syscall_at(pid, tramp, CLOSE, [fd as u64, 0, 0, 0, 0, 0])
+                    .map_err(|e| err(format!("restore close fd {fd}: {e}")))?;
             }
         }
     }
-    for f in &prepared.fds {
-        let opened = unsafe { libc::open(f.path.as_ptr(), f.flags) };
-        if opened < 0 { unsafe { libc::_exit(106); } }
-        if opened != f.fd {
-            unsafe { libc::dup2(opened, f.fd); libc::close(opened); }
+
+    // Reopen transparently restorable fds at their saved numbers/offsets.
+    for f in &restorable_fds {
+        write_path(&f.path)?;
+        let opened = inject::inject_syscall_at(
+            pid,
+            tramp,
+            OPEN,
+            [scratch, f.flags as u64, 0, 0, 0, 0],
+        )
+        .map_err(|e| err(format!("restore fd open {}: {e}", f.path)))?;
+        if opened < 0 {
+            return Err(err(format!("restore fd open {} -> {opened}", f.path)));
         }
-        if unsafe { libc::lseek(f.fd, f.offset, libc::SEEK_SET) } < 0 {
-            unsafe { libc::_exit(108); }
+        if opened as i32 != f.fd {
+            // dup2 may clobber an inherited stub fd at this number; that is
+            // acceptable -- inherited stub fds are disposable. Documented M1
+            // limitation, alongside the W^X trampoline constraint.
+            inject::inject_syscall_at(pid, tramp, DUP2, [opened as u64, f.fd as u64, 0, 0, 0, 0])
+                .map_err(|e| err(format!("restore dup2 {opened}->{}: {e}", f.fd)))?;
+            inject::inject_syscall_at(pid, tramp, CLOSE, [opened as u64, 0, 0, 0, 0, 0])
+                .map_err(|e| err(format!("restore close dup src {opened}: {e}")))?;
+        }
+        let ls = inject::inject_syscall_at(
+            pid,
+            tramp,
+            LSEEK,
+            [f.fd as u64, f.offset, libc::SEEK_SET as u64, 0, 0, 0],
+        )
+        .map_err(|e| err(format!("restore lseek fd {}: {e}", f.fd)))?;
+        if ls < 0 {
+            return Err(err(format!("restore lseek fd {}", f.fd)));
         }
     }
-    unsafe { libc::_exit(0); }
+
+    // Registers last: load the saved FP then GP register files. After this the
+    // child is stopped exactly at the checkpoint's execution point.
+    crate::checkpoint::regs::set_fp_regs(pid, &cp.process_state.fpregs)
+        .map_err(|e| err(format!("restore set fp regs: {e}")))?;
+    crate::checkpoint::regs::set_gp_regs(pid, &cp.process_state.regs)
+        .map_err(|e| err(format!("restore set gp regs: {e}")))?;
+
+    Ok(skipped)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[allow(dead_code)]
+pub(crate) fn restore_into(
+    _pid: i32,
+    _cp: &Checkpoint,
+) -> Result<Vec<String>, crate::error::SandlockError> {
+    Err(crate::error::SandlockError::Runtime(
+        crate::error::SandboxRuntimeError::Child(
+            "injection-based restore is only implemented on x86_64".into(),
+        ),
+    ))
 }
 
 #[cfg(test)]
@@ -250,23 +315,122 @@ mod tests {
         assert_eq!(plan.len(), 2, "special regions are skipped, not planned");
     }
 
+    /// End-to-end proof of the injection-based rebuild: capture a donor's known
+    /// page + registers, then drive `restore_into` against a fresh stub and read
+    /// BOTH back from the still-stopped stub before resuming it. No Landlock and
+    /// no resume are needed -- the read-back alone proves mmap + writev (memory)
+    /// and SETREGSET (registers) flowed through the trampoline correctly.
     #[test]
-    fn child_restore_applies_plan_exit_zero() {
-        let addr: u64 = 0x4000_0000;
-        let plan = vec![RestoreRegion::WriteBytes {
-            start: addr, end: addr + 4096, perms: "rw-p".into(), data: vec![0xABu8; 4096],
-        }];
-        let prepared = prepare_restore(&plan, &[]).expect("prepare");
-        let pid = unsafe { libc::fork() };
-        if pid == 0 {
-            apply_prepared_child(&prepared); // never returns; _exit(0) on success
+    #[cfg(target_arch = "x86_64")]
+    fn restore_into_reconstructs_memory_and_regs() {
+        const DON: u64 = 0x4500_0000_0000;
+        const PAT: u8 = 0xC7;
+
+        // Donor: raw-libc child that maps a known page at a fixed hole, fills it
+        // with a recognizable pattern, then pauses forever. No allocation/panic.
+        let donor = unsafe { libc::fork() };
+        if donor == 0 {
+            unsafe {
+                let p = libc::mmap(
+                    DON as *mut libc::c_void,
+                    4096,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED,
+                    -1,
+                    0,
+                );
+                if p != DON as *mut libc::c_void {
+                    libc::_exit(1);
+                }
+                let mut i = 0usize;
+                while i < 4096 {
+                    *(DON as *mut u8).add(i) = PAT;
+                    i += 1;
+                }
+                loop {
+                    libc::pause();
+                }
+            }
         }
+        assert!(donor > 0, "fork donor");
+        // Let the donor finish its mmap+fill before we seize it.
+        unsafe {
+            libc::usleep(50_000);
+        }
+
+        let policy = crate::Sandbox::builder().build().unwrap();
+        let cp = crate::checkpoint::capture::capture(donor as i32, &policy).expect("capture");
+
+        // The donor is no longer needed; capture already detached.
+        unsafe {
+            libc::kill(donor, libc::SIGKILL);
+            let mut s = 0;
+            libc::waitpid(donor, &mut s, 0);
+        }
+
+        // Sanity: the donor's page was captured with our pattern. If not, the
+        // test setup -- not restore_into -- is wrong.
+        let seg = cp
+            .process_state
+            .memory_data
+            .iter()
+            .find(|s| s.start == DON)
+            .expect("donor DON page must be captured");
+        assert!(
+            seg.data.len() >= 4096 && seg.data[..4096].iter().all(|&b| b == PAT),
+            "captured DON page must be all 0x{PAT:02x}"
+        );
+
+        // Stub: a traceable child that stops and is never continued. The test
+        // process becomes its tracer via PTRACE_TRACEME.
+        let stub = unsafe { libc::fork() };
+        if stub == 0 {
+            unsafe {
+                libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0);
+                libc::raise(libc::SIGSTOP);
+                libc::_exit(0); // only reached if continued, which we never do
+            }
+        }
+        assert!(stub > 0, "fork stub");
         let mut st = 0i32;
-        unsafe { libc::waitpid(pid, &mut st, 0); }
-        // Decode wait status manually: low 7 bits 0 means exited normally.
-        let exited = (st & 0x7f) == 0;
-        let code = (st >> 8) & 0xff;
-        assert!(exited, "restore child should have exited normally; raw status {st:#x}");
-        assert_eq!(code, 0, "restore child should exit 0; got exit code {code}");
+        unsafe {
+            libc::waitpid(stub, &mut st, 0);
+        } // catch the SIGSTOP-stop
+
+        let _skipped = restore_into(stub, &cp).expect("restore_into");
+
+        // Read the restored DON page back out of the still-stopped stub.
+        let mut buf = vec![0u8; 4096];
+        let local = libc::iovec {
+            iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+            iov_len: 4096,
+        };
+        let remote = libc::iovec {
+            iov_base: DON as *mut libc::c_void,
+            iov_len: 4096,
+        };
+        let n = unsafe { libc::process_vm_readv(stub, &local, 1, &remote, 1, 0) };
+
+        // Read the restored GP register file back out of the stub.
+        let read_regs = crate::checkpoint::capture::ptrace_getregs(stub);
+
+        // Reap the stub before asserting so a failed assert never leaks it.
+        unsafe {
+            libc::kill(stub, libc::SIGKILL);
+            let mut s = 0;
+            libc::waitpid(stub, &mut s, 0);
+        }
+
+        assert_eq!(n, 4096, "process_vm_readv of restored DON page");
+        assert!(
+            buf.iter().all(|&b| b == PAT),
+            "restored DON page must be all 0x{PAT:02x}"
+        );
+
+        let read_regs = read_regs.expect("read stub regs");
+        assert_eq!(
+            read_regs, cp.process_state.regs,
+            "restored GP registers must match the checkpoint exactly"
+        );
     }
 }

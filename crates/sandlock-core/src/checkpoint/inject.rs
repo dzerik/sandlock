@@ -293,9 +293,8 @@ pub(crate) fn inject_syscall_at(_pid: i32, _gadget: u64, _nr: u64, _args: [u64; 
 /// `process_vm_writev`. The target page must be writable. Mirrors the private
 /// `write_child_mem_vm` helper in `seccomp::notif` (copied locally because that
 /// one is private and TOCTOU-bound to a live notification).
-// used by the restore path (added in a later change)
-#[allow(dead_code)]
-fn write_child_mem(pid: i32, addr: u64, bytes: &[u8]) -> io::Result<()> {
+// used by the restore path (resume::restore_into) and setup_trampoline
+pub(crate) fn write_child_mem(pid: i32, addr: u64, bytes: &[u8]) -> io::Result<()> {
     let local_iov = libc::iovec {
         iov_base: bytes.as_ptr() as *mut libc::c_void,
         iov_len: bytes.len(),
@@ -334,21 +333,28 @@ pub(crate) fn setup_trampoline(pid: i32, maps: &[MemoryMap]) -> io::Result<u64> 
         .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no free page for restore trampoline"))?;
 
     // mmap(addr, 4096, PROT_READ|PROT_WRITE|PROT_EXEC,
-    //      MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED_NOREPLACE, -1, 0). nr = 9 on x86_64.
-    // MAP_FIXED_NOREPLACE returns -EEXIST if the address is already occupied,
-    // so the post-call check below is a genuine safety net rather than a
-    // tautology (MAP_FIXED always returns the requested address on success).
+    //      MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0). nr = 9 on x86_64.
+    //
+    // MAP_FIXED (not MAP_FIXED_NOREPLACE) is deliberate: in a real restore the
+    // stub's address space differs from the checkpoint, so the trampoline hole
+    // (a gap in the TARGET/checkpoint layout) is typically still occupied by
+    // disposable inherited mappings in the stub, which we MUST clobber to plant
+    // the gadget. Safety against clobbering a RESTORED region is guaranteed by
+    // the caller passing the CHECKPOINT's `memory_maps` here, so the hole does
+    // not exist in the target and no restored region ever maps over it -- NOT by
+    // NOREPLACE. The post-call check stays meaningful because MAP_FIXED returns
+    // the requested address on success and a negative errno on failure (e.g. a
+    // W^X denial of a writable+executable mapping).
     let prot = (libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) as u64;
-    let flags = (libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED_NOREPLACE) as u64;
+    let flags = (libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED) as u64;
     let ret = inject_syscall(pid, 9, [addr, 4096, prot, flags, (-1i64) as u64, 0])?;
 
-    // MAP_FIXED_NOREPLACE returns the requested address on success; a negative
-    // value (-EEXIST, -ENOMEM, ...) means the mapping failed, most likely
-    // because the address is already occupied.
+    // MAP_FIXED returns the requested address on success; a negative value
+    // (-EPERM from a W^X denial, -ENOMEM, ...) means the mapping failed.
     if ret < 0 || (ret as u64) != addr {
         return Err(io::Error::new(
             io::ErrorKind::Other,
-            format!("trampoline mmap at {addr:#x} failed or address occupied (ret={ret:#x})"),
+            format!("trampoline mmap at {addr:#x} failed (ret={ret:#x})"),
         ));
     }
 
