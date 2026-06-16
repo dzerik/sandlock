@@ -723,6 +723,11 @@ impl Sandbox {
     /// up already sandboxed. Returns the list of non-transparently-restored fd
     /// paths (skipped; the caller should log them). x86_64 restore engine only.
     ///
+    /// Limitation: transparent restore currently works for vDSO-free programs.
+    /// libc/glibc programs that call vDSO functions (e.g. `clock_gettime`) crash
+    /// on resume because the vDSO is not yet relocated/restored (known limitation,
+    /// next milestone).
+    ///
     /// On error the child may be left half-built; the caller should drop/kill the
     /// Sandbox (Drop reaps it).
     pub async fn restore_interactive(
@@ -760,7 +765,15 @@ impl Sandbox {
                 })?;
                 // Inject the checkpoint image; leaves the child stopped with the
                 // saved registers (including rip at the checkpoint pc) loaded.
-                let skipped = crate::checkpoint::resume::restore_into(pid, &cp)?;
+                // On error, best-effort detach so the child is not left seized
+                // with a dangling tracer thread.
+                let skipped = match crate::checkpoint::resume::restore_into(pid, &cp) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let _ = crate::checkpoint::capture::ptrace_detach(pid);
+                        return Err(e);
+                    }
+                };
                 // PTRACE_DETACH resumes the child; because rip points at the
                 // checkpoint pc, it resumes the checkpointed program, abandoning
                 // the ready-pipe read, under the already-installed policy.

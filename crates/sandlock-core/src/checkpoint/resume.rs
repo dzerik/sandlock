@@ -90,6 +90,10 @@ fn prot_from_perms(perms: &str) -> libc::c_int {
 /// Limitation: file-backed regions are restored `MAP_PRIVATE` from the on-disk
 /// file, so a checkpointed `MAP_SHARED` mapping is restored as private
 /// (documented M1 limitation).
+/// Limitation: transparent restore currently works for vDSO-free programs.
+/// libc/glibc programs that call vDSO functions (e.g. `clock_gettime`) crash
+/// on resume because the vDSO is not yet relocated/restored (known limitation,
+/// next milestone).
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn restore_into(
     pid: i32,
@@ -283,13 +287,21 @@ pub(crate) fn restore_into(
     // sentinel (e.g. -514) in rax and fault. Apply the fixup ourselves so the
     // syscall re-executes cleanly with its arguments still in registers (this is
     // what CRIU does). x86_64 user_regs_struct layout: rax=10, orig_rax=15, rip=16.
+    //
+    // Real restart sentinels: -512 ERESTARTSYS, -513 ERESTARTNOINTR,
+    // -514 ERESTARTNOHAND, -516 ERESTART_RESTARTBLOCK. -515 (ENOIOCTLCMD) is
+    // NOT a restart code and must not be matched. For ERESTART_RESTARTBLOCK
+    // (-516) we re-run orig_rax rather than the kernel restart_syscall path
+    // (restart_block is not captured), so timeout-bearing syscalls restart with
+    // their full original timeout rather than remaining time -- accepted
+    // approximation for fresh-process restore.
     const RAX: usize = 10;
     const ORIG_RAX: usize = 15;
     const RIP: usize = 16;
     let mut regs = cp.process_state.regs.clone();
     if let (Some(&rax), Some(&orig_rax)) = (regs.get(RAX), regs.get(ORIG_RAX)) {
-        // ERESTART_RESTARTBLOCK..=ERESTARTSYS == -516..=-512.
-        if (-516..=-512).contains(&(rax as i64)) {
+        let rax_signed = rax as i64;
+        if matches!(rax_signed, -512 | -513 | -514 | -516) {
             regs[RAX] = orig_rax;
             regs[RIP] = regs[RIP].wrapping_sub(2);
         }
@@ -487,15 +499,18 @@ mod tests {
         let read_regs = read_regs.expect("read stub regs");
         // `restore_into` restores registers verbatim EXCEPT it re-arms an
         // interrupted, restartable syscall: when the checkpoint's rax holds a
-        // restart sentinel (-516..=-512), it reloads rax with orig_rax and
-        // rewinds rip by 2 onto the `syscall` instruction so the call re-executes
-        // cleanly on resume. The donor here is captured in `pause()`, which is
-        // restartable, so apply the same fixup to build the expected register set.
+        // restart sentinel (-512 ERESTARTSYS, -513 ERESTARTNOINTR, -514
+        // ERESTARTNOHAND, -516 ERESTART_RESTARTBLOCK; note -515 ENOIOCTLCMD is
+        // NOT a sentinel), it reloads rax with orig_rax and rewinds rip by 2
+        // onto the `syscall` instruction so the call re-executes cleanly on
+        // resume. The donor here is captured in `pause()`, which is restartable,
+        // so apply the same fixup to build the expected register set.
         let mut expected = cp.process_state.regs.clone();
         const RAX: usize = 10;
         const ORIG_RAX: usize = 15;
         const RIP: usize = 16;
-        if (-516..=-512).contains(&(expected[RAX] as i64)) {
+        let rax_signed = expected[RAX] as i64;
+        if matches!(rax_signed, -512 | -513 | -514 | -516) {
             expected[RAX] = expected[ORIG_RAX];
             expected[RIP] = expected[RIP].wrapping_sub(2);
         }
