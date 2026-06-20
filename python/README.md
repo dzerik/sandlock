@@ -571,7 +571,7 @@ Checkpoint.restore("my-snapshot", restore_fn=lambda data: rebuild(data))
 |--------|-------------|
 | `cp.save(name, store=None)` | Persist checkpoint to disk |
 | `Checkpoint.load(name, store=None)` | Load from disk |
-| `Checkpoint.restore(name, restore_fn, store=None)` | Load and call restore_fn with app_state |
+| `Checkpoint.restore(name, restore_fn=None, store=None)` | Load; if app_state was saved (via save_fn) call restore_fn with it. restore_fn and save_fn must both be present or both absent. |
 | `Checkpoint.list(store=None)` | List saved checkpoint names |
 | `Checkpoint.delete(name, store=None)` | Delete a saved checkpoint |
 

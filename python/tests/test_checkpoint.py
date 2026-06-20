@@ -146,12 +146,33 @@ class TestCheckpointRestore:
         assert isinstance(result, Checkpoint)
         assert result.name == "ret-test"
 
-    def test_restore_no_app_state_raises(self, running_sandbox, tmp_dir):
+    def test_restore_no_app_state_no_fn_succeeds(self, running_sandbox, tmp_dir):
+        # save_fn absent at checkpoint, restore_fn absent at restore: both
+        # absent is the symmetric, valid case and must not raise.
         cp = running_sandbox.checkpoint()
         cp.save("no-app", store=tmp_dir)
 
+        result = Checkpoint.restore("no-app", store=tmp_dir)
+        assert isinstance(result, Checkpoint)
+        assert result.app_state is None
+
+    def test_restore_fn_without_app_state_raises(self, running_sandbox, tmp_dir):
+        # restore_fn given but the checkpoint has no app_state: a one-sided
+        # pairing, which is rejected.
+        cp = running_sandbox.checkpoint()
+        cp.save("no-app-fn", store=tmp_dir)
+
         with pytest.raises(ValueError, match="no app_state"):
-            Checkpoint.restore("no-app", lambda d: None, store=tmp_dir)
+            Checkpoint.restore("no-app-fn", lambda d: None, store=tmp_dir)
+
+    def test_restore_app_state_without_fn_raises(self, running_sandbox, tmp_dir):
+        # app_state present but restore_fn omitted: the other one-sided pairing,
+        # also rejected.
+        cp = running_sandbox.checkpoint(save_fn=lambda: b"state")
+        cp.save("app-no-fn", store=tmp_dir)
+
+        with pytest.raises(ValueError, match="has app_state"):
+            Checkpoint.restore("app-no-fn", store=tmp_dir)
 
     def test_restore_nonexistent_raises(self, tmp_dir):
         with pytest.raises(FileNotFoundError):

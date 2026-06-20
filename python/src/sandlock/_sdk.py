@@ -861,18 +861,25 @@ class Checkpoint:
     def restore(
         cls,
         name: str,
-        restore_fn: "Callable[[bytes], None]",
+        restore_fn: "Callable[[bytes], None] | None" = None,
         *,
         store: "Path | str | None" = None,
     ) -> "Checkpoint":
-        """Load a checkpoint and pass its app state to restore_fn.
+        """Load a checkpoint and, if it carries app state, pass it to restore_fn.
 
-        Convenience for ``load()`` + calling ``restore_fn(cp.app_state)``.
+        Convenience for ``load()`` plus calling ``restore_fn(cp.app_state)``.
+
+        ``restore_fn`` mirrors ``save_fn`` on ``Sandbox.checkpoint``: a checkpoint
+        taken without ``save_fn`` has no app state and is restored without
+        ``restore_fn``; a checkpoint taken with ``save_fn`` carries app state and
+        must be restored with ``restore_fn``. Supplying exactly one of the pair
+        is an error.
 
         Args:
             name: Checkpoint name.
-            restore_fn: Callback that receives the saved application-level
-                state bytes. Use this to rebuild state that ptrace can't
+            restore_fn: Optional callback receiving the saved application-level
+                state bytes. Required if (and only if) the checkpoint was taken
+                with ``save_fn``. Use it to rebuild state that ptrace cannot
                 capture (caches, session data, etc.).
             store: Storage root. Defaults to ``~/.sandlock/checkpoints/``.
 
@@ -881,16 +888,26 @@ class Checkpoint:
 
         Raises:
             FileNotFoundError: If the checkpoint does not exist.
-            ValueError: If the checkpoint has no app_state.
+            ValueError: If the checkpoint has app_state but no restore_fn was
+                given, or a restore_fn was given but the checkpoint has no
+                app_state.
         """
         cp = cls.load(name, store=store)
         state = cp.app_state
-        if state is None:
+        has_state = state is not None
+        has_fn = restore_fn is not None
+        if has_state and not has_fn:
             raise ValueError(
-                f"Checkpoint {name!r} has no app_state — "
-                "was it created with save_fn?"
+                f"Checkpoint {name!r} has app_state; pass restore_fn to "
+                "consume it (it was created with save_fn)"
             )
-        restore_fn(state)
+        if has_fn and not has_state:
+            raise ValueError(
+                f"Checkpoint {name!r} has no app_state; restore_fn was given "
+                "but there is nothing to pass (was it created with save_fn?)"
+            )
+        if has_fn:
+            restore_fn(state)
         return cp
 
     @classmethod
