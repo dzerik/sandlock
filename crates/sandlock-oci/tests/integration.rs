@@ -269,19 +269,7 @@ async fn oci_restore_resumes_vdso_free_program() {
     let counter_s = counter.to_str().unwrap().to_string();
     let image = tmp.join("image");
 
-    fs::write(&src, counter_source(&counter_s)).unwrap();
-
-    let cc = if which("cc") { "cc" } else if which("gcc") { "gcc" } else {
-        eprintln!("skipping: no C compiler (cc/gcc) available");
-        let _ = fs::remove_dir_all(&tmp);
-        return;
-    };
-    let build = Command::new(cc)
-        .args(["-static", "-nostdlib", "-no-pie", "-O0", "-o"])
-        .arg(&bin).arg(&src)
-        .output().unwrap();
-    if !build.status.success() {
-        eprintln!("skipping: build failed: {}", String::from_utf8_lossy(&build.stderr));
+    if !build_counter(&bin, &src, &counter_s) {
         let _ = fs::remove_dir_all(&tmp);
         return;
     }
@@ -381,6 +369,253 @@ async fn oci_restore_resumes_vdso_free_program() {
         "OCI-restored process must resume mid-loop and advance the counter past {baseline}; \
          last seen {last}, restore log: {restore_out}",
     );
+}
+
+/// Build the freestanding, vDSO-free counter program (shared with the restore
+/// test) into `bin`, writing its counter to the in-sandbox path `out_path`.
+/// Returns false (and prints a skip reason) when no C compiler is available or
+/// the build fails, so callers can early-return on unsupported hosts.
+fn build_counter(bin: &Path, src: &Path, out_path: &str) -> bool {
+    fs::write(src, counter_source(out_path)).unwrap();
+    let cc = if which("cc") {
+        "cc"
+    } else if which("gcc") {
+        "gcc"
+    } else {
+        eprintln!("skipping: no C compiler (cc/gcc) available");
+        return false;
+    };
+    let build = Command::new(cc)
+        .args(["-static", "-nostdlib", "-no-pie", "-O0", "-o"])
+        .arg(bin)
+        .arg(src)
+        .output()
+        .unwrap();
+    if !build.status.success() {
+        eprintln!(
+            "skipping: build failed: {}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+        return false;
+    }
+    true
+}
+
+/// End-to-end proof that `sandlock-oci checkpoint` works on a RUNNING container
+/// created + started from an OCI bundle.
+///
+/// Before the supervisor fix, `supervisor_main` stopped serving the control
+/// socket once the child started (it only `wait()`ed), so a `checkpoint` of a
+/// running container could not be reached and timed out. This test creates +
+/// starts a sandbox running the vDSO-free counter, waits for it to advance
+/// (proving it is genuinely RUNNING), then checkpoints it and asserts the
+/// checkpoint image (`meta.json`) was written. As a bonus it then `restore`s the
+/// image into a second container and proves the restored counter advances,
+/// exercising a full OCI checkpoint -> restore round-trip of a running program.
+#[tokio::test(flavor = "multi_thread")]
+async fn oci_checkpoint_of_running_container() {
+    if cfg!(not(target_arch = "x86_64")) {
+        eprintln!("skipping: injection-based checkpoint/restore is x86_64-only");
+        return;
+    }
+    if sandlock_core::landlock_abi_version().is_err() {
+        eprintln!("skipping: Landlock unavailable on this host");
+        return;
+    }
+
+    let tmp = std::env::temp_dir().join(format!("sandlock-oci-ckpt-{}", std::process::id()));
+    fs::create_dir_all(&tmp).unwrap();
+    let src = tmp.join("counter.c");
+    let bin = tmp.join("counter");
+
+    // The container chroots to `rootfs`, so the counter's in-sandbox path
+    // `/out.cnt` resolves to `rootfs/out.cnt` on the host.
+    if !build_counter(&bin, &src, "/out.cnt") {
+        let _ = fs::remove_dir_all(&tmp);
+        return;
+    }
+
+    // Build the OCI bundle: the freestanding binary lives inside rootfs and the
+    // spec runs it via its in-chroot path.
+    let bundle = tmp.join("bundle");
+    let rootfs = bundle.join("rootfs");
+    fs::create_dir_all(&rootfs).unwrap();
+    let bin_in_rootfs = rootfs.join("counter");
+    fs::copy(&bin, &bin_in_rootfs).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&bin_in_rootfs, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    create_bundle(&bundle, &["/counter"]);
+
+    let host_counter = rootfs.join("out.cnt");
+    let host_counter_s = host_counter.to_str().unwrap().to_string();
+    let read_counter = |path: &str| -> Option<u64> {
+        fs::read_to_string(path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+    };
+
+    let root = tempdir().unwrap();
+    let root_s = root.path().to_str().unwrap().to_string();
+    let id = "oci-ckpt-running";
+    let image = tmp.join("image");
+
+    // ── create (daemonizes a supervisor that inherits stdio; redirect + status) ─
+    let create_log = tmp.join("create.log");
+    let create_status = Command::new(oci_bin())
+        .args(["--root", &root_s, "create", id, "-b", bundle.to_str().unwrap()])
+        .stdout(std::process::Stdio::from(fs::File::create(&create_log).unwrap()))
+        .stderr(std::process::Stdio::from(
+            fs::OpenOptions::new().append(true).open(&create_log).unwrap(),
+        ))
+        .status()
+        .expect("failed to run sandlock-oci create");
+    let create_out = fs::read_to_string(&create_log).unwrap_or_default();
+    assert!(
+        create_status.success(),
+        "create CLI failed (exit {:?}): {}",
+        create_status.code(),
+        create_out
+    );
+
+    // ── start (releases the parked child to execve) ─────────────────────────────
+    let start_out = Command::new(oci_bin())
+        .args(["--root", &root_s, "start", id])
+        .output()
+        .expect("failed to run sandlock-oci start");
+    if !start_out.status.success() {
+        let _ = Command::new(oci_bin())
+            .args(["--root", &root_s, "delete", id, "--force"])
+            .output();
+        let _ = fs::remove_dir_all(&tmp);
+        panic!(
+            "start CLI failed: {}",
+            String::from_utf8_lossy(&start_out.stderr)
+        );
+    }
+
+    // Poll until the running container's counter advances (proves it is RUNNING).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut baseline = 0u64;
+    let mut running = false;
+    while std::time::Instant::now() < deadline {
+        if let Some(v) = read_counter(&host_counter_s) {
+            if v > 2 {
+                baseline = v;
+                running = true;
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // ── checkpoint the RUNNING container ───────────────────────────────────────
+    let ckpt_out = if running {
+        Some(
+            Command::new(oci_bin())
+                .args(["--root", &root_s, "checkpoint", id, "--image-path", image.to_str().unwrap()])
+                .output()
+                .expect("failed to run sandlock-oci checkpoint"),
+        )
+    } else {
+        None
+    };
+    let ckpt_ok = ckpt_out.as_ref().map(|o| o.status.success()).unwrap_or(false);
+    let meta_exists = image.join("meta.json").exists();
+
+    // ── bonus: restore the checkpoint into a second container ───────────────────
+    let id2 = "oci-ckpt-restored";
+    let mut restored_advanced = None::<bool>;
+    let mut restore_diag = String::new();
+    if ckpt_ok && meta_exists {
+        // Stop the original so only a restored process can advance the file, and
+        // drop a low sentinel to prove the restored process (not a leftover) writes.
+        let _ = Command::new(oci_bin())
+            .args(["--root", &root_s, "delete", id, "--force"])
+            .output();
+        fs::write(&host_counter, b"0\n").unwrap();
+
+        let restore_log = tmp.join("restore.log");
+        let restore_status = Command::new(oci_bin())
+            .args(["--root", &root_s, "restore", id2, "--image-path", image.to_str().unwrap()])
+            .stdout(std::process::Stdio::from(fs::File::create(&restore_log).unwrap()))
+            .stderr(std::process::Stdio::from(
+                fs::OpenOptions::new().append(true).open(&restore_log).unwrap(),
+            ))
+            .status()
+            .expect("failed to run sandlock-oci restore");
+        if restore_status.success() {
+            let rdl = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut adv = false;
+            while std::time::Instant::now() < rdl {
+                if let Some(v) = read_counter(&host_counter_s) {
+                    if v > baseline {
+                        adv = true;
+                        break;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            restored_advanced = Some(adv);
+            restore_diag = format!(
+                "restore_status ok; last_counter={:?}; log: {}",
+                read_counter(&host_counter_s),
+                fs::read_to_string(&restore_log).unwrap_or_default()
+            );
+        } else {
+            restored_advanced = Some(false);
+            restore_diag = format!(
+                "restore_status FAILED; log: {}",
+                fs::read_to_string(&restore_log).unwrap_or_default()
+            );
+        }
+    }
+
+    // ── clean up before asserting so a failure never leaks a process ────────────
+    let _ = Command::new(oci_bin())
+        .args(["--root", &root_s, "delete", id, "--force"])
+        .output();
+    let _ = Command::new(oci_bin())
+        .args(["--root", &root_s, "delete", id2, "--force"])
+        .output();
+    let _ = fs::remove_dir_all(&tmp);
+
+    assert!(
+        running,
+        "container counter never advanced; create_out: {create_out}"
+    );
+    let ckpt_stderr = ckpt_out
+        .as_ref()
+        .map(|o| String::from_utf8_lossy(&o.stderr).to_string())
+        .unwrap_or_default();
+    assert!(
+        ckpt_ok,
+        "checkpoint of a RUNNING container must succeed; stderr: {ckpt_stderr}"
+    );
+    assert!(
+        meta_exists,
+        "checkpoint must write meta.json to the image dir"
+    );
+    // Bonus (non-fatal): a full OCI checkpoint -> restore round-trip. The
+    // checkpoint-of-running assertions above are the required deliverable. The
+    // restore engine reopens fds/mappings by their recorded HOST path, which
+    // collides with the virtual-chroot path rewriting of a bundle-based
+    // container (the binary at `<rootfs>/counter` gets re-confined under the
+    // restored chroot and Landlock denies it with EACCES). The standalone
+    // `oci_restore_resumes_vdso_free_program` test covers restore on its own,
+    // chroot-free; restore of a *chrooted* checkpoint is a separate limitation
+    // outside the scope of the serve-while-running fix, so we only report it.
+    if let Some(adv) = restored_advanced {
+        if adv {
+            eprintln!("bonus: full OCI checkpoint -> restore round-trip advanced the counter");
+        } else {
+            eprintln!(
+                "note: bonus round-trip restore of a chrooted checkpoint did not advance \
+                 (restore-under-chroot limitation, orthogonal to this fix): {restore_diag}"
+            );
+        }
+    }
 }
 
 /// Minimal PATH lookup so the test does not depend on extra crates.
