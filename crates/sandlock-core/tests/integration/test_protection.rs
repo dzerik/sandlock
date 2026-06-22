@@ -1,9 +1,13 @@
 //! Integration tests for the per-protection availability resolution
 //! in `landlock::confine_inner`.
 //!
-//! These tests exercise the policy-driven resolution path directly via
-//! the `ProtectionStatus::resolve()` helper with synthetic ABI values,
-//! so they are independent of the host kernel's actual Landlock ABI.
+//! Most of these tests exercise the policy-driven resolution path
+//! directly via the `ProtectionStatus::resolve()` helper with synthetic
+//! ABI values, so they are independent of the host kernel's actual
+//! Landlock ABI. The one exception is
+//! `degraded_policy_confines_and_runs_below_v6`, which builds and runs a
+//! genuinely confined child to cover the end-to-end degrade path on a
+//! real low-ABI kernel; it self-skips where Landlock is unavailable.
 
 use sandlock_core::landlock::compute_fs_mask;
 use sandlock_core::{Protection, ProtectionPolicy, ProtectionState, ProtectionStatus};
@@ -459,4 +463,73 @@ fn disable_fsrefer_is_rejected_at_build() {
         .allow_degraded(Protection::FsRefer)
         .build()
         .expect("allow_degraded(FsRefer) must remain allowed");
+}
+
+// ----------------------------------------------------------------------
+// End-to-end degrade path: real confinement on a low-ABI host
+//
+// Unlike the synthetic resolve() tests above, this one builds and runs a
+// genuinely confined child. A *fully degradable* policy must build on
+// any Landlock-capable kernel and confine with whatever the host
+// supports, degrading (silently skipping) the scopes it lacks instead of
+// hard-failing the way the default `strict_all()` does below ABI 6.
+//
+// This is the test that gives the ubuntu-22.04 CI runner (a 6.8 Azure
+// kernel, Landlock ABI v4) its purpose: there, SignalScope /
+// AbstractUnixSocketScope (v6) and FsIoctlDev (v5) resolve to Degraded,
+// exercising the opt-out path end-to-end. On a v6 host the same scopes
+// resolve Active and the degrade assertion is skipped. Where Landlock is
+// unavailable entirely, the test self-skips rather than failing.
+// ----------------------------------------------------------------------
+
+#[tokio::test]
+async fn degraded_policy_confines_and_runs_below_v6() {
+    let abi = match sandlock_core::landlock_abi_version() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Skipping: Landlock unavailable ({e})");
+            return;
+        }
+    };
+
+    let mut builder = sandlock_core::Sandbox::builder();
+    for p in Protection::all() {
+        builder = builder.allow_degraded(p);
+    }
+    let sandbox = builder
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .build()
+        .expect("a fully-degradable policy must build on any Landlock host");
+
+    // Below ABI 6, every scope the host cannot provide must resolve to
+    // Degraded — not Unavailable, which is what makes `confine` refuse.
+    if abi < 6 {
+        let states = sandbox
+            .active_protections()
+            .expect("resolve protections against host ABI");
+        for (p, status) in &states {
+            if p.min_abi() > abi {
+                assert_eq!(
+                    *status,
+                    ProtectionStatus::Degraded,
+                    "{p:?} (needs v{}) on a v{abi} host must degrade, not fail",
+                    p.min_abi()
+                );
+            }
+        }
+    }
+
+    let result = sandbox
+        .with_name("degraded")
+        .run(&["echo", "ok"])
+        .await
+        .expect("a confined child must run under a degraded policy");
+    assert!(
+        result.success(),
+        "degraded-mode confinement must still execute the child"
+    );
 }
