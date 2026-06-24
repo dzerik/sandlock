@@ -260,22 +260,39 @@ impl SeccompCowBranch {
 
     /// Execute a file copy synchronously. Used by `ensure_cow_copy` and the
     /// async dispatch (via `spawn_blocking`).
-    pub fn execute_copy(upper: &Path, lower: &Path) -> Result<(), std::io::Error> {
-        match fs::copy(lower, upper) {
-            Ok(_) => {
-                if let Ok(meta) = lower.metadata() {
-                    let _ = fs::set_permissions(upper, meta.permissions());
-                }
-                Ok(())
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                // Can't read the lower file (e.g. root-owned 0640).
-                // Create an empty file in upper so writes can proceed.
+    pub fn execute_copy(
+        workdir_root: &Path,
+        rel: &str,
+        upper: &Path,
+    ) -> Result<(), std::io::Error> {
+        use std::os::unix::io::FromRawFd;
+
+        // Read the lower source confined to the workdir root: a symlink or
+        // `..` in `rel` cannot escape the tree (issue #112).
+        let fd = match crate::sys::fs::openat2_in_root(
+            workdir_root,
+            rel,
+            libc::O_RDONLY | libc::O_CLOEXEC,
+            0,
+        ) {
+            Ok(fd) => fd,
+            // Unreadable (EACCES) or confined-out / absent (ENOENT): give the
+            // child an empty COW file so writes proceed, never leaking the
+            // escape target.
+            Err(libc::EACCES) | Err(libc::ENOENT) => {
                 fs::File::create(upper)?;
-                Ok(())
+                return Ok(());
             }
-            Err(e) => Err(e),
+            Err(e) => return Err(std::io::Error::from_raw_os_error(e)),
+        };
+
+        let mut src = unsafe { fs::File::from_raw_fd(fd) };
+        let mut dst = fs::File::create(upper)?;
+        std::io::copy(&mut src, &mut dst)?;
+        if let Ok(meta) = src.metadata() {
+            let _ = fs::set_permissions(upper, meta.permissions());
         }
+        Ok(())
     }
 
     /// Ensure a COW copy exists in upper (synchronous). Returns the upper path.
@@ -283,8 +300,8 @@ impl SeccompCowBranch {
     pub fn ensure_cow_copy(&mut self, rel_path: &str) -> Result<PathBuf, BranchError> {
         match self.prepare_copy(rel_path)? {
             CowCopyPlan::Ready(upper) => Ok(upper),
-            CowCopyPlan::NeedsCopy { upper, lower, file_size } => {
-                match Self::execute_copy(&upper, &lower) {
+            CowCopyPlan::NeedsCopy { upper, lower: _lower, file_size } => {
+                match Self::execute_copy(&self.workdir, rel_path, &upper) {
                     Ok(()) => Ok(upper),
                     Err(e) => {
                         self.rollback_copy(file_size);
@@ -1463,5 +1480,34 @@ mod tests {
         // unlink (is_dir=false) on a regular file should succeed.
         let path = abs(&branch, "existing.txt");
         assert!(branch.handle_unlink(&path, false).unwrap());
+    }
+
+    #[test]
+    fn copy_up_does_not_follow_symlinked_parent() {
+        // workdir/evil -> /etc ; writing evil/group must not copy /etc/group.
+        let (workdir, storage) = setup_workdir();
+        std::os::unix::fs::symlink("/etc", workdir.path().join("evil")).unwrap();
+        let mut branch =
+            SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+
+        // ensure_cow_copy on a path reached through the symlinked parent.
+        let upper = branch.ensure_cow_copy("evil/group").unwrap();
+
+        // The upper file must NOT contain the host /etc/group contents.
+        let host = std::fs::read_to_string("/etc/group").unwrap_or_default();
+        let copied = std::fs::read_to_string(&upper).unwrap_or_default();
+        assert!(
+            copied.is_empty() || copied != host,
+            "copy-up leaked /etc/group into the upper layer"
+        );
+    }
+
+    #[test]
+    fn copy_up_copies_legitimate_in_tree_file() {
+        let (workdir, storage) = setup_workdir();
+        let mut branch =
+            SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let upper = branch.ensure_cow_copy("existing.txt").unwrap();
+        assert_eq!(std::fs::read_to_string(&upper).unwrap(), "hello");
     }
 }
