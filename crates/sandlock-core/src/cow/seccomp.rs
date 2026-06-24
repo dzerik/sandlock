@@ -6,6 +6,8 @@
 
 use std::collections::HashSet;
 use std::fs;
+use std::os::unix::ffi::OsStringExt;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use crate::error::BranchError;
@@ -207,7 +209,9 @@ impl SeccompCowBranch {
         let upper_file = self.upper.join(rel_path);
         let lower_file = self.workdir.join(rel_path);
 
-        if upper_file.exists() || upper_file.is_symlink() {
+        // Already materialized in upper? Confined lstat succeeds for any
+        // existing entry (including a dangling symlink).
+        if crate::sys::fs::statat_in_root(&self.upper, rel_path, false).is_ok() {
             return Ok(CowCopyPlan::Ready(upper_file));
         }
 
@@ -216,11 +220,26 @@ impl SeccompCowBranch {
                 .map_err(|e| BranchError::Operation(format!("create parent: {}", e)))?;
         }
 
-        // Symlink — copy immediately (tiny, not worth deferring)
-        if lower_file.is_symlink() {
+        // Classify the lower entry confined to the workdir root, so a symlinked
+        // parent component cannot make us follow out of the tree (issue #112).
+        // The lstat also yields the size of the entry we will actually copy.
+        let st = match crate::sys::fs::statat_in_root(&self.workdir, rel_path, false) {
+            Ok(st) => st,
+            // Absent or confined-out: treat as a new file created in upper.
+            Err(libc::ENOENT) => {
+                self.check_quota(0)?;
+                return Ok(CowCopyPlan::Ready(upper_file));
+            }
+            Err(e) => return Err(BranchError::Operation(format!("stat lower: {}", e))),
+        };
+        let kind = st.st_mode & libc::S_IFMT;
+
+        // Symlink — copy verbatim (tiny, not worth deferring)
+        if kind == libc::S_IFLNK {
             self.check_quota(256)?;
-            let target = fs::read_link(&lower_file)
+            let target = crate::sys::fs::readlink_in_root(&self.workdir, rel_path)
                 .map_err(|e| BranchError::Operation(format!("readlink: {}", e)))?;
+            let target = std::path::PathBuf::from(std::ffi::OsString::from_vec(target));
             std::os::unix::fs::symlink(&target, &upper_file)
                 .map_err(|e| BranchError::Operation(format!("symlink: {}", e)))?;
             self.disk_used += 256;
@@ -228,34 +247,29 @@ impl SeccompCowBranch {
         }
 
         // Directory — create immediately (no data copy)
-        if lower_file.is_dir() {
+        if kind == libc::S_IFDIR {
             self.check_quota(4096)?;
             fs::create_dir_all(&upper_file)
                 .map_err(|e| BranchError::Operation(format!("create dir: {}", e)))?;
-            if let Ok(meta) = lower_file.metadata() {
-                let _ = fs::set_permissions(&upper_file, meta.permissions());
-            }
+            let _ = fs::set_permissions(
+                &upper_file,
+                std::fs::Permissions::from_mode(st.st_mode & 0o7777),
+            );
             self.disk_used += 4096;
             return Ok(CowCopyPlan::Ready(upper_file));
         }
 
-        // Regular file — defer the potentially expensive copy
-        if lower_file.exists() {
-            let meta = lower_file.metadata()
-                .map_err(|e| BranchError::Operation(format!("metadata: {}", e)))?;
-            let file_size = meta.len();
-            self.check_quota(file_size)?;
-            self.disk_used += file_size;
-            return Ok(CowCopyPlan::NeedsCopy {
-                upper: upper_file,
-                lower: lower_file,
-                file_size,
-            });
-        }
-
-        // New file (not in lower layer)
-        self.check_quota(0)?;
-        Ok(CowCopyPlan::Ready(upper_file))
+        // Regular file — defer the potentially expensive copy. Size comes from
+        // the confined lstat, so the quota reservation matches the file
+        // execute_copy will actually read.
+        let file_size = st.st_size as u64;
+        self.check_quota(file_size)?;
+        self.disk_used += file_size;
+        Ok(CowCopyPlan::NeedsCopy {
+            upper: upper_file,
+            lower: lower_file,
+            file_size,
+        })
     }
 
     /// Execute a file copy synchronously. Used by `ensure_cow_copy` and the
@@ -704,15 +718,14 @@ impl SeccompCowBranch {
         if self.is_deleted(&rel) {
             return None;
         }
-        let upper = self.upper.join(&rel);
-        let lower = self.workdir.join(&rel);
-        if upper.is_symlink() {
-            fs::read_link(&upper).ok().map(|p| p.to_string_lossy().into_owned())
-        } else if lower.is_symlink() {
-            fs::read_link(&lower).ok().map(|p| p.to_string_lossy().into_owned())
-        } else {
-            None
+        // Read the link confined to each layer root so a symlinked parent
+        // component cannot escape the tree (issue #112).
+        for root in [&self.upper, &self.workdir] {
+            if let Ok(target) = crate::sys::fs::readlink_in_root(root, &rel) {
+                return Some(String::from_utf8_lossy(&target).into_owned());
+            }
         }
+        None
     }
 
     /// List all filesystem changes in the COW layer.
@@ -1553,5 +1566,21 @@ mod tests {
         // The workdir entry must not have become a regular file holding the host content.
         let meta = std::fs::symlink_metadata(&committed).unwrap();
         assert!(meta.file_type().is_symlink());
+    }
+
+    #[test]
+    fn cow_copy_preserves_in_tree_symlink() {
+        // The confined-stat classification in prepare_copy must still treat an
+        // in-tree symlink as a symlink and copy it verbatim into upper.
+        let (workdir, storage) = setup_workdir();
+        std::os::unix::fs::symlink("existing.txt", workdir.path().join("link")).unwrap();
+        let mut branch =
+            SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let upper = branch.ensure_cow_copy("link").unwrap();
+        assert!(upper.is_symlink(), "in-tree symlink was not preserved");
+        assert_eq!(
+            std::fs::read_link(&upper).unwrap(),
+            std::path::Path::new("existing.txt")
+        );
     }
 }

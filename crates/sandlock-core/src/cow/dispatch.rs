@@ -154,13 +154,16 @@ fn map_cow_upper_path(cow: &SeccompCowBranch, path: &str) -> String {
 /// child-controlled path cannot escape the upper/lower tree (issue #112).
 /// Picks the anchor root by prefix, then defers all resolution to the kernel
 /// via `openat2(RESOLVE_IN_ROOT)`.
-fn open_confined(
-    upper_root: &Path,
-    workdir_root: &Path,
+/// Select the layer root (`upper` first, then `workdir`) that `real_path` lives
+/// under and return it with the relative remainder. `Err(EACCES)` if the path
+/// is under neither root. This only selects the anchor; the kernel re-resolves
+/// the relative path under it with `RESOLVE_IN_ROOT`, so the lexical
+/// `strip_prefix` grants no trust.
+fn pick_root_rel<'a>(
+    upper_root: &'a Path,
+    workdir_root: &'a Path,
     real_path: &Path,
-    flags: i32,
-    mode: u32,
-) -> Result<RawFd, i32> {
+) -> Result<(&'a Path, String), i32> {
     let (root, rel) = if let Ok(rel) = real_path.strip_prefix(upper_root) {
         (upper_root, rel)
     } else if let Ok(rel) = real_path.strip_prefix(workdir_root) {
@@ -168,8 +171,18 @@ fn open_confined(
     } else {
         return Err(libc::EACCES);
     };
-    let rel = rel.to_str().ok_or(libc::EINVAL)?;
-    crate::sys::fs::openat2_in_root(root, rel, flags, mode)
+    Ok((root, rel.to_str().ok_or(libc::EINVAL)?.to_string()))
+}
+
+fn open_confined(
+    upper_root: &Path,
+    workdir_root: &Path,
+    real_path: &Path,
+    flags: i32,
+    mode: u32,
+) -> Result<RawFd, i32> {
+    let (root, rel) = pick_root_rel(upper_root, workdir_root, real_path)?;
+    crate::sys::fs::openat2_in_root(root, &rel, flags, mode)
 }
 
 /// Handle openat under workdir: redirect to COW upper/lower.
@@ -702,22 +715,25 @@ pub(crate) async fn handle_cow_utimensat(
         None => return NotifAction::Continue,
     };
 
-    let upper_path = {
+    let (upper_path, upper_root, workdir_root) = {
         let mut st = cow_state.lock().await;
         let cow = match st.branch.as_mut() {
             Some(c) => c,
             None => return NotifAction::Continue,
         };
+        let upper_root = cow.upper_dir().to_path_buf();
+        let workdir_root = cow.workdir().to_path_buf();
         let path = map_cow_upper_path(cow, &path);
         if !cow.matches(&path) {
             return NotifAction::Continue;
         }
-        match cow.handle_utimensat(&path) {
+        let p = match cow.handle_utimensat(&path) {
             Ok(Some(p)) => p,
             Ok(None) => return NotifAction::Continue,
             Err(crate::error::BranchError::QuotaExceeded) => return NotifAction::Errno(libc::ENOSPC),
             Err(_) => return NotifAction::Continue,
-        }
+        };
+        (p, upper_root, workdir_root)
     };
 
     // Read times from child memory (2 x struct timespec = 32 bytes on x86_64)
@@ -736,13 +752,14 @@ pub(crate) async fn handle_cow_utimensat(
         None
     };
 
-    let c_path = match std::ffi::CString::new(upper_path.to_str().unwrap_or("")) {
-        Ok(c) => c,
-        Err(_) => return NotifAction::Continue,
+    let (root, rel) = match pick_root_rel(&upper_root, &workdir_root, &upper_path) {
+        Ok(v) => v,
+        Err(e) => return NotifAction::Errno(e),
     };
     let times_raw = times.as_ref().map(|t| t.as_ptr()).unwrap_or(std::ptr::null());
-    if unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times_raw, flags) } < 0 {
-        return NotifAction::Errno(libc::EIO);
+    let follow = (flags & libc::AT_SYMLINK_NOFOLLOW) == 0;
+    if let Err(e) = crate::sys::fs::utimensat_in_root(root, &rel, times_raw, follow) {
+        return NotifAction::Errno(e);
     }
     NotifAction::ReturnValue(0)
 }
@@ -771,49 +788,52 @@ pub(crate) async fn handle_cow_stat(
         None => return NotifAction::Continue,
     };
 
-    let st = cow_state.lock().await;
-    let cow = match st.branch.as_ref() {
-        Some(c) => c,
-        None => return NotifAction::Continue,
-    };
-
-    let path = map_cow_upper_path(cow, &path);
-    if !cow.has_changes() || !cow.matches(&path) {
-        return NotifAction::Continue;
-    }
-
-    let real_path = match cow.handle_stat(&path) {
-        Some(p) => p,
-        None => {
-            return NotifAction::Errno(libc::ENOENT);
+    let (real_path, upper_root, workdir_root) = {
+        let st = cow_state.lock().await;
+        let cow = match st.branch.as_ref() {
+            Some(c) => c,
+            None => return NotifAction::Continue,
+        };
+        let upper_root = cow.upper_dir().to_path_buf();
+        let workdir_root = cow.workdir().to_path_buf();
+        let path = map_cow_upper_path(cow, &path);
+        if !cow.has_changes() || !cow.matches(&path) {
+            return NotifAction::Continue;
         }
+        let real = match cow.handle_stat(&path) {
+            Some(p) => p,
+            None => return NotifAction::Errno(libc::ENOENT),
+        };
+        (real, upper_root, workdir_root)
     };
-    drop(st);
 
     if nr == libc::SYS_faccessat || nr == crate::arch::SYS_FACCESSAT2 {
-        // For faccessat, just check if the file exists (we already resolved it)
-        if real_path.exists() || real_path.is_symlink() {
+        // Existence check, confined: lstat succeeds for any present entry
+        // (including a dangling symlink), matching the prior semantics.
+        let (root, rel) = match pick_root_rel(&upper_root, &workdir_root, &real_path) {
+            Ok(v) => v,
+            Err(_) => return NotifAction::Errno(libc::ENOENT),
+        };
+        if crate::sys::fs::statat_in_root(root, &rel, false).is_ok() {
             return NotifAction::ReturnValue(0);
         }
         return NotifAction::Errno(libc::ENOENT);
     }
 
-    // newfstatat — stat the resolved path and write the native libc layout
-    // back to the child. Do not hand-pack struct stat; its layout is
-    // architecture-specific.
+    // newfstatat — stat the resolved path (confined to its layer root) and
+    // write the native libc layout back to the child. Do not hand-pack struct
+    // stat; its layout is architecture-specific.
     let statbuf_addr = notif.data.args[2];
     let flags = (notif.data.args[3] & 0xFFFF_FFFF) as i32;
-    let c_path = match std::ffi::CString::new(real_path.to_str().unwrap_or("")) {
-        Ok(c) => c,
-        Err(_) => return NotifAction::Continue,
+    let follow = (flags & libc::AT_SYMLINK_NOFOLLOW) == 0;
+    let (root, rel) = match pick_root_rel(&upper_root, &workdir_root, &real_path) {
+        Ok(v) => v,
+        Err(e) => return NotifAction::Errno(e),
     };
-    let mut statbuf: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::fstatat(libc::AT_FDCWD, c_path.as_ptr(), &mut statbuf, flags) } < 0 {
-        let errno = std::io::Error::last_os_error()
-            .raw_os_error()
-            .unwrap_or(libc::EIO);
-        return NotifAction::Errno(errno);
-    }
+    let statbuf = match crate::sys::fs::statat_in_root(root, &rel, follow) {
+        Ok(s) => s,
+        Err(e) => return NotifAction::Errno(e),
+    };
     let buf = unsafe {
         std::slice::from_raw_parts(
             &statbuf as *const libc::stat as *const u8,
@@ -859,44 +879,32 @@ pub(crate) async fn handle_cow_statx(
         _ => return NotifAction::Continue,
     };
 
-    let real_path = {
+    let (real_path, upper_root, workdir_root) = {
         let st = cow_state.lock().await;
         let cow = match st.branch.as_ref() {
             Some(c) => c,
             None => return NotifAction::Continue,
         };
-
+        let upper_root = cow.upper_dir().to_path_buf();
+        let workdir_root = cow.workdir().to_path_buf();
         let path = map_cow_upper_path(cow, &path);
         if !cow.has_changes() || !cow.matches(&path) {
             return NotifAction::Continue;
         }
-
-        match cow.handle_stat(&path) {
+        let real = match cow.handle_stat(&path) {
             Some(p) => p,
             None => return NotifAction::Errno(libc::ENOENT), // deleted or absent
-        }
+        };
+        (real, upper_root, workdir_root)
     };
 
-    let c_path = match std::ffi::CString::new(real_path.to_str().unwrap_or("")) {
-        Ok(c) => c,
-        Err(_) => return NotifAction::Continue,
+    let (root, rel) = match pick_root_rel(&upper_root, &workdir_root, &real_path) {
+        Ok(v) => v,
+        Err(e) => return NotifAction::Errno(e),
     };
     let mut stx_buf = vec![0u8; 256]; // sizeof(struct statx)
-    let ret = unsafe {
-        libc::syscall(
-            libc::SYS_statx,
-            libc::AT_FDCWD,
-            c_path.as_ptr(),
-            flags,
-            mask,
-            stx_buf.as_mut_ptr(),
-        )
-    };
-    if ret < 0 {
-        let errno = std::io::Error::last_os_error()
-            .raw_os_error()
-            .unwrap_or(libc::EIO);
-        return NotifAction::Errno(errno);
+    if let Err(e) = crate::sys::fs::statx_in_root(root, &rel, flags, mask, &mut stx_buf) {
+        return NotifAction::Errno(e);
     }
 
     if write_child_mem(notif_fd, notif.id, notif.pid, statxbuf_addr, &stx_buf).is_err() {
