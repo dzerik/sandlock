@@ -1631,32 +1631,34 @@ mod tests {
 
     #[test]
     fn upper_write_does_not_escape_through_symlink() {
-        // workdir/evil -> /etc (absolute symlink). Copy it up verbatim into
-        // upper so upper/evil is also an absolute symlink. Then invoke
-        // handle_mkdir with a path that would go through that symlink.
-        // The confined mkdirp_in_root must clamp the walk to the upper root
-        // and never create /etc/sandlock_escape_dir on the host.
+        // workdir/evil -> <outside> (absolute symlink to a writable dir
+        // outside the sandbox). Copy it up verbatim so upper/evil is also that
+        // absolute symlink, then mkdir through it. The confined mkdirp must
+        // clamp to the upper root, refuse, and never create the dir in
+        // <outside>. Pointing at a writable TempDir (not /etc) means the test
+        // distinguishes the fix from the old lexical code even when not root.
         let (workdir, storage) = setup_workdir();
-        std::os::unix::fs::symlink("/etc", workdir.path().join("evil")).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), workdir.path().join("evil")).unwrap();
         let mut branch =
             SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
 
-        // Copy up the symlink so upper/evil -> /etc verbatim.
         branch.ensure_cow_copy("evil").unwrap();
         assert!(
             branch.upper_dir().join("evil").is_symlink(),
             "precondition: upper/evil must be a verbatim symlink"
         );
 
-        // Attempt to mkdir via the symlinked parent component.
         let wd = workdir.path().canonicalize().unwrap();
         let escape_path = format!("{}/evil/sandlock_escape_dir", wd.display());
-        let _ = branch.handle_mkdir(&escape_path);
-
-        // The confined write must not have escaped.
+        // Confined: the write is clamped to the upper root and must be refused.
         assert!(
-            !std::path::Path::new("/etc/sandlock_escape_dir").exists(),
-            "upper write escaped through symlinked parent into /etc"
+            !branch.handle_mkdir(&escape_path).unwrap(),
+            "handle_mkdir reported success writing through an escaping symlink"
+        );
+        assert!(
+            !outside.path().join("sandlock_escape_dir").exists(),
+            "upper write escaped through symlinked parent into the outside dir"
         );
     }
 }

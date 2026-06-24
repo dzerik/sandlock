@@ -550,8 +550,9 @@ pub(crate) async fn handle_cow_write(
         None => return NotifAction::Continue,
     };
 
-    // Phase 1: check if we need to pre-copy a file (under lock, no heavy I/O)
-    let (copy_plan, copy_workdir, copy_rel) = {
+    // Phase 1: check if we need to pre-copy a file (under lock, no heavy I/O).
+    // Capture both layer roots here so Phase 2 needs no second lock.
+    let (copy_plan, copy_workdir, copy_upper, copy_rel) = {
         let mut st = cow_state.lock().await;
         let cow = match st.branch.as_mut() {
             Some(c) => c,
@@ -562,30 +563,21 @@ pub(crate) async fn handle_cow_write(
         match cow_copy_rel(&op, cow) {
             Some((_match_path, ref rel)) => {
                 let workdir = cow.workdir().to_path_buf();
+                let upper = cow.upper_dir().to_path_buf();
                 match cow.prepare_copy(rel) {
-                    Ok(plan) => (Some(plan), workdir, rel.clone()),
+                    Ok(plan) => (Some(plan), workdir, upper, rel.clone()),
                     Err(crate::error::BranchError::QuotaExceeded) => return NotifAction::Errno(libc::ENOSPC),
                     Err(_) => return NotifAction::Continue,
                 }
             }
-            None => (None, std::path::PathBuf::new(), String::new()),
+            None => (None, std::path::PathBuf::new(), std::path::PathBuf::new(), String::new()),
         }
     };
     // Lock is released here
 
     // Phase 2: execute the file copy outside the lock (if needed)
     if let Some(crate::cow::seccomp::CowCopyPlan::NeedsCopy { upper, lower: _lower, file_size }) = copy_plan {
-        // copy_workdir is workdir_root; we need upper_root for the dest side.
-        // Re-acquire it briefly: execute_deferred_copy needs both roots.
-        let uroot = {
-            let st = cow_state.lock().await;
-            st.branch.as_ref().map(|c| c.upper_dir().to_path_buf())
-        };
-        let uroot = match uroot {
-            Some(p) => p,
-            None => return NotifAction::Continue,
-        };
-        if execute_deferred_copy(cow_state, copy_workdir, uroot, copy_rel, upper, file_size).await.is_none() {
+        if execute_deferred_copy(cow_state, copy_workdir, copy_upper, copy_rel, upper, file_size).await.is_none() {
             return NotifAction::Continue;
         }
     }
