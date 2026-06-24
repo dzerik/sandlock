@@ -9,6 +9,8 @@
 //! - [`SandboxState`] — on-disk lifecycle state for a sandbox
 //! - [`SupervisorCmd`] / [`SupervisorReply`] — IPC messages for the supervisor
 
+pub mod fdpass;
+pub mod init;
 pub mod policy;
 pub mod spec;
 pub mod state;
