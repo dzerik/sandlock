@@ -1313,13 +1313,10 @@ fn resolve_path_for_notif(notif: &SeccompNotif, notif_fd: RawFd) -> Option<Strin
             let path = read_path_for_event(notif, notif.data.args[1], notif_fd)?;
             resolve_at_path_for_event(notif, notif.data.args[0] as i64, &path)
         }
-        // symlinkat(target, newdirfd, linkpath)
-        // The target string is what the symlink points to; deny if it names a denied path.
-        n if n == libc::SYS_symlinkat => {
-            let target = read_path_for_event(notif, notif.data.args[0], notif_fd)?;
-            // target may be absolute or relative to the process cwd
-            resolve_at_path_for_event(notif, libc::AT_FDCWD as i64, &target)
-        }
+        // symlinkat/symlink intentionally omitted: creating a symlink does
+        // not access its target, so there is nothing to gate here. Any later
+        // open through the symlink resolves to the real target and is denied
+        // race-free on the open path (issue #111). See `on_behalf_open_for_deny`.
         // link(oldpath, newpath) — legacy, AT_FDCWD implied for both
         n if Some(n) == arch::sys_link() => {
             let path = read_path_for_event(notif, notif.data.args[0], notif_fd)?;
@@ -1329,11 +1326,6 @@ fn resolve_path_for_notif(notif: &SeccompNotif, notif_fd: RawFd) -> Option<Strin
         n if Some(n) == arch::sys_rename() => {
             let path = read_path_for_event(notif, notif.data.args[0], notif_fd)?;
             resolve_at_path_for_event(notif, libc::AT_FDCWD as i64, &path)
-        }
-        // symlink(target, linkpath) — legacy
-        n if Some(n) == arch::sys_symlink() => {
-            let target = read_path_for_event(notif, notif.data.args[0], notif_fd)?;
-            resolve_at_path_for_event(notif, libc::AT_FDCWD as i64, &target)
         }
         _ => None,
     }
@@ -1620,12 +1612,15 @@ async fn handle_notification(
     // Check dynamic path denials before dispatch
     let mut action = {
         let nr = notif.data.nr as i64;
+        // symlinkat/symlink are not gated: creating a symlink does not access
+        // its target (any open through it is denied race-free on the open
+        // path). See `resolve_path_for_notif`.
         let mut path_check_nrs = vec![
             libc::SYS_openat, arch::SYS_OPENAT2, libc::SYS_execve, libc::SYS_execveat,
-            libc::SYS_linkat, libc::SYS_renameat2, libc::SYS_symlinkat,
+            libc::SYS_linkat, libc::SYS_renameat2,
         ];
         path_check_nrs.extend([
-            arch::sys_open(), arch::sys_link(), arch::sys_rename(), arch::sys_symlink(),
+            arch::sys_open(), arch::sys_link(), arch::sys_rename(),
         ].into_iter().flatten());
         let should_precheck_denied = policy.chroot_root.is_none()
             && path_check_nrs.contains(&nr);

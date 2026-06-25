@@ -232,6 +232,10 @@ fn chroot_path_syscalls() -> Vec<i64> {
 }
 
 fn fs_denied_path_syscalls() -> Vec<i64> {
+    // symlinkat/symlink are intentionally absent: creating a symlink does not
+    // access its target, so there is nothing to deny at creation time. A later
+    // open through the symlink resolves to the real target and is denied
+    // race-free on the open path (issue #111).
     let mut v = vec![
         libc::SYS_openat,
         arch::SYS_OPENAT2,
@@ -239,14 +243,12 @@ fn fs_denied_path_syscalls() -> Vec<i64> {
         libc::SYS_execveat,
         libc::SYS_linkat,
         libc::SYS_renameat2,
-        libc::SYS_symlinkat,
     ];
     v.extend(
         [
             arch::sys_open(),
             arch::sys_link(),
             arch::sys_rename(),
-            arch::sys_symlink(),
         ]
         .into_iter()
         .flatten(),
