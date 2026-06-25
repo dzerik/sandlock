@@ -433,6 +433,16 @@ impl PolicyFnState {
             false
         }
     }
+
+    /// Whether any deny rule is currently in effect. Cheap gate for the
+    /// race-free on-behalf open path: with no denies there is no carve-out
+    /// to protect and opens are left to the kernel and Landlock.
+    pub fn has_denied_paths(&self) -> bool {
+        self.denied_paths
+            .read()
+            .map(|d| !d.is_empty())
+            .unwrap_or(false)
+    }
 }
 
 // ============================================================

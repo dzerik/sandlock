@@ -1497,3 +1497,64 @@ async fn test_isolate_signals_allows_self() {
 
     let _ = std::fs::remove_file(&out);
 }
+
+#[tokio::test]
+async fn test_deny_carveout_on_behalf_open_preserves_io() {
+    // Issue #111: with a deny active, openat/open run on-behalf in the
+    // supervisor (race-free) instead of Continue-ing to the kernel. This
+    // checks that the new path preserves normal I/O — allowed reads, allowed
+    // creates — while the denied carve-out inside the granted tree stays
+    // blocked.
+    let dir = temp_file("deny-onbehalf-dir");
+    let _ = std::fs::create_dir_all(&dir);
+    let ok = dir.join("ok.txt");
+    let secret = dir.join("secret.txt");
+    std::fs::write(&ok, "ok-data").unwrap();
+    std::fs::write(&secret, "secret-data").unwrap();
+    let created = dir.join("created.txt");
+    let _ = std::fs::remove_file(&created);
+
+    let policy = Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_write(dir.to_str().unwrap()) // grant the whole tree writable
+        .fs_deny(secret.to_str().unwrap()) // carve-out inside the grant
+        .build()
+        .unwrap();
+
+    // Allowed read still works (on-behalf probe + reopen path).
+    let r = policy
+        .clone()
+        .with_name("t")
+        .run(&["cat", ok.to_str().unwrap()])
+        .await
+        .unwrap();
+    assert!(r.success(), "allowed read must work through on-behalf open");
+
+    // Allowed create still works (on-behalf O_CREAT parent-resolve path).
+    let cmd = format!("echo hi > {}", created.display());
+    let w = policy
+        .clone()
+        .with_name("t")
+        .run_interactive(&["sh", "-c", &cmd])
+        .await
+        .unwrap();
+    assert!(w.success(), "allowed create must work through on-behalf open");
+    assert_eq!(std::fs::read_to_string(&created).unwrap().trim(), "hi");
+
+    // The denied carve-out stays blocked.
+    let d = policy
+        .clone()
+        .with_name("t")
+        .run(&["cat", secret.to_str().unwrap()])
+        .await
+        .unwrap();
+    assert!(!d.success(), "denied carve-out must stay blocked");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
