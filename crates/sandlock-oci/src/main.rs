@@ -339,6 +339,38 @@ fn run(cli: Cli) -> Result<()> {
     Ok(())
 }
 
+/// How the supervisor daemon should terminate so a reaping containerd shim sees
+/// a wait-status that mirrors the workload.
+#[derive(Debug, PartialEq, Eq)]
+enum ExitAction {
+    /// Exit with this code (workload exited normally).
+    Code(i32),
+    /// Re-raise this signal on self (workload was killed by it) so the shim sees
+    /// WIFSIGNALED and reports 128+signal, matching runc.
+    Raise(i32),
+}
+
+fn supervisor_exit_action(info: Option<state::ExitInfo>) -> ExitAction {
+    match info {
+        Some(state::ExitInfo { code: Some(c), .. }) => ExitAction::Code(c),
+        Some(state::ExitInfo { signal: Some(s), .. }) => ExitAction::Raise(s),
+        _ => ExitAction::Code(0),
+    }
+}
+
+/// Terminate the supervisor daemon with the workload's status. Diverges.
+fn supervisor_exit(info: Option<state::ExitInfo>) -> ! {
+    match supervisor_exit_action(info) {
+        ExitAction::Code(c) => unsafe { libc::_exit(c) },
+        ExitAction::Raise(s) => unsafe {
+            libc::signal(s as libc::c_int, libc::SIG_DFL);
+            libc::raise(s as libc::c_int);
+            // raise should not return for a default-action signal; fall back.
+            libc::_exit(128 + s)
+        },
+    }
+}
+
 /// `sandlock-oci create <id> -b <bundle>`
 ///
 /// 1. Parse OCI config.json from the bundle.
@@ -455,11 +487,13 @@ fn cmd_create(id: &str, bundle: &PathBuf, pid_file: Option<&std::path::Path>) ->
             }
         }
 
-        let _ = supervisor::run_supervisor(id, &cmd_args, policy, write_fd);
-        unsafe {
-            libc::close(write_fd);
-            libc::_exit(0);
-        }
+        let exit_info = supervisor::run_supervisor(id, &cmd_args, policy, write_fd)
+            .ok()
+            .flatten();
+        unsafe { libc::close(write_fd) };
+        // Exit with the workload's status so a reaping containerd shim reports
+        // the right container exit code/signal.
+        supervisor_exit(exit_info);
     }
 
     // ===== ORIGINAL PROCESS (caller) =====
@@ -477,7 +511,7 @@ fn cmd_create(id: &str, bundle: &PathBuf, pid_file: Option<&std::path::Path>) ->
     //   `OK <pid>\n`   — sandbox created, <pid> is the sandbox's init PID
     //   `ERR <msg>\n`  — setup failed; the sandbox was never created
     //   (EOF)          — supervisor crashed before writing; treated as error
-    let child_pid = {
+    let (supervisor_pid, init_pid) = {
         let mut buf = [0u8; 512];
         let n = unsafe {
             libc::read(read_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
@@ -489,8 +523,13 @@ fn cmd_create(id: &str, bundle: &PathBuf, pid_file: Option<&std::path::Path>) ->
         let response = String::from_utf8_lossy(&buf[..n as usize]);
         let response = response.trim();
         if let Some(rest) = response.strip_prefix("OK ") {
-            rest.parse::<i32>()
-                .with_context(|| format!("invalid PID in supervisor response: {:?}", response))?
+            let mut parts = rest.split_whitespace();
+            let sup = parts.next().and_then(|s| s.parse::<i32>().ok());
+            let init = parts.next().and_then(|s| s.parse::<i32>().ok());
+            match (sup, init) {
+                (Some(sup), Some(init)) => (sup, init),
+                _ => bail!("invalid PIDs in supervisor response: {:?}", response),
+            }
         } else if let Some(msg) = response.strip_prefix("ERR ") {
             bail!("sandbox create failed: {}", msg);
         } else {
@@ -498,16 +537,19 @@ fn cmd_create(id: &str, bundle: &PathBuf, pid_file: Option<&std::path::Path>) ->
         }
     };
 
-    // Update the state file with the actual PID.
+    // state.pid is the OCI container init (sandlock-init); `start` later updates
+    // it to the workload pid.
     {
         let mut state = SandboxState::load(id)?;
-        state.set_created(child_pid);
+        state.set_created(init_pid);
         state.save()?;
     }
 
-    // Write pid-file if requested (CRI-O / containerd expect this).
+    // The pid-file gets the SUPERVISOR pid: that is the process the containerd
+    // shim reaps to detect container exit (the supervisor is the shim's child
+    // and exits with the workload's status).
     if let Some(pf) = pid_file {
-        std::fs::write(pf, child_pid.to_string())
+        std::fs::write(pf, supervisor_pid.to_string())
             .with_context(|| format!("write pid file {:?}", pf))?;
     }
 
@@ -982,6 +1024,19 @@ mod tests {
         let explicit =
             Cli::try_parse_from(["sandlock-oci", "--rootless=false", "list"]).unwrap();
         assert_eq!(explicit.rootless, Some(false));
+    }
+
+    #[test]
+    fn supervisor_exit_action_maps_status() {
+        assert_eq!(
+            supervisor_exit_action(Some(state::ExitInfo { code: Some(7), signal: None })),
+            ExitAction::Code(7)
+        );
+        assert_eq!(
+            supervisor_exit_action(Some(state::ExitInfo { code: None, signal: Some(libc::SIGSEGV) })),
+            ExitAction::Raise(libc::SIGSEGV)
+        );
+        assert_eq!(supervisor_exit_action(None), ExitAction::Code(0));
     }
 
     #[test]
