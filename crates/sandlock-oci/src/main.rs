@@ -891,7 +891,10 @@ fn cmd_exec(
         args: req.args,
         env: req.env,
         cwd: req.cwd,
-        detach,
+        // Always ask the supervisor to report the exec'd process's exit. The
+        // caller's `--detach` (set by the containerd shim) is handled locally
+        // by the exec proxy below, which still needs that exit status.
+        detach: false,
     };
     let payload = serde_json::to_vec(&cmd).context("serialize exec command")?;
 
@@ -924,13 +927,78 @@ fn cmd_exec(
         other => bail!("unexpected exec reply: {:?}", other),
     };
 
+    if detach {
+        // Detached exec (containerd: `exec --detach --pid-file`). The shim
+        // expects this CLI to return promptly and reaps the pid-file pid for
+        // exit. The exec'd process is sandlock-init's child, which the shim
+        // cannot reap; so fork a proxy whose pid goes in the pid-file. When this
+        // CLI returns, the proxy reparents to the shim (the subreaper), and the
+        // proxy exits with the exec'd process's status, so the shim reaps a
+        // matching wait-status. This is the exec-path analog of the create-path
+        // supervisor that the shim already reaps.
+        let mut rdy = [0i32; 2];
+        if unsafe { libc::pipe2(rdy.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            bail!("pipe2 for exec proxy failed: {}", std::io::Error::last_os_error());
+        }
+        let (rdy_r, rdy_w) = (rdy[0], rdy[1]);
+        let kid = unsafe { libc::fork() };
+        if kid < 0 {
+            bail!("fork exec proxy failed: {}", std::io::Error::last_os_error());
+        }
+        if kid == 0 {
+            // ===== EXEC PROXY =====
+            unsafe { libc::close(rdy_r) };
+            // Drop the shim's exec stdio so we do not pin those streams open;
+            // the exec'd process holds its own dup'd copies (via SCM_RIGHTS), so
+            // the shim still sees EOF when that process exits.
+            unsafe {
+                let n = libc::open(b"/dev/null\0".as_ptr() as *const libc::c_char, libc::O_RDWR);
+                if n >= 0 {
+                    libc::dup2(n, 0);
+                    libc::dup2(n, 1);
+                    libc::dup2(n, 2);
+                    if n > 2 {
+                        libc::close(n);
+                    }
+                }
+            }
+            // The pid the shim will reap is THIS proxy.
+            if let Some(pf) = pid_file {
+                let _ = std::fs::write(pf, std::process::id().to_string());
+            }
+            // Tell the parent the pid-file is written; it can now return.
+            unsafe {
+                libc::write(rdy_w, b"x".as_ptr() as *const libc::c_void, 1);
+                libc::close(rdy_w);
+            }
+            // Block until the exec'd process exits, then exit with its status.
+            let mut line2 = String::new();
+            if reader.read_line(&mut line2).is_ok() {
+                if let Ok(supervisor::SupervisorReply::Exit { code, signal }) =
+                    serde_json::from_str::<supervisor::SupervisorReply>(line2.trim())
+                {
+                    supervisor_exit(Some(state::ExitInfo { code, signal }));
+                }
+            }
+            // Lost the channel before an Exit arrived: report a generic failure
+            // so the shim does not hang.
+            unsafe { libc::_exit(255) };
+        }
+        // ===== PARENT: wait until the proxy has written the pid-file, return =====
+        unsafe { libc::close(rdy_w) };
+        let mut b = [0u8; 1];
+        unsafe {
+            libc::read(rdy_r, b.as_mut_ptr() as *mut libc::c_void, 1);
+            libc::close(rdy_r);
+        }
+        return Ok(());
+    }
+
+    // Attached: this CLI is the handle the caller waits on. Record the exec'd
+    // pid and block until it exits.
     if let Some(pf) = pid_file {
         std::fs::write(pf, exec_pid.to_string())
             .with_context(|| format!("write pid file {:?}", pf))?;
-    }
-
-    if detach {
-        return Ok(());
     }
 
     // Second reply: Exit. Exit this CLI with the same status.
