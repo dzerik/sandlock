@@ -64,6 +64,8 @@ pub(crate) struct ChrootCtx<'a> {
     pub writable: &'a [PathBuf],
     pub denied: &'a [PathBuf],
     pub mounts: &'a [(PathBuf, PathBuf)],
+    /// Virtual paths of read-only mounts: reads allowed, writes denied.
+    pub mount_ro: &'a [PathBuf],
 }
 
 impl ChrootCtx<'_> {
@@ -87,9 +89,21 @@ impl ChrootCtx<'_> {
             || self.writable.iter().any(|p| virtual_path.starts_with(p) || p.starts_with(virtual_path))
     }
 
+    /// Check if a virtual path falls under a read-only mount.
+    fn is_mount_ro(&self, virtual_path: &Path) -> bool {
+        self.mount_ro.iter().any(|vp| virtual_path.starts_with(vp))
+    }
+
     /// Check if `virtual_path` is allowed for writing.
     fn can_write(&self, virtual_path: &Path) -> bool {
         if self.is_denied(virtual_path) {
+            return false;
+        }
+        // Read-only mounts deny writes even though they are mounted (and so
+        // readable). Checked before the is_mounted allow so a read-only mount
+        // (e.g. the host procfs) can't be made writable by a broad writable
+        // prefix such as a read-write rootfs granting "/".
+        if self.is_mount_ro(virtual_path) {
             return false;
         }
         if self.is_mounted(virtual_path) {
@@ -2010,5 +2024,49 @@ mod self_rewrite_tests {
         assert_eq!(canon_proc_self("/proc/cpuinfo", 42), "/proc/cpuinfo");
         assert_eq!(canon_proc_self("/proc/selfish", 42), "/proc/selfish");
         assert_eq!(canon_proc_self("/etc/passwd", 42), "/etc/passwd");
+    }
+}
+
+#[cfg(test)]
+mod mount_ro_tests {
+    use super::ChrootCtx;
+    use std::path::{Path, PathBuf};
+
+    fn ctx<'a>(
+        mounts: &'a [(PathBuf, PathBuf)],
+        mount_ro: &'a [PathBuf],
+        writable: &'a [PathBuf],
+    ) -> ChrootCtx<'a> {
+        ChrootCtx {
+            root: Path::new("/rootfs"),
+            readable: &[],
+            writable,
+            denied: &[],
+            mounts,
+            mount_ro,
+        }
+    }
+
+    #[test]
+    fn read_only_mount_denies_writes_but_allows_reads() {
+        let mounts = vec![(PathBuf::from("/proc"), PathBuf::from("/proc"))];
+        let ro = vec![PathBuf::from("/proc")];
+        // Even with a writable rootfs ("/" granted), the read-only /proc mount
+        // must still deny writes — this is the host-escape guard.
+        let writable = vec![PathBuf::from("/")];
+        let c = ctx(&mounts, &ro, &writable);
+        assert!(c.can_read(Path::new("/proc/version")));
+        assert!(!c.can_write(Path::new("/proc/sys/kernel/core_pattern")));
+        assert!(!c.can_write(Path::new("/proc/self/oom_score_adj")));
+    }
+
+    #[test]
+    fn writable_mount_still_allows_writes() {
+        let mounts = vec![(PathBuf::from("/data"), PathBuf::from("/host/data"))];
+        let ro: Vec<PathBuf> = vec![];
+        let writable = vec![PathBuf::from("/data")];
+        let c = ctx(&mounts, &ro, &writable);
+        assert!(c.can_read(Path::new("/data/file")));
+        assert!(c.can_write(Path::new("/data/file")));
     }
 }

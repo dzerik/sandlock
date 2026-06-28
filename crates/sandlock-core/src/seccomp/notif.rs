@@ -759,6 +759,11 @@ pub struct NotifPolicy {
     pub chroot_denied: Vec<std::path::PathBuf>,
     /// Mount mappings: (virtual_path, host_path) pairs.
     pub chroot_mounts: Vec<(std::path::PathBuf, std::path::PathBuf)>,
+    /// Virtual paths of mounts that are read-only: writes are denied even
+    /// though the path is mounted (and therefore readable). Used for the host
+    /// procfs mount and OCI `ro` bind mounts so a writable rootfs cannot make
+    /// e.g. `/proc/sys/*` writable.
+    pub chroot_mount_ro: Vec<std::path::PathBuf>,
     pub deterministic_dirs: bool,
     pub virtual_hostname: Option<String>,
     pub has_http_acl: bool,

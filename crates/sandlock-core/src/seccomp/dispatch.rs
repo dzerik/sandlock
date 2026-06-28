@@ -753,6 +753,7 @@ fn register_chroot_handlers(
                         writable: &policy.chroot_writable,
                         denied: &policy.chroot_denied,
                         mounts: &policy.chroot_mounts,
+                        mount_ro: &policy.chroot_mount_ro,
                     };
                     $handler(&notif, &chroot_state, &cow_state, notif_fd, &chroot_ctx).await
                 }
@@ -780,6 +781,7 @@ fn register_chroot_handlers(
                         writable: &policy.chroot_writable,
                         denied: &policy.chroot_denied,
                         mounts: &policy.chroot_mounts,
+                        mount_ro: &policy.chroot_mount_ro,
                     };
                     $handler(&notif, &chroot_state, &cow_state, notif_fd, &chroot_ctx).await
                 }
@@ -859,6 +861,7 @@ fn register_chroot_handlers(
                     writable: &policy.chroot_writable,
                     denied: &policy.chroot_denied,
                     mounts: &policy.chroot_mounts,
+                    mount_ro: &policy.chroot_mount_ro,
                 };
                 crate::chroot::dispatch::handle_chroot_legacy_chown(&notif, &sup.chroot, &sup.cow, notif_fd, &chroot_ctx, false).await
             }
@@ -881,6 +884,7 @@ fn register_chroot_handlers(
                     writable: &policy.chroot_writable,
                     denied: &policy.chroot_denied,
                     mounts: &policy.chroot_mounts,
+                    mount_ro: &policy.chroot_mount_ro,
                 };
                 crate::chroot::dispatch::handle_chroot_legacy_chown(&notif, &sup.chroot, &sup.cow, notif_fd, &chroot_ctx, true).await
             }
@@ -1112,6 +1116,7 @@ mod handler_tests {
                 chroot_writable: Vec::new(),
                 chroot_denied: Vec::new(),
                 chroot_mounts: Vec::new(),
+                chroot_mount_ro: Vec::new(),
                 deterministic_dirs: false,
                 virtual_hostname: None,
                 has_http_acl: false,
