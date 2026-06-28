@@ -213,9 +213,38 @@ enum Command {
     },
 }
 
-fn main() -> Result<()> {
-    let cli = Cli::parse();
+/// Append a fatal error to the runc-compatible `--log` file so containerd can
+/// surface the real failure reason. Never panics: if the file cannot be opened
+/// the error is dropped here (it is still printed to stderr by the caller).
+fn write_error_log(path: &std::path::Path, format: LogFormat, err: &anyhow::Error) {
+    use std::io::Write;
+    // `{:#}` renders the full anyhow context chain on one line.
+    let msg = format!("{:#}", err);
+    let line = match format {
+        // serde_json handles correct escaping of arbitrary message text.
+        LogFormat::Json => serde_json::json!({ "level": "error", "msg": msg }).to_string(),
+        LogFormat::Text => msg,
+    };
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{}", line);
+    }
+}
 
+fn main() {
+    let cli = Cli::parse();
+    // Capture the log destination before `cli.command` is consumed by `run`.
+    let log = cli.log.clone();
+    let log_format = cli.log_format;
+    if let Err(err) = run(cli) {
+        if let Some(path) = log.as_deref() {
+            write_error_log(path, log_format, &err);
+        }
+        eprintln!("Error: {:#}", err);
+        std::process::exit(1);
+    }
+}
+
+fn run(cli: Cli) -> Result<()> {
     // Resolve the state-dir root once, before any state I/O or fork, so the
     // supervisor child inherits the same location.
     state::init_state_dir(cli.root.as_deref().and_then(|p| p.to_str()));
@@ -953,6 +982,29 @@ mod tests {
         let explicit =
             Cli::try_parse_from(["sandlock-oci", "--rootless=false", "list"]).unwrap();
         assert_eq!(explicit.rootless, Some(false));
+    }
+
+    #[test]
+    fn error_log_json_is_parseable_with_msg() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.json");
+        let err = anyhow::anyhow!("boom").context("creating sandbox");
+        write_error_log(&path, LogFormat::Json, &err);
+        let content = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        assert_eq!(v["level"], "error");
+        let msg = v["msg"].as_str().unwrap();
+        assert!(msg.contains("creating sandbox"), "msg was: {msg}");
+        assert!(msg.contains("boom"), "msg was: {msg}");
+    }
+
+    #[test]
+    fn error_log_text_is_plain_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.txt");
+        write_error_log(&path, LogFormat::Text, &anyhow::anyhow!("plain failure"));
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content.trim(), "plain failure");
     }
 
     #[test]
