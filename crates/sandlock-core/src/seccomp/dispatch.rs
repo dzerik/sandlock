@@ -474,23 +474,14 @@ pub(crate) fn build_dispatch_table(
     }
 
     // ------------------------------------------------------------------
-    // Chroot path interception (before COW)
-    // ------------------------------------------------------------------
-    if policy.chroot_root.is_some() {
-        register_chroot_handlers(&mut table, policy, ctx);
-    }
-
-    // ------------------------------------------------------------------
-    // COW filesystem interception
-    // ------------------------------------------------------------------
-    if policy.cow_enabled {
-        register_cow_handlers(&mut table, ctx);
-    }
-
-    // ------------------------------------------------------------------
-    // /proc virtualization (always on). The handler does both
-    // sensitive-path blocking and per-PID filtering, both of which are
-    // security boundaries, so it has to catch every open-family spelling.
+    // /proc file virtualization (always on). Registered BEFORE chroot/COW so a
+    // synthesized /proc memfd wins over a real open of <chroot>/proc/* (the
+    // empty rootfs procfs) — mirroring the /etc/hosts and CA handlers above.
+    // The handler also does sensitive-path blocking and per-PID filtering
+    // (security boundaries), so it must run first and catch every open-family
+    // spelling. NOTE: only the open-family handler moves here; the getdents
+    // directory-listing handler stays after chroot (below) so a chrooted /proc
+    // dir fd lists the empty rootfs procfs rather than the host's entries.
     // ------------------------------------------------------------------
     for nr in open_family_syscalls() {
         let policy_for_proc_open = Arc::clone(policy);
@@ -509,6 +500,27 @@ pub(crate) fn build_dispatch_table(
             }
         });
     }
+
+    // ------------------------------------------------------------------
+    // Chroot path interception (before COW)
+    // ------------------------------------------------------------------
+    if policy.chroot_root.is_some() {
+        register_chroot_handlers(&mut table, policy, ctx);
+    }
+
+    // ------------------------------------------------------------------
+    // COW filesystem interception
+    // ------------------------------------------------------------------
+    if policy.cow_enabled {
+        register_cow_handlers(&mut table, ctx);
+    }
+
+    // ------------------------------------------------------------------
+    // /proc directory-listing PID filter. Stays after chroot/COW: under chroot
+    // the /proc dir fd resolves to the empty rootfs procfs, so the listing is
+    // empty rather than leaking the host's /proc entry names (which are not all
+    // synthesized and would dangle on access).
+    // ------------------------------------------------------------------
     let mut getdents_nrs = vec![libc::SYS_getdents64];
     if let Some(getdents) = arch::sys_getdents() {
         getdents_nrs.push(getdents);
