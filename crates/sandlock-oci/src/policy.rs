@@ -340,12 +340,16 @@ fn rootfs_path(spec: &Spec, bundle: &Path) -> Result<Option<PathBuf>> {
 /// - **tmpfs** writable scratch (`/tmp`, `/run`, `/dev/shm`, …): backed by a
 ///   host directory under the sandbox state dir and bind-mounted read-write,
 ///   so it works on a read-only root and stays isolated from the rootfs.
-/// - **proc**: `fs_mount(dest, /proc)` — the host procfs, so the sandbox gets a
-///   full `/proc` like a container; the seccomp `/proc` handler synthesizes the
-///   limit-aware files on top and blocks foreign PIDs / sensitive paths.
-/// - **tmpfs at `/dev`, sysfs**: passed through read-only so sandlock's `/dev`
-///   interception services them; an empty backing dir would shadow `/dev/null`,
-///   `/sys/*`, etc.
+/// - **proc**: `fs_mount(dest, /proc)` read-only — the host procfs, so the
+///   sandbox gets a full `/proc` like a container; the seccomp `/proc` handler
+///   synthesizes the limit-aware files on top and blocks foreign PIDs /
+///   sensitive paths. Read-only blocks host-global writes (`/proc/sys/*`).
+/// - **sysfs**: `fs_mount(dest, /sys)` read-only — the host sysfs, so the
+///   sandbox sees a populated `/sys`. Read-only blocks host-global writes
+///   (`/sys/power/state`, …); there is no per-path filter, so reads are full
+///   host sysfs (as in a container's ro `/sys`).
+/// - **tmpfs at `/dev`**: passed through read-only so sandlock's `/dev`
+///   interception services it; an empty backing dir would shadow `/dev/null`.
 /// - **devpts/mqueue/cgroup**: skipped (no safe namespace-less equivalent).
 fn map_mounts(
     mounts: &[oci_spec::runtime::Mount],
@@ -377,9 +381,17 @@ fn map_mounts(
                 fs_mount.push((dest.to_path_buf(), PathBuf::from("/proc")));
                 fs_mount_ro.push(dest.to_path_buf());
             }
-            // sysfs: pass the host's through read-only; sandlock's sensitive-path
-            // filter still gates it.
-            "sysfs" => fs_read.push(PathBuf::from("/sys")),
+            // sysfs: mount the host /sys READ-ONLY at the requested destination
+            // so the sandbox sees a populated /sys like a container (an empty
+            // rootfs /sys is otherwise bare).  Read-only is mandatory: writable
+            // sysfs exposes host-global controls (/sys/power/state,
+            // /sys/kernel/*, device controls).  Unlike /proc there is no
+            // per-path sandlock filter for sysfs, so this is full read-only host
+            // sysfs exposure (consistent with a container's ro /sys mount).
+            "sysfs" => {
+                fs_mount.push((dest.to_path_buf(), PathBuf::from("/sys")));
+                fs_mount_ro.push(dest.to_path_buf());
+            }
 
             "tmpfs" => {
                 if dest.to_str() == Some("/dev") {
@@ -656,6 +668,7 @@ mod tests {
             "mounts": [
                 { "destination": "/tmp",  "type": "tmpfs", "source": "tmpfs" },
                 { "destination": "/proc", "type": "proc",  "source": "proc" },
+                { "destination": "/sys",  "type": "sysfs", "source": "sysfs" },
                 { "destination": "/dev",  "type": "tmpfs", "source": "tmpfs" }
             ]
         });
@@ -681,6 +694,12 @@ mod tests {
         // ...and it is read-only, so the sandbox can't write host-global
         // controls like /proc/sys/* through the mount.
         assert!(policy.fs_mount_ro.contains(&PathBuf::from("/proc")));
+        // /sys mounts the host sysfs read-only, same as /proc.
+        assert!(policy
+            .fs_mount
+            .iter()
+            .any(|(d, h)| d == Path::new("/sys") && h == Path::new("/sys")));
+        assert!(policy.fs_mount_ro.contains(&PathBuf::from("/sys")));
         // /dev is passed through read-only, not emulated.
         assert!(policy.fs_read.contains(&PathBuf::from("/dev")));
         assert!(!policy.fs_mount.iter().any(|(d, _)| d == Path::new("/dev")));
