@@ -268,6 +268,15 @@ impl OciPolicy {
             builder = builder.user(ru.uid, ru.gid);
         }
 
+        // Container workloads legitimately run servers (nginx, etc.). sandlock
+        // gates bind() by default-deny (Landlock BIND_TCP), so without this an
+        // in-container server fails bind() with EACCES and the container exits,
+        // which in turn hangs any readiness/verification exec that waits on it.
+        // Enable port remapping: binds are emulated on-behalf and succeed,
+        // using the requested port when free and a fresh host port only on
+        // conflict, so co-located sandboxes never collide on a host port.
+        builder = builder.port_remap(true);
+
         builder.build_unchecked().map_err(Into::into)
     }
 }
@@ -718,6 +727,9 @@ mod tests {
         assert!(sandbox.chroot.is_some());
         assert!(sandbox.cwd.is_some());
         assert!(!sandbox.env.is_empty());
+        // Container workloads must be able to bind ports (servers); port
+        // remapping is enabled so bind() succeeds instead of EACCES-exiting.
+        assert!(sandbox.port_remap, "OCI containers must allow port binding");
     }
 
     #[test]
