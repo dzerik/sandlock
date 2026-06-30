@@ -33,23 +33,31 @@ protects your working directory automatically.
 
 Sandlock is implemented in **Rust** for performance and safety:
 
-- **sandlock-core** — Rust library: Landlock, seccomp, supervisor, COW, pipeline
-- **sandlock-cli** — Rust CLI binary (`sandlock run ...`)
-- **sandlock-ffi** — C ABI shared library (`libsandlock_ffi.so`)
-- **Python SDK** — ctypes bindings to the FFI library
+- **sandlock-core**: Rust library (Landlock, seccomp, supervisor, COW, pipeline)
+- **sandlock-cli**: Rust CLI binary (`sandlock run ...`)
+- **sandlock-oci**: OCI runtime shim for containerd, CRI-O, and Kubernetes (namespace-less)
+- **sandlock-ffi**: C ABI shared library (`libsandlock_ffi.so`)
+- **Python SDK**: ctypes bindings to the FFI library
+- **Go SDK**: cgo bindings to the FFI library
 
 ```
-                    ┌─────────────┐
-                    │  Python SDK │  ctypes FFI
-                    │  (sandlock) │──────────────┐
-                    └─────────────┘              │
-                                                 ▼
+       ┌─────────────┐      ┌─────────────┐
+       │  Python SDK │      │   Go SDK    │
+       │   (ctypes)  │      │    (cgo)    │
+       └──────┬──────┘      └──────┬──────┘
+              │  FFI               │  FFI
+              └─────────┬──────────┘
+                        ▼
 ┌──────────────┐    ┌──────────────────────────────┐
 │ sandlock CLI │───>│       libsandlock_ffi.so      │
-└──────────────┘    └──────────────┬───────────────┘
-                                   │
-                    ┌──────────────▼───────────────┐
-                    │        sandlock-core          │
+└──────────────┘    └───────────────┬──────────────┘
+                                    │
+┌──────────────┐                    │
+│ sandlock-oci │────────────┐       │
+│ (OCI runtime)│            │       │
+└──────────────┘            ▼       ▼
+                    ┌──────────────────────────────┐
+                    │         sandlock-core         │
                     │  Landlock · seccomp · COW ·   │
                     │  pipeline · policy_fn · vDSO  │
                     └──────────────────────────────┘
