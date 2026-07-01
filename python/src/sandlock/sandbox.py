@@ -11,7 +11,7 @@ from __future__ import annotations
 import inspect
 import re
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import Enum, IntEnum
 from typing import TYPE_CHECKING, Callable, Mapping, Sequence
 
 if TYPE_CHECKING:
@@ -90,6 +90,20 @@ class BranchAction(Enum):
     COMMIT = "commit"    # Merge writes into parent branch
     ABORT = "abort"      # Discard all writes
     KEEP = "keep"        # Leave branch as-is (caller decides)
+
+
+class StdioMode(IntEnum):
+    """Per-stream stdio wiring for :meth:`Sandbox.popen`.
+
+    The values are the stable ABI discriminants shared with the C/Rust core.
+    """
+
+    INHERIT = 0
+    """Share the supervisor's own fd (child writes to the same terminal/file)."""
+    PIPED = 1
+    """Connect to a pipe; the caller owns the returned end via :class:`Process`."""
+    NULL = 2
+    """Connect the stream to ``/dev/null``."""
 
 
 @dataclass(frozen=True)
@@ -836,6 +850,85 @@ class Sandbox:
             stderr=stderr,
         )
 
+    def popen(
+        self,
+        cmd: Sequence[str],
+        stdin: StdioMode = StdioMode.INHERIT,
+        stdout: StdioMode = StdioMode.INHERIT,
+        stderr: StdioMode = StdioMode.INHERIT,
+    ) -> "Process":
+        """Spawn a confined process with per-stream stdio and return a live
+        :class:`Process` whose piped streams the caller reads/writes while it runs.
+
+        The streaming counterpart of :meth:`run`: instead of buffering output
+        until the child exits, each stream set to :attr:`StdioMode.PIPED` is
+        handed back as a file object on the returned ``Process`` (``.stdin`` /
+        ``.stdout`` / ``.stderr``); ``INHERIT``/``NULL`` streams are ``None``.
+        Use it to drive a request/response protocol over stdio while the process
+        is alive (an MCP or LSP server, a REPL, JSON-RPC).
+
+        All streams default to :attr:`StdioMode.INHERIT` (parity with
+        :class:`subprocess.Popen`); pass :attr:`StdioMode.PIPED` for exactly the
+        streams you want to drive.
+
+        Deadlock warning (as with :class:`subprocess.Popen`): if you write to a
+        piped ``stdin`` you own it -- close it before :meth:`Process.wait` or a
+        child that reads to EOF (e.g. ``cat``) never exits and the wait blocks
+        forever; likewise drain a piped ``stdout``/``stderr`` before waiting or a
+        child that fills the pipe buffer blocks on write. ``Process`` is a
+        context manager that closes the streams and reaps the child on exit.
+
+        The ``Result`` returned by :meth:`Process.wait` carries *no* captured
+        ``stdout``/``stderr`` (they were streamed to you as fds) — read the output
+        off ``proc.stdout``/``proc.stderr``, not off the result.
+
+        Raises:
+            RuntimeError: If a process is already running, or the spawn failed.
+            ValueError: If a stdio argument is not a valid :class:`StdioMode`.
+        """
+        import ctypes
+        from ._sdk import _lib, _make_argv
+
+        if self._handle is not None:
+            raise RuntimeError("sandbox is already running")
+
+        # Normalize/validate up front: StdioMode(x) accepts a StdioMode or its int
+        # discriminant and raises ValueError on anything else, so a bad mode fails
+        # clearly in Python instead of as an opaque null handle across the FFI.
+        stdin, stdout, stderr = StdioMode(stdin), StdioMode(stdout), StdioMode(stderr)
+
+        native = self._ensure_native()
+        argv, argc = _make_argv(list(cmd))
+        resolved_name = self._resolve_name()
+
+        fd_in = ctypes.c_int(-1)
+        fd_out = ctypes.c_int(-1)
+        fd_err = ctypes.c_int(-1)
+        self._handle = _lib.sandlock_popen(
+            native.ptr,
+            _encode(resolved_name),
+            argv,
+            argc,
+            int(stdin),
+            int(stdout),
+            int(stderr),
+            ctypes.byref(fd_in),
+            ctypes.byref(fd_out),
+            ctypes.byref(fd_err),
+        )
+        if not self._handle:
+            raise RuntimeError("sandlock_popen failed")
+
+        try:
+            return Process(self, fd_in.value, fd_out.value, fd_err.value)
+        except BaseException:
+            # Wrapping the fds failed after the child was spawned. Process.__init__
+            # already closed any fds it opened; free the handle (which reaps the
+            # child) and clear it so the Sandbox is left clean.
+            _lib.sandlock_handle_free(self._handle)
+            self._handle = None
+            raise
+
     def dry_run(self, cmd: Sequence[str], timeout: float | None = None) -> "DryRunResult":
         """Dry-run: run a command, collect filesystem changes, then discard.
 
@@ -1149,3 +1242,172 @@ def _resolve_syscall(key) -> int:
         f"syscall key must be a name (str) or number (int), "
         f"got {type(key).__name__}"
     )
+
+
+class Process:
+    """A live confined process with caller-owned stdio, returned by
+    :meth:`Sandbox.popen`.
+
+    ``.stdin`` / ``.stdout`` / ``.stderr`` are unbuffered binary file objects
+    for streams opened with :attr:`StdioMode.PIPED`, else ``None``. The process
+    keeps running until :meth:`wait` (or :meth:`kill`) is called, or the
+    ``Process`` context manager exits. Prefer the context manager, which closes
+    the streams and reaps the child even on error::
+
+        with sandbox.popen(["cat"], stdin=StdioMode.PIPED,
+                           stdout=StdioMode.PIPED) as proc:
+            proc.stdin.write(b"hi\\n")
+            proc.stdin.close()          # EOF so cat exits
+            data = proc.stdout.read()
+            result = proc.wait()
+    """
+
+    def __init__(self, sandbox: "Sandbox", stdin_fd: int, stdout_fd: int, stderr_fd: int):
+        import os
+
+        self._sandbox = sandbox
+        self._result = None
+        self.stdin = self.stdout = self.stderr = None
+        # os.fdopen takes ownership of each fd: closing the stream closes the fd,
+        # so a Process that is closed/exited never leaks the pipe ends. Wrap the
+        # three fds so that if a later fdopen raises, the streams already opened
+        # are closed and the not-yet-wrapped raw fds are closed too — no fd is
+        # leaked on the error path.
+        specs = ((stdin_fd, "wb"), (stdout_fd, "rb"), (stderr_fd, "rb"))
+        opened: list = []
+        try:
+            for fd, mode in specs:
+                opened.append(os.fdopen(fd, mode, buffering=0) if fd >= 0 else None)
+        except BaseException:
+            for stream in opened:
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
+            for fd, _mode in specs[len(opened):]:
+                if fd >= 0:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+            raise
+        self.stdin, self.stdout, self.stderr = opened
+
+    @property
+    def pid(self) -> int | None:
+        """The child PID while running, else ``None``."""
+        return self._sandbox.pid
+
+    def kill(self) -> None:
+        """SIGKILL the child's entire process group. Idempotent: a process that
+        already exited is not an error. The handle stays valid -- call
+        :meth:`wait` afterwards to collect the (non-success) exit status."""
+        from ._sdk import _lib
+
+        handle = self._sandbox._handle
+        if handle is None:
+            return
+        _lib.sandlock_handle_kill(handle)
+
+    def wait(self, timeout: float | None = None) -> "Result":
+        """Wait for the child to exit and return its :class:`Result`.
+
+        A still-open piped ``stdin`` is closed first so a child that reads to EOF
+        can exit; piped ``stdout``/``stderr`` stay open for the caller to finish
+        reading. Frees the underlying handle; a second call returns the cached
+        result.
+
+        The returned ``Result`` carries no ``stdout``/``stderr`` (those were
+        streamed to you as fds — read them off ``.stdout``/``.stderr``).
+
+        Args:
+            timeout: Maximum seconds to wait. On timeout the child is killed and
+                a non-success ``Result`` is returned (same semantics as
+                :meth:`Sandbox.run`'s ``timeout``) — the wait never hangs. ``None``
+                (default) waits indefinitely. Note: without a ``timeout``, a piped
+                ``stdout``/``stderr`` you have not drained can block the child on a
+                full pipe and hang the wait forever; pass a ``timeout`` or drain first.
+        """
+        from ._sdk import _lib, Result
+
+        handle = self._sandbox._handle
+        if handle is None:
+            if self._result is not None:
+                return self._result
+            raise RuntimeError("process is not running")
+
+        # Deliver EOF to a still-open piped stdin so a reader child can exit and
+        # the wait below does not block forever.
+        if self.stdin is not None and not self.stdin.closed:
+            try:
+                self.stdin.close()
+            except OSError:
+                pass
+
+        try:
+            timeout_ms = int(timeout * 1000) if timeout else 0
+            result_p = _lib.sandlock_handle_wait_timeout(handle, timeout_ms)
+        finally:
+            _lib.sandlock_handle_free(handle)
+            self._sandbox._handle = None
+
+        if not result_p:
+            self._result = Result(
+                success=False, exit_code=-1, error="sandlock_handle_wait failed"
+            )
+            return self._result
+
+        exit_code = _lib.sandlock_result_exit_code(result_p)
+        success = _lib.sandlock_result_success(result_p)
+        # stdout/stderr were handed to the caller as fds, so the RunResult holds
+        # none — read them off the streams, not the Result.
+        _lib.sandlock_result_free(result_p)
+        self._result = Result(success=bool(success), exit_code=exit_code)
+        return self._result
+
+    def __enter__(self) -> "Process":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        # Terminate and reap a still-running child so no confined process is left
+        # behind, then close every stream we own.
+        if self._sandbox._handle is not None:
+            try:
+                self.kill()
+            except Exception:
+                pass
+            try:
+                self.wait()
+            except Exception:
+                pass
+        for stream in (self.stdin, self.stdout, self.stderr):
+            if stream is not None and not stream.closed:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+
+    def __del__(self):
+        # Safety net for a Process dropped without wait()/context: a live handle
+        # would otherwise leak the confined child + its runtime and wedge the
+        # Sandbox in "already running". Reap it, warning like subprocess.Popen so
+        # the missing wait()/`with` is visible. __del__ must never raise, and may
+        # run during interpreter shutdown when imports/globals are gone — so this
+        # is strictly best-effort inside a broad guard.
+        try:
+            if getattr(self, "_sandbox", None) is None or self._sandbox._handle is None:
+                return
+            import warnings
+
+            warnings.warn(
+                "Process was not waited on or used as a context manager; "
+                "reaping the confined child. Use `with sandbox.popen(...)` or "
+                "call wait().",
+                ResourceWarning,
+                stacklevel=2,
+            )
+            self.kill()
+            self.wait()
+        except Exception:
+            pass
