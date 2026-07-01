@@ -40,6 +40,34 @@ enum Command {
 /// Sandbox-level flags come from `SandboxBuilder` via `#[clap(flatten)]`.
 /// CLI-only flags (profile, timeout, image, etc.) and non-clap-friendly
 /// sandbox fields (max_memory, fs_mount, env, gpu, cpu-cores) remain here.
+/// GPU visibility for `--gpu`: `all` for every present GPU, or explicit
+/// indices like `0,2`. Absence of the flag means no GPU access.
+#[derive(Clone, Debug)]
+enum GpuSelection {
+    All,
+    Devices(Vec<u32>),
+}
+
+impl std::str::FromStr for GpuSelection {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.eq_ignore_ascii_case("all") {
+            return Ok(GpuSelection::All);
+        }
+        let devices = s
+            .split(',')
+            .map(|p| {
+                let p = p.trim();
+                p.parse::<u32>().map_err(|_| {
+                    format!("invalid GPU index '{p}'; expected 'all' or indices like 0,2")
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(GpuSelection::Devices(devices))
+    }
+}
+
 #[derive(clap::Args)]
 struct RunArgs {
     // ── Sandbox flags (flattened from SandboxBuilder) ───────────────────────
@@ -78,9 +106,9 @@ struct RunArgs {
     #[arg(long = "cpu-cores", value_delimiter = ',')]
     cpu_cores: Vec<u32>,
 
-    /// GPU device indices visible to the sandbox (e.g. --gpu 0,2)
-    #[arg(long = "gpu", value_delimiter = ',')]
-    gpu_devices: Vec<u32>,
+    /// GPUs visible to the sandbox: `all` for every GPU, or indices (e.g. --gpu 0,2)
+    #[arg(long = "gpu", value_name = "all|N,N,...")]
+    gpu: Option<GpuSelection>,
 
     // ── CLI-only flags ───────────────────────────────────────────────────────
     #[arg(short = 't', long)]
@@ -466,7 +494,13 @@ async fn run_command(args: RunArgs) -> Result<i32> {
         };
     }
     if !args.cpu_cores.is_empty() { builder = builder.cpu_cores(args.cpu_cores.clone()); }
-    if !args.gpu_devices.is_empty() { builder = builder.gpu_devices(args.gpu_devices.clone()); }
+    match &args.gpu {
+        // `all` maps to an empty device list, which the core expands to every
+        // present GPU; explicit indices pass through unchanged.
+        Some(GpuSelection::All) => builder = builder.gpu_devices(Vec::new()),
+        Some(GpuSelection::Devices(devs)) => builder = builder.gpu_devices(devs.clone()),
+        None => {}
+    }
     for spec in &args.env_vars {
         if let Some((k, v)) = spec.split_once('=') {
             builder = builder.env_var(k, v);
@@ -694,7 +728,7 @@ fn validate_no_supervisor(args: &RunArgs) -> Result<()> {
     if args.max_disk.is_some() { bad.push("--max-disk"); }
     if pb.port_remap { bad.push("--port-remap"); }
     if !args.cpu_cores.is_empty() { bad.push("--cpu-cores"); }
-    if !args.gpu_devices.is_empty() { bad.push("--gpu"); }
+    if args.gpu.is_some() { bad.push("--gpu"); }
     if args.dry_run { bad.push("--dry-run"); }
     if args.status_fd.is_some() { bad.push("--status-fd"); }
     if !pb.fs_denied.is_empty() { bad.push("--fs-deny"); }
