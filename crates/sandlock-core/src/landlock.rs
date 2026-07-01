@@ -90,6 +90,24 @@ fn write_access(abi: u32) -> u64 {
     mask
 }
 
+/// Indices N for which `/dev/nvidiaN` exists. Used for the "all GPUs"
+/// (`gpu_devices == []`) case. Matches `nvidia<digits>` exactly, so the
+/// control/capability nodes (`nvidiactl`, `nvidia-uvm`, `nvidia-caps`,
+/// `nvidia-modeset`) are excluded.
+fn present_gpu_indices() -> Vec<u32> {
+    let Ok(entries) = std::fs::read_dir("/dev") else {
+        return Vec::new();
+    };
+    // `parse::<u32>` accepts only "nvidia<digits>", rejecting nvidiactl,
+    // nvidia-uvm, nvidia-caps, nvidia-modeset, etc.
+    let mut out: Vec<u32> = entries
+        .flatten()
+        .filter_map(|ent| ent.file_name().to_str()?.strip_prefix("nvidia")?.parse().ok())
+        .collect();
+    out.sort_unstable();
+    out
+}
+
 // ============================================================
 // ABI version detection
 // ============================================================
@@ -472,23 +490,45 @@ fn confine_inner(policy: &Sandbox, handle_net: bool) -> Result<(), SandlockError
     }
 
     // GPU device paths (when gpu_devices is set)
-    if policy.gpu_devices.is_some() {
-        // Read-write access to GPU device nodes
-        for path in &[
-            "/dev/nvidia0", "/dev/nvidia1", "/dev/nvidia2", "/dev/nvidia3",
-            "/dev/nvidiactl", "/dev/nvidia-uvm", "/dev/nvidia-uvm-tools",
-            "/dev/dri",
-        ] {
-            let _ = add_path_rule(&ruleset_fd, std::path::Path::new(path), fs_write_mask);
-            // Ignore errors — devices may not exist
+    if let Some(ref devices) = policy.gpu_devices {
+        // Shared control nodes: required for ANY GPU use, not per-GPU.
+        // (nvidiactl = RM control channel; uvm = unified memory.)
+        for path in &["/dev/nvidiactl", "/dev/nvidia-uvm", "/dev/nvidia-uvm-tools"] {
+            let _ = add_path_rule(&ruleset_fd, Path::new(path), fs_write_mask);
+            // Ignore errors — nodes may not exist (e.g. uvm before first use)
         }
+
+        // Per-GPU render nodes. Each physical GPU N is a distinct node
+        // /dev/nvidiaN; opening it O_RDWR is REQUIRED to map that GPU. Granting
+        // only the requested indices makes selection a hard kernel boundary
+        // instead of the soft CUDA_VISIBLE_DEVICES hint set in context.rs.
+        // Empty list = all present GPUs.
+        let indices = if devices.is_empty() {
+            present_gpu_indices()
+        } else {
+            devices.clone()
+        };
+        for idx in indices {
+            let node = format!("/dev/nvidia{idx}");
+            let _ = add_path_rule(&ruleset_fd, Path::new(&node), fs_write_mask);
+        }
+
+        // DRM render nodes. /dev/dri is a directory of per-GPU card*/renderD*
+        // nodes; a single rule exposes ALL of them, which would reopen the
+        // sharing hole this selection closes. CUDA compute does not need
+        // /dev/dri, so only grant it for the all-GPUs case; per-index DRM
+        // mapping would need a PCI-BDF -> renderD* lookup (future work).
+        if devices.is_empty() {
+            let _ = add_path_rule(&ruleset_fd, Path::new("/dev/dri"), fs_write_mask);
+        }
+
         // Read-only access to GPU sysfs/procfs
         for path in &[
             "/proc/driver/nvidia",
             "/sys/bus/pci/devices",
             "/sys/module/nvidia",
         ] {
-            let _ = add_path_rule(&ruleset_fd, std::path::Path::new(path), READ_ACCESS);
+            let _ = add_path_rule(&ruleset_fd, Path::new(path), READ_ACCESS);
         }
     }
 
