@@ -111,6 +111,15 @@ sandlock run -i -r /usr -r /lib -r /lib64 -r /bin -r /etc -w /tmp -- /bin/sh
 # Resource limits + timeout
 sandlock run -m 512M -P 20 -t 30 -- ./compute.sh
 
+# GPU access (NVIDIA): `--gpu all` for every GPU, or indices like `0,2`.
+# Selection is a hard Landlock boundary — only the chosen /dev/nvidiaN nodes
+# are openable, so a sandbox given `--gpu 0` cannot touch other GPUs. The
+# NVIDIA userspace also needs the driver libraries readable and writes thread
+# names under /proc/self/task.
+sandlock run --gpu 0 \
+  -r /usr -r /lib -r /lib64 -r /etc -r /sys -r /proc -w /proc/self/task \
+  -- python3 train.py
+
 # Outbound allowlist — restrict to one host on one port
 sandlock run --net-allow api.openai.com:443 -r /usr -r /lib -r /etc -- python3 agent.py
 
