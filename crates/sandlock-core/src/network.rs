@@ -20,6 +20,13 @@ use crate::sys::structs::{SeccompNotif, AF_INET, AF_INET6, ECONNREFUSED};
 /// Prevents a sandboxed process from triggering OOM in the supervisor.
 const MAX_SEND_BUF: usize = 64 << 20;
 
+/// Maximum ancillary (control) buffer we copy for an on-behalf `sendmsg`.
+/// A control buffer larger than this fails closed with `EMSGSIZE` rather than
+/// being silently truncated into a partial cmsg chain (`SCM_MAX_FD` is 253 fds
+/// ≈ 1 KiB, so 16 KiB is far above any legitimate use while bounding supervisor
+/// memory per trapped send).
+const MAX_CONTROL_BUF: usize = 16 << 10;
+
 /// An IPv4 or IPv6 address with a prefix length, used by `--net-deny`
 /// to match destination IPs by exact address (`/32`, `/128`) or by range.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -457,6 +464,71 @@ pub(crate) fn query_socket_protocol(fd: RawFd) -> Option<Protocol> {
         libc::IPPROTO_ICMP | libc::IPPROTO_ICMPV6 => Some(Protocol::Icmp),
         _ => None,
     }
+}
+
+/// Rewrite the `SCM_RIGHTS` file descriptors in a copied control buffer from
+/// the child's fd numbers to supervisor fd numbers, rejecting identity cmsgs.
+///
+/// On-behalf sends run in the supervisor, so a control buffer copied verbatim
+/// from the child carries fd numbers that are meaningless (or, worse, alias
+/// unrelated files) in the supervisor. For every `SOL_SOCKET`/`SCM_RIGHTS`
+/// message we `pidfd_getfd` each child fd into the supervisor and patch its
+/// number in place. The returned `OwnedFd`s must stay alive until after
+/// `sendmsg` (the kernel installs its own copies into the socket buffer during
+/// the send), then drop to close the supervisor's copies.
+///
+/// `SCM_CREDENTIALS` is rejected with `EPERM`: on the on-behalf path the
+/// *supervisor* is the syscall's sender, so forwarding the child's crafted
+/// `pid/uid/gid` would either fail `EPERM` anyway (an unprivileged supervisor
+/// can't assert them) or, for a privileged supervisor, let the child forge
+/// credentials it could never send itself. Failing closed is the safe choice.
+///
+/// Errors: `EBADF` if a child fd can't be fetched (matching the kernel's own
+/// error for a bad fd), `EPERM` for a credential cmsg, `EINVAL` for a malformed
+/// cmsg header (too short or extending past the buffer) — all fail closed, none
+/// sends a partial or forged control chain.
+fn translate_scm_rights(child_pid: u32, control: &[u8]) -> Result<(Vec<u8>, Vec<OwnedFd>), i32> {
+    // sizeof(struct cmsghdr) on LP64: cmsg_len(8) + cmsg_level(4) + cmsg_type(4).
+    // CMSG_ALIGN(16) == 16, so cmsg data begins right after the header.
+    const CMSG_HDR: usize = 16;
+    const FD: usize = std::mem::size_of::<i32>();
+    let mut out = control.to_vec();
+    let mut held: Vec<OwnedFd> = Vec::new();
+    let mut off = 0usize;
+    while off + CMSG_HDR <= out.len() {
+        let cmsg_len = usize::from_ne_bytes(out[off..off + 8].try_into().unwrap());
+        let level = i32::from_ne_bytes(out[off + 8..off + 12].try_into().unwrap());
+        let ctype = i32::from_ne_bytes(out[off + 12..off + 16].try_into().unwrap());
+        // `cmsg_len` is child-controlled. Compare against the *remaining* space
+        // (never `off + cmsg_len`, which could overflow `usize`). A header that
+        // is too short or claims to run past the buffer is malformed — fail
+        // closed, as the kernel would `EINVAL` it. `off <= out.len() - CMSG_HDR`
+        // holds from the loop guard, so `out.len() - off` cannot underflow.
+        if cmsg_len < CMSG_HDR || cmsg_len > out.len() - off {
+            return Err(libc::EINVAL);
+        }
+        if level == libc::SOL_SOCKET {
+            if ctype == libc::SCM_RIGHTS {
+                let data_off = off + CMSG_HDR;
+                let nfds = (cmsg_len - CMSG_HDR) / FD;
+                for i in 0..nfds {
+                    let p = data_off + i * FD;
+                    let child_fd = i32::from_ne_bytes(out[p..p + FD].try_into().unwrap());
+                    let sup_fd = crate::seccomp::notif::dup_fd_from_pid(child_pid, child_fd)
+                        .map_err(|e| e.raw_os_error().unwrap_or(libc::EBADF))?;
+                    out[p..p + FD].copy_from_slice(&sup_fd.as_raw_fd().to_ne_bytes());
+                    held.push(sup_fd);
+                }
+            } else if ctype == libc::SCM_CREDENTIALS {
+                return Err(libc::EPERM);
+            }
+        }
+        // Advance to CMSG_ALIGN(cmsg_len). `cmsg_len <= out.len() - off` bounds
+        // the aligned add well under `usize::MAX`; each step is >= CMSG_HDR so
+        // the loop always makes progress.
+        off += (cmsg_len + 7) & !7;
+    }
+    Ok((out, held))
 }
 
 // ============================================================
@@ -1020,11 +1092,23 @@ fn send_named_unix_msghdr(
         })
         .collect();
 
-    let control_buf = if msg_control_ptr != 0 && msg_controllen > 0 {
-        let len = (msg_controllen as usize).min(4096);
-        read_child_mem(notif_fd, notif.id, notif.pid, msg_control_ptr, len).ok()
+    // Rewrite SCM_RIGHTS fds from child to supervisor numbers; `_scm_fds` keeps
+    // them open across the send (same reasoning as `send_msghdr_on_behalf`).
+    let (control_buf, _scm_fds) = if msg_control_ptr != 0 && msg_controllen > 0 {
+        // Fail closed on an oversized control buffer instead of silently
+        // truncating (which could drop SCM_RIGHTS fds or send a malformed tail).
+        if msg_controllen as usize > MAX_CONTROL_BUF {
+            return Err(libc::EMSGSIZE);
+        }
+        match read_child_mem(notif_fd, notif.id, notif.pid, msg_control_ptr, msg_controllen as usize) {
+            Ok(raw) => {
+                let (buf, fds) = translate_scm_rights(notif.pid, &raw)?;
+                (Some(buf), fds)
+            }
+            Err(_) => (None, Vec::new()),
+        }
     } else {
-        None
+        (None, Vec::new())
     };
 
     let dup_fd = crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd)
@@ -1332,10 +1416,19 @@ async fn sendmsg_on_behalf(
         Ok(fd) => fd,
         Err(e) => return NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EBADF)),
     };
-    let protocol = match query_socket_protocol(dup_fd.as_raw_fd()) {
-        Some(p) => p,
-        None => return NotifAction::Errno(ECONNREFUSED),
-    };
+    // Resolve the protocol as `Option`: it is only consumed to validate a
+    // non-connected IP destination. `query_socket_protocol` returns `None` for
+    // an AF_UNIX socket (no IP protocol), and a connected send (every AF_UNIX
+    // send that reaches here — its connection was gated at connect time) never
+    // consumes it, so the send goes through the TOCTOU-safe on-behalf path on
+    // our immune `dup_fd` rather than being refused. A non-connected send with
+    // no resolvable protocol fails closed inside `send_msghdr_on_behalf`.
+    //
+    // On-behalf (not Continue) is load-bearing under a destination policy: a
+    // Continue would let the kernel re-resolve `sockfd`/`msg_name` against the
+    // live child, so a racing `dup2(inet_sock, sockfd)` after a domain check
+    // could redirect the send onto an IP socket to a denied destination.
+    let protocol = query_socket_protocol(dup_fd.as_raw_fd());
 
     match send_msghdr_on_behalf(notif, ctx, notif_fd, &dup_fd, protocol, msghdr_ptr, flags).await {
         Ok(n) => NotifAction::ReturnValue(n as i64),
@@ -1395,9 +1488,16 @@ fn prescan_msghdr(
 /// the child. Caller is responsible for:
 ///   - dup'ing the child fd (`dup_fd`),
 ///   - resolving the socket protocol (`protocol`) via
-///     `query_socket_protocol` on that dup,
-///   - having confirmed via `prescan_msghdr` that `msghdr_ptr` points
-///     at an IP-family destination (non-NULL `msg_name`).
+///     `query_socket_protocol` on that dup.
+///
+/// `protocol` is `Option` because it is only consumed to validate a
+/// *non-connected* IP destination against the allowlist. A connected send
+/// (`msg_name == NULL`) — which is every send that reaches here on an AF_UNIX
+/// socket, since its connection was already gated at connect time — carries no
+/// destination and needs no protocol, so `None` is passed through unused. When
+/// the message *is* non-connected, a missing protocol fails closed
+/// (`ECONNREFUSED`), so an IP send whose protocol can't be resolved is refused
+/// rather than escaping the allowlist.
 ///
 /// Returns the byte count returned by `sendmsg`, or an errno suitable
 /// for `NotifAction::Errno`. ECONNREFUSED is used both for "destination
@@ -1408,7 +1508,7 @@ async fn send_msghdr_on_behalf(
     ctx: &Arc<SupervisorCtx>,
     notif_fd: RawFd,
     dup_fd: &std::os::unix::io::OwnedFd,
-    protocol: Protocol,
+    protocol: Option<Protocol>,
     msghdr_ptr: u64,
     flags: i32,
 ) -> Result<isize, i32> {
@@ -1447,6 +1547,9 @@ async fn send_msghdr_on_behalf(
             None => return Err(libc::EAFNOSUPPORT),
         };
         let dest_port = parse_port_from_sockaddr(&addr_bytes);
+        // A non-connected IP send must have a resolved protocol to key the
+        // per-protocol allowlist. If it couldn't be resolved, fail closed.
+        let protocol = protocol.ok_or(ECONNREFUSED)?;
 
         let ns = ctx.network.lock().await;
         let live_policy = {
@@ -1497,11 +1600,23 @@ async fn send_msghdr_on_behalf(
         });
     }
 
-    let control_buf = if msg_control_ptr != 0 && msg_controllen > 0 {
-        let len = (msg_controllen as usize).min(4096);
-        read_child_mem(notif_fd, notif.id, notif.pid, msg_control_ptr, len).ok()
+    // Copy the control buffer and rewrite any SCM_RIGHTS fds from child to
+    // supervisor numbers; `_scm_fds` keeps the fetched fds open across the send.
+    let (control_buf, _scm_fds) = if msg_control_ptr != 0 && msg_controllen > 0 {
+        // Fail closed on an oversized control buffer instead of silently
+        // truncating (which could drop SCM_RIGHTS fds or send a malformed tail).
+        if msg_controllen as usize > MAX_CONTROL_BUF {
+            return Err(libc::EMSGSIZE);
+        }
+        match read_child_mem(notif_fd, notif.id, notif.pid, msg_control_ptr, msg_controllen as usize) {
+            Ok(raw) => {
+                let (buf, fds) = translate_scm_rights(notif.pid, &raw)?;
+                (Some(buf), fds)
+            }
+            Err(_) => (None, Vec::new()),
+        }
     } else {
-        None
+        (None, Vec::new())
     };
 
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
@@ -1617,10 +1732,13 @@ async fn sendmmsg_on_behalf(
             Ok(fd) => fd,
             Err(e) => return NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EBADF)),
         };
-        let protocol = match query_socket_protocol(dup_fd.as_raw_fd()) {
-            Some(p) => p,
-            None => return NotifAction::Errno(ECONNREFUSED),
-        };
+        // Protocol is resolved as `Option` and consumed only by a non-connected
+        // IP entry (see `send_msghdr_on_behalf`). It is `None` for an AF_UNIX
+        // socket — whose connected entries send through the immune `dup_fd`
+        // without a destination check — so the batch is handled on-behalf here
+        // rather than refused with ECONNREFUSED. On-behalf (not Continue) keeps
+        // it TOCTOU-safe against a racing fd swap.
+        let protocol = query_socket_protocol(dup_fd.as_raw_fd());
         let mut sent: usize = 0;
         let mut first_errno: Option<i32> = None;
         for i in 0..vlen {
@@ -1680,7 +1798,9 @@ async fn sendmmsg_on_behalf(
 
     for i in 0..vlen {
         let entry_ptr = msgvec_ptr + (i * MMSGHDR_SIZE) as u64;
-        match send_msghdr_on_behalf(notif, ctx, notif_fd, &dup_fd, protocol, entry_ptr, flags).await {
+        // Every entry is OnBehalf (IP, non-connected) per the prescan above, so
+        // the resolved protocol is always required and present here.
+        match send_msghdr_on_behalf(notif, ctx, notif_fd, &dup_fd, Some(protocol), entry_ptr, flags).await {
             Ok(n) => {
                 let bytes = (n as u32).to_ne_bytes();
                 let _ = write_child_mem(
@@ -2023,6 +2143,57 @@ pub fn compose_virtual_etc_hosts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- translate_scm_rights tests (control-buffer parsing, child-controlled) ---
+
+    fn cmsg_hdr(cmsg_len: usize, level: i32, ctype: i32) -> Vec<u8> {
+        let mut b = vec![0u8; 16];
+        b[0..8].copy_from_slice(&cmsg_len.to_ne_bytes());
+        b[8..12].copy_from_slice(&level.to_ne_bytes());
+        b[12..16].copy_from_slice(&ctype.to_ne_bytes());
+        b
+    }
+
+    #[test]
+    fn scm_rights_rejects_overflowing_cmsg_len() {
+        // A child-crafted cmsg_len near usize::MAX must fail closed (EINVAL),
+        // never overflow-panic (debug) or wrap past the bounds check (release).
+        let buf = cmsg_hdr(usize::MAX - 7, libc::SOL_SOCKET, libc::SCM_RIGHTS);
+        assert_eq!(translate_scm_rights(0, &buf).map(drop), Err(libc::EINVAL));
+    }
+
+    #[test]
+    fn scm_rights_rejects_short_header() {
+        let buf = cmsg_hdr(8, libc::SOL_SOCKET, libc::SCM_RIGHTS); // < CMSG_HDR (16)
+        assert_eq!(translate_scm_rights(0, &buf).map(drop), Err(libc::EINVAL));
+    }
+
+    #[test]
+    fn scm_rights_rejects_cmsg_running_past_buffer() {
+        let buf = cmsg_hdr(17, libc::SOL_SOCKET, libc::SCM_RIGHTS); // claims 17, has 16
+        assert_eq!(translate_scm_rights(0, &buf).map(drop), Err(libc::EINVAL));
+    }
+
+    #[test]
+    fn scm_rights_rejects_credentials() {
+        // Identity ancillary data on the on-behalf path must fail closed, not be
+        // forwarded with the child's crafted pid/uid/gid.
+        let buf = cmsg_hdr(16, libc::SOL_SOCKET, libc::SCM_CREDENTIALS);
+        assert_eq!(translate_scm_rights(0, &buf).map(drop), Err(libc::EPERM));
+    }
+
+    #[test]
+    fn scm_rights_passes_through_empty_and_non_socket_cmsg() {
+        // Empty control → no-op. A non-SOL_SOCKET cmsg (e.g. an IP-level control)
+        // passes through byte-for-byte with no fetched fds.
+        let (out, fds) = translate_scm_rights(0, &[]).unwrap();
+        assert!(out.is_empty() && fds.is_empty());
+
+        let buf = cmsg_hdr(16, libc::IPPROTO_IP, 2 /* IP_TTL-ish */);
+        let (out, fds) = translate_scm_rights(0, &buf).unwrap();
+        assert_eq!(out, buf);
+        assert!(fds.is_empty());
+    }
 
     // --- NetAllow::parse tests ---
 
