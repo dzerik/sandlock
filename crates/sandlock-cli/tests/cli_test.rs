@@ -512,6 +512,35 @@ fn test_uid_mapping_fakes_root() {
     );
 }
 
+/// Verify that `sandlock learn` populates `[limits]` with memory, processes,
+/// and open_files when the workload runs long enough for the sampler to capture
+/// resource peaks.
+#[test]
+fn test_learn_captures_resource_limits() {
+    let output = sandlock_bin()
+        .args(["learn", "--", "sleep", "0.2"])
+        .output()
+        .expect("failed to run sandlock learn");
+    assert!(
+        output.status.success(),
+        "sandlock learn failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("memory = \""),
+        "expected memory limit in learn output, got:\n{stdout}",
+    );
+    assert!(
+        stdout.contains("processes = "),
+        "expected processes limit in learn output, got:\n{stdout}",
+    );
+    assert!(
+        stdout.contains("open_files = "),
+        "expected open_files limit in learn output, got:\n{stdout}",
+    );
+}
+
 #[test]
 fn test_uid_mapping_arbitrary_uid() {
     // Arbitrary --user value should also map cleanly (not just 0).
