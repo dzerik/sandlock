@@ -531,6 +531,59 @@ fn translate_scm_rights(child_pid: u32, control: &[u8]) -> Result<(Vec<u8>, Vec<
     Ok((out, held))
 }
 
+/// True iff `fd` is an `AF_UNIX` socket, probed via `SO_DOMAIN`. `SCM_RIGHTS`
+/// and `SCM_CREDENTIALS` are unix-only, so control rewriting/gating is applied
+/// only to unix sockets — an IP socket's control (e.g. `IP_PKTINFO`) carries no
+/// fds or credentials and passes through untouched.
+fn socket_is_unix(fd: RawFd) -> bool {
+    let mut domain: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_DOMAIN,
+            &mut domain as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    rc == 0 && domain == libc::AF_UNIX
+}
+
+/// Copy (and, for a unix socket, translate) the control buffer of an on-behalf
+/// send. Shared by `send_msghdr_on_behalf` and `send_named_unix_msghdr`.
+///
+/// Returns `(control_bytes, held_fds)` — the fds keep the translated
+/// `SCM_RIGHTS` files open across the send. Fails closed: oversized control →
+/// `EMSGSIZE`; unreadable control → `EIO` (never a silent send that drops the
+/// caller's cmsgs). For a unix socket, `SCM_RIGHTS` fds are translated and
+/// `SCM_CREDENTIALS` is rejected; a non-unix socket's control passes through
+/// verbatim.
+fn materialize_control(
+    notif: &SeccompNotif,
+    notif_fd: RawFd,
+    msg_control_ptr: u64,
+    msg_controllen: u64,
+    is_unix: bool,
+) -> Result<(Option<Vec<u8>>, Vec<OwnedFd>), i32> {
+    if msg_control_ptr == 0 || msg_controllen == 0 {
+        return Ok((None, Vec::new()));
+    }
+    // Fail closed on an oversized control buffer instead of silently truncating
+    // (which could drop SCM_RIGHTS fds or send a malformed tail).
+    if msg_controllen as usize > MAX_CONTROL_BUF {
+        return Err(libc::EMSGSIZE);
+    }
+    let raw = read_child_mem(notif_fd, notif.id, notif.pid, msg_control_ptr, msg_controllen as usize)
+        .map_err(|_| libc::EIO)?;
+    if is_unix {
+        let (buf, fds) = translate_scm_rights(notif.pid, &raw)?;
+        Ok((Some(buf), fds))
+    } else {
+        Ok((Some(raw), Vec::new()))
+    }
+}
+
 // ============================================================
 // connect_on_behalf — perform connect() on behalf of the child (TOCTOU-safe)
 // ============================================================
@@ -1092,24 +1145,9 @@ fn send_named_unix_msghdr(
         })
         .collect();
 
-    // Rewrite SCM_RIGHTS fds from child to supervisor numbers; `_scm_fds` keeps
-    // them open across the send (same reasoning as `send_msghdr_on_behalf`).
-    let (control_buf, _scm_fds) = if msg_control_ptr != 0 && msg_controllen > 0 {
-        // Fail closed on an oversized control buffer instead of silently
-        // truncating (which could drop SCM_RIGHTS fds or send a malformed tail).
-        if msg_controllen as usize > MAX_CONTROL_BUF {
-            return Err(libc::EMSGSIZE);
-        }
-        match read_child_mem(notif_fd, notif.id, notif.pid, msg_control_ptr, msg_controllen as usize) {
-            Ok(raw) => {
-                let (buf, fds) = translate_scm_rights(notif.pid, &raw)?;
-                (Some(buf), fds)
-            }
-            Err(_) => (None, Vec::new()),
-        }
-    } else {
-        (None, Vec::new())
-    };
+    // Named target is always AF_UNIX, so translate SCM_RIGHTS / reject creds.
+    let (control_buf, _scm_fds) =
+        materialize_control(notif, notif_fd, msg_control_ptr, msg_controllen, true)?;
 
     let dup_fd = crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd)
         .map_err(|e| e.raw_os_error().unwrap_or(libc::EBADF))?;
@@ -1600,24 +1638,15 @@ async fn send_msghdr_on_behalf(
         });
     }
 
-    // Copy the control buffer and rewrite any SCM_RIGHTS fds from child to
-    // supervisor numbers; `_scm_fds` keeps the fetched fds open across the send.
-    let (control_buf, _scm_fds) = if msg_control_ptr != 0 && msg_controllen > 0 {
-        // Fail closed on an oversized control buffer instead of silently
-        // truncating (which could drop SCM_RIGHTS fds or send a malformed tail).
-        if msg_controllen as usize > MAX_CONTROL_BUF {
-            return Err(libc::EMSGSIZE);
-        }
-        match read_child_mem(notif_fd, notif.id, notif.pid, msg_control_ptr, msg_controllen as usize) {
-            Ok(raw) => {
-                let (buf, fds) = translate_scm_rights(notif.pid, &raw)?;
-                (Some(buf), fds)
-            }
-            Err(_) => (None, Vec::new()),
-        }
-    } else {
-        (None, Vec::new())
-    };
+    // Translate SCM_RIGHTS / reject creds only for a unix socket; an IP socket's
+    // control carries no fds or credentials and passes through untouched.
+    let (control_buf, _scm_fds) = materialize_control(
+        notif,
+        notif_fd,
+        msg_control_ptr,
+        msg_controllen,
+        socket_is_unix(dup_fd.as_raw_fd()),
+    )?;
 
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     if !connected {
