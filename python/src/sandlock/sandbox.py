@@ -560,11 +560,15 @@ class Sandbox:
     def pid(self) -> int | None:
         """Child PID while running, None otherwise. Reflects a running child from
         either the sandbox lifecycle or a live :meth:`popen` :class:`Process`."""
-        handle = self._live_handle()
-        if handle is None:
+        proc = self._popen_process()
+        if proc is not None:
+            # The Process owns the handle; its pid is lock-guarded and cached, so
+            # reading it can't race a concurrent wait() freeing the handle.
+            return proc.pid
+        if self._handle is None:
             return None
         from ._sdk import _lib
-        return _lib.sandlock_handle_pid(handle) or None
+        return _lib.sandlock_handle_pid(self._handle) or None
 
     @property
     def is_running(self) -> bool:
@@ -1207,19 +1211,14 @@ class Sandbox:
         or no ports have been remapped. Works for a running child from either
         the lifecycle or a live :meth:`popen` :class:`Process`.
         """
-        handle = self._live_handle()
-        if handle is None:
+        proc = self._popen_process()
+        if proc is not None:
+            # The Process owns the handle; its ports() reads it under the lock so
+            # this can't race a concurrent wait() freeing it.
+            return proc.ports()
+        if self._handle is None:
             return {}
-        from ._sdk import _lib
-        c_str = _lib.sandlock_handle_port_mappings(handle)
-        if not c_str:
-            return {}
-        try:
-            import json
-            raw = json.loads(c_str.decode())
-            return {int(k): v for k, v in raw.items()}
-        finally:
-            _lib.sandlock_string_free(c_str)
+        return _read_port_mappings(self._handle)
 
     def checkpoint(
         self,
@@ -1244,6 +1243,10 @@ class Sandbox:
         """
         from ._sdk import _lib, Checkpoint
 
+        # A popen() Process owns its handle; checkpoint (SIGSTOP + ptrace freeze)
+        # would fight the streaming Process for it, so reject rather than reach
+        # past it — consistent with wait/pause/resume/kill.
+        self._reject_if_popen()
         if self._handle is None:
             raise RuntimeError("sandbox is not running (use start() or run() first)")
         ptr = _lib.sandlock_handle_checkpoint(self._handle)
@@ -1253,6 +1256,22 @@ class Sandbox:
         if save_fn is not None:
             cp.app_state = save_fn()
         return cp
+
+
+def _read_port_mappings(handle) -> dict[int, int]:
+    """Decode {virtual: real} port mappings for a live handle. Shared by
+    ``Sandbox.ports`` and ``Process.ports``; the caller must hold whatever lock
+    guards ``handle`` while invoking this."""
+    from ._sdk import _lib
+    c_str = _lib.sandlock_handle_port_mappings(handle)
+    if not c_str:
+        return {}
+    try:
+        import json
+        raw = json.loads(c_str.decode())
+        return {int(k): v for k, v in raw.items()}
+    finally:
+        _lib.sandlock_string_free(c_str)
 
 
 def _encode(s: str) -> bytes:
@@ -1393,6 +1412,15 @@ class Process:
         """The child PID while running, else ``None`` (after :meth:`wait`)."""
         with self._lock:
             return self._pid if self._handle is not None and self._pid > 0 else None
+
+    def ports(self) -> dict[int, int]:
+        """Current virtual→real port mappings while running, else ``{}`` (needs
+        ``port_remap``). Reads the handle under the lock, and reports ``{}``
+        while a :meth:`wait` holds it, so it can't race the wait's free."""
+        with self._lock:
+            if self._handle is None or self._waiting:
+                return {}
+            return _read_port_mappings(self._handle)
 
     def kill(self) -> None:
         """SIGKILL the child's entire process group by pid (like the sandbox and

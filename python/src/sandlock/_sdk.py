@@ -333,11 +333,6 @@ _lib.sandlock_popen.argtypes = [
     ctypes.POINTER(ctypes.c_int),  # out_stderr_fd
 ]
 
-# SIGKILL the handle's process group without freeing it (so wait can still
-# collect the exit status). 0 on success, -1 on error.
-_lib.sandlock_handle_kill.restype = ctypes.c_int
-_lib.sandlock_handle_kill.argtypes = [_c_handle_p]
-
 # Result
 _lib.sandlock_result_exit_code.restype = ctypes.c_int
 _lib.sandlock_result_exit_code.argtypes = [_c_result_p]

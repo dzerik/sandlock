@@ -277,7 +277,8 @@ def test_sandbox_lifecycle_methods_reject_popen_process():
     sandbox = _policy()
     proc = sandbox.popen(["sleep", "100"])
     try:
-        for op in (sandbox.wait, sandbox.kill, sandbox.pause, sandbox.resume):
+        for op in (sandbox.wait, sandbox.kill, sandbox.pause, sandbox.resume,
+                   sandbox.checkpoint):
             with pytest.raises(RuntimeError):
                 op()
         # The Process still works after the rejected sandbox-level calls.
@@ -285,6 +286,23 @@ def test_sandbox_lifecycle_methods_reject_popen_process():
     finally:
         proc.kill()
         proc.wait()
+
+
+def test_sandbox_pid_and_ports_delegate_to_popen_process():
+    # Sandbox.pid/ports must read the popen child through the Process (whose
+    # accessors are lock-guarded), not touch the Process's handle directly —
+    # otherwise a concurrent wait() free would race the raw FFI read.
+    sandbox = _policy()
+    proc = sandbox.popen(["sleep", "100"])
+    try:
+        assert proc.pid is not None
+        assert sandbox.pid == proc.pid
+        assert sandbox.ports() == proc.ports()  # both {} without port_remap
+    finally:
+        proc.kill()
+        proc.wait()
+    assert sandbox.pid is None
+    assert sandbox.ports() == {}
 
 
 def test_wait_timeout_zero_does_not_wait_forever():
