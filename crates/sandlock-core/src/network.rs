@@ -1082,25 +1082,29 @@ fn sendmsg_named_unix_on_behalf(
     sun_path: &std::path::Path,
     writable: &[std::path::PathBuf],
 ) -> NotifAction {
-    match send_named_unix_msghdr(notif, notif_fd, sockfd, msghdr_ptr, flags, sun_path, writable) {
-        Ok(n) => NotifAction::ReturnValue(n as i64),
+    match send_named_unix_msghdr(notif, notif_fd, sockfd, msghdr_ptr, sun_path, writable) {
+        Ok((dup_fd, m)) => {
+            let blocking = wants_blocking(dup_fd.as_raw_fd(), flags);
+            resolve_send(dup_fd, m, flags, blocking)
+        }
         Err(errno) => NotifAction::Errno(errno),
     }
 }
 
-/// Core of the named-unix on-behalf `sendmsg`: resolve+verify `sun_path`, copy
-/// the message's iovecs/control from the child, and send to the pinned inode
-/// via `/proc/self/fd`. Returns the bytes sent or an errno. Shared by the
-/// single-message `sendmsg` path and the per-entry `sendmmsg` path.
+/// Core of the named-unix on-behalf `sendmsg`: resolve+verify `sun_path` and
+/// copy the message's iovecs/control from the child, addressed to the pinned
+/// inode via `/proc/self/fd`. Returns the dup'd socket and a [`MaterializedMsg`]
+/// (which keeps the inode pin alive) for the caller to send — inline, and
+/// deferred if it would block. Shared by the single-message `sendmsg` path and
+/// the per-entry `sendmmsg` path.
 fn send_named_unix_msghdr(
     notif: &SeccompNotif,
     notif_fd: RawFd,
     sockfd: i32,
     msghdr_ptr: u64,
-    flags: i32,
     sun_path: &std::path::Path,
     writable: &[std::path::PathBuf],
-) -> Result<isize, i32> {
+) -> Result<(OwnedFd, MaterializedMsg), i32> {
     let pinned = match resolve_named_unix_target(notif.pid, sun_path, writable) {
         Ok(fd) => fd,
         Err(NotifAction::Errno(e)) => return Err(e),
@@ -1120,53 +1124,32 @@ fn send_named_unix_msghdr(
     let iovlen = (msg_iovlen as usize).min(1024);
     let iov_bytes = read_child_mem(notif_fd, notif.id, notif.pid, msg_iov_ptr, iovlen * 16)
         .map_err(|_| libc::EIO)?;
-    let mut data_bufs: Vec<Vec<u8>> = Vec::with_capacity(iovlen);
-    for i in 0..iovlen {
-        let off = i * 16;
-        if off + 16 > iov_bytes.len() {
-            break;
-        }
-        let base = u64::from_ne_bytes(iov_bytes[off..off + 8].try_into().unwrap());
-        let len = u64::from_ne_bytes(iov_bytes[off + 8..off + 16].try_into().unwrap()) as usize;
-        if len > MAX_SEND_BUF {
-            return Err(libc::EMSGSIZE);
-        }
-        if base == 0 || len == 0 {
-            data_bufs.push(Vec::new());
-            continue;
-        }
-        data_bufs.push(read_child_mem(notif_fd, notif.id, notif.pid, base, len).map_err(|_| libc::EIO)?);
-    }
-    let mut local_iovs: Vec<libc::iovec> = data_bufs
-        .iter()
-        .map(|b| libc::iovec {
-            iov_base: b.as_ptr() as *mut libc::c_void,
-            iov_len: b.len(),
-        })
-        .collect();
-
+    let data = flatten_iovecs(notif, notif_fd, &iov_bytes, iovlen)?;
     // Named target is always AF_UNIX, so translate SCM_RIGHTS / reject creds.
-    let (control_buf, _scm_fds) =
+    let (control_buf, scm_fds) =
         materialize_control(notif, notif_fd, msg_control_ptr, msg_controllen, true)?;
 
     let dup_fd = crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd)
         .map_err(|e| e.raw_os_error().unwrap_or(libc::EBADF))?;
 
-    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    msg.msg_name = &sun as *const libc::sockaddr_un as *mut libc::c_void;
-    msg.msg_namelen = sun_len;
-    msg.msg_iov = local_iovs.as_mut_ptr();
-    msg.msg_iovlen = local_iovs.len();
-    if let Some(ref ctrl) = control_buf {
-        msg.msg_control = ctrl.as_ptr() as *mut libc::c_void;
-        msg.msg_controllen = ctrl.len();
+    // The destination is the `/proc/self/fd/<pinned>` sockaddr; `pinned` must
+    // stay open (and at the same fd number) for that path to resolve, so the
+    // message keeps it alive. Copy the sockaddr bytes it currently encodes.
+    let addr = unsafe {
+        std::slice::from_raw_parts(&sun as *const libc::sockaddr_un as *const u8, sun_len as usize)
     }
-    let ret = unsafe { libc::sendmsg(dup_fd.as_raw_fd(), &msg, flags) };
-    if ret >= 0 {
-        Ok(ret)
-    } else {
-        Err(unsafe { *libc::__errno_location() })
-    }
+    .to_vec();
+
+    Ok((
+        dup_fd,
+        MaterializedMsg {
+            data,
+            control: control_buf,
+            addr,
+            _scm_fds: scm_fds,
+            _pinned: Some(pinned),
+        },
+    ))
 }
 
 /// Read a `sendmmsg` entry's `msg_name` and return its NAMED `AF_UNIX` path, or
@@ -1216,22 +1199,52 @@ fn sendmmsg_named_unix_on_behalf(
             // stop here and report a short send rather than passing it through.
             None => break,
         };
-        match send_named_unix_msghdr(notif, notif_fd, sockfd, entry_ptr, flags, &path, writable) {
-            Ok(n) => {
-                let bytes = (n as u32).to_ne_bytes();
-                let _ = write_child_mem(
-                    notif_fd,
-                    notif.id,
-                    notif.pid,
-                    entry_ptr + MSG_LEN_OFFSET as u64,
-                    &bytes,
-                );
-                sent += 1;
-            }
+        let (dup_fd, m) = match send_named_unix_msghdr(notif, notif_fd, sockfd, entry_ptr, &path, writable) {
+            Ok(pair) => pair,
             Err(errno) => {
                 first_errno = Some(errno);
                 break;
             }
+        };
+        // Non-blocking per entry so a batch never occupies the notification loop;
+        // the two cases that must leave the loop are deferred (see below).
+        let blocking = wants_blocking(dup_fd.as_raw_fd(), flags);
+        let ret = send_materialized_at(dup_fd.as_raw_fd(), &m, 0, flags | libc::MSG_DONTWAIT);
+        if ret >= 0 {
+            if blocking && (ret as usize) < m.data.len() {
+                // Partial stream on a blocking socket: complete this entry off the
+                // loop and report it, so a caller ignoring per-entry msg_len isn't
+                // silently truncated.
+                return complete_batch_entry(
+                    dup_fd, m, flags, ret as usize, notif_fd, notif.id, notif.pid,
+                    entry_ptr + MSG_LEN_OFFSET as u64, sent,
+                );
+            }
+            let bytes = (ret as u32).to_ne_bytes();
+            let _ = write_child_mem(
+                notif_fd, notif.id, notif.pid, entry_ptr + MSG_LEN_OFFSET as u64, &bytes,
+            );
+            sent += 1;
+        } else {
+            let err = unsafe { *libc::__errno_location() };
+            if err == libc::EAGAIN || err == libc::EWOULDBLOCK {
+                if sent == 0 && blocking {
+                    // Entry 0 would block entirely: a blocking socket never returns
+                    // EAGAIN, so complete it off the loop.
+                    return complete_batch_entry(
+                        dup_fd, m, flags, 0, notif_fd, notif.id, notif.pid,
+                        entry_ptr + MSG_LEN_OFFSET as u64, 0,
+                    );
+                }
+                // i>0 with nothing sent is a contract-legal short count; a
+                // non-blocking child at entry 0 gets EAGAIN.
+                if sent == 0 {
+                    first_errno = Some(libc::EAGAIN);
+                }
+                break;
+            }
+            first_errno = Some(err);
+            break;
         }
     }
     if sent > 0 {
@@ -1353,27 +1366,19 @@ async fn sendto_on_behalf(
             Err(_) => return NotifAction::Errno(libc::EIO),
         };
 
-        // 4. (dup_fd from step 2 is reused for the supervisor sendto.)
-
-        // 5. Perform sendto in supervisor with validated sockaddr + copied data
-        let ret = unsafe {
-            libc::sendto(
-                dup_fd.as_raw_fd(),
-                data.as_ptr() as *const libc::c_void,
-                data.len(),
-                flags,
-                addr_bytes.as_ptr() as *const libc::sockaddr,
-                addr_len as libc::socklen_t,
-            )
+        // 4. Send on-behalf (deferred if it would block), like sendmsg — a
+        // sendto is a sendmsg with a single iovec and an explicit destination.
+        // The first attempt is non-blocking on the loop; a blocking child whose
+        // send buffer is full defers off the loop instead of wedging it.
+        let m = MaterializedMsg {
+            data,
+            control: None,
+            addr: addr_bytes,
+            _scm_fds: Vec::new(),
+            _pinned: None,
         };
-
-        // 6. Return result
-        if ret >= 0 {
-            NotifAction::ReturnValue(ret as i64)
-        } else {
-            let errno = unsafe { *libc::__errno_location() };
-            NotifAction::Errno(errno)
-        }
+        let blocking = wants_blocking(dup_fd.as_raw_fd(), flags);
+        resolve_send(dup_fd, m, flags, blocking)
     } else {
         // Non-IP family. Gate a NAMED AF_UNIX datagram the same way as connect:
         // sendto to a named socket is a WRITE on its inode, so deny unless the
@@ -1468,8 +1473,11 @@ async fn sendmsg_on_behalf(
     // could redirect the send onto an IP socket to a denied destination.
     let protocol = query_socket_protocol(dup_fd.as_raw_fd());
 
-    match send_msghdr_on_behalf(notif, ctx, notif_fd, &dup_fd, protocol, msghdr_ptr, flags).await {
-        Ok(n) => NotifAction::ReturnValue(n as i64),
+    match send_msghdr_on_behalf(notif, ctx, notif_fd, &dup_fd, protocol, msghdr_ptr).await {
+        Ok(m) => {
+            let blocking = wants_blocking(dup_fd.as_raw_fd(), flags);
+            resolve_send(dup_fd, m, flags, blocking)
+        }
         Err(errno) => NotifAction::Errno(errno),
     }
 }
@@ -1522,6 +1530,210 @@ fn prescan_msghdr(
     PrescanResult::OnBehalf
 }
 
+/// A fully-materialized on-behalf send. Owns the (flattened) iovec payload, the
+/// translated control buffer (with its `SCM_RIGHTS` fds and any named-unix inode
+/// pin kept alive), and the destination sockaddr (empty = connected). Owning
+/// everything lets the send be retried — from a byte offset, on a deferred
+/// worker — without borrowing supervisor state, so a blocked send can leave the
+/// sequential notification loop while still delivering the whole message.
+struct MaterializedMsg {
+    data: Vec<u8>,
+    control: Option<Vec<u8>>,
+    addr: Vec<u8>,
+    _scm_fds: Vec<OwnedFd>,
+    _pinned: Option<OwnedFd>,
+}
+
+/// True iff this send should block until it completes: the socket is in blocking
+/// mode (`O_NONBLOCK` clear — the dup shares the child's file description, so it
+/// reflects the child's own mode) *and* the per-call `send_flags` did not request
+/// non-blocking with `MSG_DONTWAIT`. A child that passes `MSG_DONTWAIT` on a
+/// blocking socket wants the immediate short-count/`EAGAIN`, not a deferred
+/// block-to-completion, so it must not be deferred.
+fn wants_blocking(fd: RawFd, send_flags: i32) -> bool {
+    if send_flags & libc::MSG_DONTWAIT != 0 {
+        return false;
+    }
+    let fl = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    fl >= 0 && (fl & libc::O_NONBLOCK) == 0
+}
+
+/// One `sendmsg` of `m` starting at byte `offset`. The destination address and
+/// control ancillary are attached only at `offset == 0`: `SCM_RIGHTS` transmits
+/// exactly once, and a stream continuation carries no new address. Returns the
+/// kernel result (>= 0 bytes, or -1 with errno in `*__errno_location`).
+fn send_materialized_at(fd: RawFd, m: &MaterializedMsg, offset: usize, flags: i32) -> isize {
+    let iov = libc::iovec {
+        iov_base: unsafe { m.data.as_ptr().add(offset) } as *mut libc::c_void,
+        iov_len: m.data.len() - offset,
+    };
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    if offset == 0 {
+        if !m.addr.is_empty() {
+            msg.msg_name = m.addr.as_ptr() as *mut libc::c_void;
+            msg.msg_namelen = m.addr.len() as u32;
+        }
+        if let Some(ref c) = m.control {
+            msg.msg_control = c.as_ptr() as *mut libc::c_void;
+            msg.msg_controllen = c.len();
+        }
+    }
+    msg.msg_iov = &iov as *const libc::iovec as *mut libc::iovec;
+    msg.msg_iovlen = 1;
+    unsafe { libc::sendmsg(fd, &msg, flags) }
+}
+
+/// Read a child's iovec array (`iov_bytes` = the raw `struct iovec[]`) and
+/// concatenate the referenced buffers into one owned payload, capped at
+/// `MAX_SEND_BUF` total so a hostile child can't OOM the supervisor. A null
+/// base or zero length contributes nothing (matching the prior per-iovec copy).
+fn flatten_iovecs(
+    notif: &SeccompNotif,
+    notif_fd: RawFd,
+    iov_bytes: &[u8],
+    iovlen: usize,
+) -> Result<Vec<u8>, i32> {
+    let mut data: Vec<u8> = Vec::new();
+    for i in 0..iovlen {
+        let off = i * 16;
+        if off + 16 > iov_bytes.len() {
+            break;
+        }
+        let base = u64::from_ne_bytes(iov_bytes[off..off + 8].try_into().unwrap());
+        let len = u64::from_ne_bytes(iov_bytes[off + 8..off + 16].try_into().unwrap()) as usize;
+        if base == 0 || len == 0 {
+            continue;
+        }
+        if len > MAX_SEND_BUF || data.len().saturating_add(len) > MAX_SEND_BUF {
+            return Err(libc::EMSGSIZE);
+        }
+        data.extend_from_slice(
+            &read_child_mem(notif_fd, notif.id, notif.pid, base, len).map_err(|_| libc::EIO)?,
+        );
+    }
+    Ok(data)
+}
+
+/// Resolve a materialized send to a terminal action. The first attempt is
+/// non-blocking (`MSG_DONTWAIT`) on the seccomp loop, so it never blocks there.
+/// A non-blocking child gets whatever that one attempt returns (short count or
+/// `EAGAIN`), exactly as the kernel would give it. A blocking child whose whole
+/// message didn't fit is completed off the loop (`defer_send`), preserving the
+/// kernel's "a blocking send of N returns N" contract without occupying the
+/// loop or a worker thread — a stream send that partially fit continues from
+/// the sent offset; a full send buffer defers from offset 0.
+fn resolve_send(dup_fd: OwnedFd, m: MaterializedMsg, flags: i32, child_blocking: bool) -> NotifAction {
+    let ret = send_materialized_at(dup_fd.as_raw_fd(), &m, 0, flags | libc::MSG_DONTWAIT);
+    if ret >= 0 {
+        let sent = ret as usize;
+        if !child_blocking || sent >= m.data.len() {
+            return NotifAction::ReturnValue(ret as i64);
+        }
+        // Blocking stream socket, partial fit: finish the remainder off the loop.
+        return NotifAction::defer(defer_send(dup_fd, m, flags, sent));
+    }
+    let err = unsafe { *libc::__errno_location() };
+    if err == libc::EAGAIN || err == libc::EWOULDBLOCK {
+        if child_blocking {
+            return NotifAction::defer(defer_send(dup_fd, m, flags, 0));
+        }
+        return NotifAction::Errno(libc::EAGAIN);
+    }
+    NotifAction::Errno(err)
+}
+
+/// Byte-level completion core: await writability on the dup'd fd through the
+/// Tokio IO driver's epoll (never blocking a worker thread) and push the rest of
+/// the message, advancing `offset` past each partial send, until the whole
+/// message is delivered or a real error occurs. Bounded by the supervisor's
+/// deferred-work timeout, so a peer that never drains can wedge only this one
+/// send for that bound — never the notification loop.
+///
+/// `Ok(n)` is the total bytes sent: the full length on success, or the bytes
+/// queued before a hard error interrupted a partially-sent stream. `Err(e)` is
+/// returned only when nothing at all was sent. Shared by the single-message
+/// deferral ([`defer_send`]) and the batch tail ([`complete_batch_entry`]).
+async fn push_until_done(
+    dup_fd: OwnedFd,
+    m: MaterializedMsg,
+    flags: i32,
+    mut offset: usize,
+) -> Result<usize, i32> {
+    let afd = tokio::io::unix::AsyncFd::with_interest(dup_fd, tokio::io::Interest::WRITABLE)
+        .map_err(|_| libc::EIO)?;
+    loop {
+        let mut guard = afd.writable().await.map_err(|_| libc::EIO)?;
+        let ret = send_materialized_at(afd.get_ref().as_raw_fd(), &m, offset, flags | libc::MSG_DONTWAIT);
+        if ret >= 0 {
+            offset += ret as usize;
+            if offset >= m.data.len() {
+                return Ok(m.data.len());
+            }
+            // More to send; the next writability edge (or an EAGAIN below) gates it.
+            continue;
+        }
+        let err = unsafe { *libc::__errno_location() };
+        if err == libc::EAGAIN || err == libc::EWOULDBLOCK {
+            guard.clear_ready();
+            continue;
+        }
+        return if offset > 0 { Ok(offset) } else { Err(err) };
+    }
+}
+
+/// Deferred tail of [`resolve_send`] for a single message: complete the send and
+/// return the byte count (matching a blocking send of N returning N; a partial
+/// stream then error returns the partial count).
+async fn defer_send(dup_fd: OwnedFd, m: MaterializedMsg, flags: i32, offset: usize) -> NotifAction {
+    match push_until_done(dup_fd, m, flags, offset).await {
+        Ok(n) => NotifAction::ReturnValue(n as i64),
+        Err(e) => NotifAction::Errno(e),
+    }
+}
+
+/// Deferred tail shared by the three `sendmmsg` batch loops. Completes entry
+/// `prior_count` (which either would-block entirely, offset 0, or partially sent
+/// a stream, offset > 0) off the loop, then reports the *message* count — not a
+/// byte count — as `sendmmsg` requires: `prior_count + 1` once the entry is
+/// fully delivered (writing its full `msg_len` back so a blocking caller that
+/// ignores per-entry `msg_len` isn't silently truncated). On error it reports
+/// `prior_count` (the entries already fully sent), or the errno only when
+/// nothing at all has been sent (`prior_count == 0` and this entry made no
+/// progress). Entries beyond this one are left for the child to retry, so the
+/// batch is never materialized whole.
+fn complete_batch_entry(
+    dup_fd: OwnedFd,
+    m: MaterializedMsg,
+    flags: i32,
+    offset: usize,
+    notif_fd: RawFd,
+    notif_id: u64,
+    notif_pid: u32,
+    msglen_addr: u64,
+    prior_count: usize,
+) -> NotifAction {
+    let m_len = m.data.len();
+    NotifAction::defer(async move {
+        match push_until_done(dup_fd, m, flags, offset).await {
+            Ok(n) if n == m_len => {
+                let bytes = (m_len as u32).to_ne_bytes();
+                let _ = write_child_mem(notif_fd, notif_id, notif_pid, msglen_addr, &bytes);
+                NotifAction::ReturnValue((prior_count + 1) as i64)
+            }
+            // Partial stream then hard error: entry not fully delivered, so it is
+            // not counted; the child retries it (and the rest).
+            Ok(_) => NotifAction::ReturnValue(prior_count as i64),
+            Err(e) => {
+                if prior_count == 0 {
+                    NotifAction::Errno(e)
+                } else {
+                    NotifAction::ReturnValue(prior_count as i64)
+                }
+            }
+        }
+    })
+}
+
 /// Validate, materialize, and send one `struct msghdr` on behalf of
 /// the child. Caller is responsible for:
 ///   - dup'ing the child fd (`dup_fd`),
@@ -1537,10 +1749,10 @@ fn prescan_msghdr(
 /// (`ECONNREFUSED`), so an IP send whose protocol can't be resolved is refused
 /// rather than escaping the allowlist.
 ///
-/// Returns the byte count returned by `sendmsg`, or an errno suitable
-/// for `NotifAction::Errno`. ECONNREFUSED is used both for "destination
-/// blocked by policy" and for "couldn't parse a port from the
-/// sockaddr"; EIO for sub-buffer read failures (iovec / control).
+/// Returns a [`MaterializedMsg`] the caller sends (inline and, if it would
+/// block, deferred) via [`resolve_send`] / [`send_materialized`]; or an errno.
+/// ECONNREFUSED is used both for "destination blocked by policy" and for
+/// "couldn't parse a port from the sockaddr"; EIO for sub-buffer read failures.
 async fn send_msghdr_on_behalf(
     notif: &SeccompNotif,
     ctx: &Arc<SupervisorCtx>,
@@ -1548,8 +1760,7 @@ async fn send_msghdr_on_behalf(
     dup_fd: &std::os::unix::io::OwnedFd,
     protocol: Option<Protocol>,
     msghdr_ptr: u64,
-    flags: i32,
-) -> Result<isize, i32> {
+) -> Result<MaterializedMsg, i32> {
     let msghdr_bytes = match read_child_mem(notif_fd, notif.id, notif.pid, msghdr_ptr, 56) {
         Ok(b) if b.len() >= 56 => b,
         _ => return Err(libc::EFAULT),
@@ -1606,41 +1817,15 @@ async fn send_msghdr_on_behalf(
     }
 
     let iovlen = (msg_iovlen as usize).min(1024);
-    let iov_size = iovlen * 16;
-    let iov_bytes = match read_child_mem(notif_fd, notif.id, notif.pid, msg_iov_ptr, iov_size) {
+    let iov_bytes = match read_child_mem(notif_fd, notif.id, notif.pid, msg_iov_ptr, iovlen * 16) {
         Ok(b) => b,
         Err(_) => return Err(libc::EIO),
     };
-    let mut data_bufs: Vec<Vec<u8>> = Vec::with_capacity(iovlen);
-    let mut local_iovs: Vec<libc::iovec> = Vec::with_capacity(iovlen);
-    for i in 0..iovlen {
-        let off = i * 16;
-        if off + 16 > iov_bytes.len() { break; }
-        let iov_base = u64::from_ne_bytes(iov_bytes[off..off + 8].try_into().unwrap());
-        let iov_len = u64::from_ne_bytes(iov_bytes[off + 8..off + 16].try_into().unwrap()) as usize;
-        if iov_len > MAX_SEND_BUF {
-            return Err(libc::EMSGSIZE);
-        }
-        if iov_base == 0 || iov_len == 0 {
-            data_bufs.push(Vec::new());
-            continue;
-        }
-        let buf = match read_child_mem(notif_fd, notif.id, notif.pid, iov_base, iov_len) {
-            Ok(b) => b,
-            Err(_) => return Err(libc::EIO),
-        };
-        data_bufs.push(buf);
-    }
-    for buf in &data_bufs {
-        local_iovs.push(libc::iovec {
-            iov_base: buf.as_ptr() as *mut libc::c_void,
-            iov_len: buf.len(),
-        });
-    }
+    let data = flatten_iovecs(notif, notif_fd, &iov_bytes, iovlen)?;
 
     // Translate SCM_RIGHTS / reject creds only for a unix socket; an IP socket's
     // control carries no fds or credentials and passes through untouched.
-    let (control_buf, _scm_fds) = materialize_control(
+    let (control_buf, scm_fds) = materialize_control(
         notif,
         notif_fd,
         msg_control_ptr,
@@ -1648,24 +1833,13 @@ async fn send_msghdr_on_behalf(
         socket_is_unix(dup_fd.as_raw_fd()),
     )?;
 
-    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    if !connected {
-        msg.msg_name = addr_bytes.as_ptr() as *mut libc::c_void;
-        msg.msg_namelen = addr_bytes.len() as u32;
-    }
-    msg.msg_iov = local_iovs.as_mut_ptr();
-    msg.msg_iovlen = local_iovs.len();
-    if let Some(ref ctrl) = control_buf {
-        msg.msg_control = ctrl.as_ptr() as *mut libc::c_void;
-        msg.msg_controllen = ctrl.len();
-    }
-
-    let ret = unsafe { libc::sendmsg(dup_fd.as_raw_fd(), &msg, flags) };
-    if ret >= 0 {
-        Ok(ret)
-    } else {
-        Err(unsafe { *libc::__errno_location() })
-    }
+    Ok(MaterializedMsg {
+        data,
+        control: control_buf,
+        addr: if connected { Vec::new() } else { addr_bytes },
+        _scm_fds: scm_fds,
+        _pinned: None,
+    })
 }
 
 // ============================================================
@@ -1772,24 +1946,49 @@ async fn sendmmsg_on_behalf(
         let mut first_errno: Option<i32> = None;
         for i in 0..vlen {
             let entry_ptr = msgvec_ptr + (i * MMSGHDR_SIZE) as u64;
-            match send_msghdr_on_behalf(notif, ctx, notif_fd, &dup_fd, protocol, entry_ptr, flags)
+            let m = match send_msghdr_on_behalf(notif, ctx, notif_fd, &dup_fd, protocol, entry_ptr)
                 .await
             {
-                Ok(n) => {
-                    let bytes = (n as u32).to_ne_bytes();
-                    let _ = write_child_mem(
-                        notif_fd,
-                        notif.id,
-                        notif.pid,
-                        entry_ptr + MSG_LEN_OFFSET as u64,
-                        &bytes,
-                    );
-                    sent += 1;
-                }
+                Ok(m) => m,
                 Err(errno) => {
                     first_errno = Some(errno);
                     break;
                 }
+            };
+            // A batch sends each entry non-blocking so it never occupies the loop;
+            // the two cases that must not (entry 0 fully blocked, or a partial
+            // stream entry) are completed off the loop instead of the child
+            // seeing a spurious EAGAIN or a silently-truncated msg_len.
+            let blocking = wants_blocking(dup_fd.as_raw_fd(), flags);
+            let ret = send_materialized_at(dup_fd.as_raw_fd(), &m, 0, flags | libc::MSG_DONTWAIT);
+            if ret >= 0 {
+                if blocking && (ret as usize) < m.data.len() {
+                    return complete_batch_entry(
+                        dup_fd, m, flags, ret as usize, notif_fd, notif.id, notif.pid,
+                        entry_ptr + MSG_LEN_OFFSET as u64, sent,
+                    );
+                }
+                let bytes = (ret as u32).to_ne_bytes();
+                let _ = write_child_mem(
+                    notif_fd, notif.id, notif.pid, entry_ptr + MSG_LEN_OFFSET as u64, &bytes,
+                );
+                sent += 1;
+            } else {
+                let err = unsafe { *libc::__errno_location() };
+                if err == libc::EAGAIN || err == libc::EWOULDBLOCK {
+                    if sent == 0 && blocking {
+                        return complete_batch_entry(
+                            dup_fd, m, flags, 0, notif_fd, notif.id, notif.pid,
+                            entry_ptr + MSG_LEN_OFFSET as u64, 0,
+                        );
+                    }
+                    if sent == 0 {
+                        first_errno = Some(libc::EAGAIN);
+                    }
+                    break;
+                }
+                first_errno = Some(err);
+                break;
             }
         }
         return if sent > 0 {
@@ -1829,20 +2028,45 @@ async fn sendmmsg_on_behalf(
         let entry_ptr = msgvec_ptr + (i * MMSGHDR_SIZE) as u64;
         // Every entry is OnBehalf (IP, non-connected) per the prescan above, so
         // the resolved protocol is always required and present here.
-        match send_msghdr_on_behalf(notif, ctx, notif_fd, &dup_fd, Some(protocol), entry_ptr, flags).await {
-            Ok(n) => {
-                let bytes = (n as u32).to_ne_bytes();
-                let _ = write_child_mem(
-                    notif_fd, notif.id, notif.pid,
-                    entry_ptr + MSG_LEN_OFFSET as u64,
-                    &bytes,
-                );
-                sent += 1;
-            }
+        let m = match send_msghdr_on_behalf(notif, ctx, notif_fd, &dup_fd, Some(protocol), entry_ptr).await {
+            Ok(m) => m,
             Err(errno) => {
                 first_errno = Some(errno);
                 break;
             }
+        };
+        // Non-blocking per entry (see the destination-policy batch above); the
+        // entry-0-fully-blocked and partial-stream cases complete off the loop.
+        let blocking = wants_blocking(dup_fd.as_raw_fd(), flags);
+        let ret = send_materialized_at(dup_fd.as_raw_fd(), &m, 0, flags | libc::MSG_DONTWAIT);
+        if ret >= 0 {
+            if blocking && (ret as usize) < m.data.len() {
+                return complete_batch_entry(
+                    dup_fd, m, flags, ret as usize, notif_fd, notif.id, notif.pid,
+                    entry_ptr + MSG_LEN_OFFSET as u64, sent,
+                );
+            }
+            let bytes = (ret as u32).to_ne_bytes();
+            let _ = write_child_mem(
+                notif_fd, notif.id, notif.pid, entry_ptr + MSG_LEN_OFFSET as u64, &bytes,
+            );
+            sent += 1;
+        } else {
+            let err = unsafe { *libc::__errno_location() };
+            if err == libc::EAGAIN || err == libc::EWOULDBLOCK {
+                if sent == 0 && blocking {
+                    return complete_batch_entry(
+                        dup_fd, m, flags, 0, notif_fd, notif.id, notif.pid,
+                        entry_ptr + MSG_LEN_OFFSET as u64, 0,
+                    );
+                }
+                if sent == 0 {
+                    first_errno = Some(libc::EAGAIN);
+                }
+                break;
+            }
+            first_errno = Some(err);
+            break;
         }
     }
 

@@ -947,3 +947,149 @@ async fn test_connected_unix_sendmsg_translates_scm_rights_under_net_policy() {
         "receiver must read the passed fd's file — SCM_RIGHTS translated to the real open file (got {got_fd:?})"
     );
 }
+
+/// A large blocking on-behalf send to a peer that stalls before draining must
+/// fill the socket buffer, would-block, and *defer* off the notification loop —
+/// then resume on writability and deliver every byte. This exercises the
+/// `MSG_DONTWAIT` + `AsyncFd` deferred path; a regression would either truncate
+/// the transfer, spuriously fail with `EAGAIN`, or (before the fix) block the
+/// whole supervisor loop on the send.
+#[tokio::test]
+async fn test_large_blocking_send_defers_and_delivers_under_net_policy() {
+    use std::io::Read;
+    use std::os::unix::net::UnixListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const N: usize = 4 * 1024 * 1024; // well past any socket send buffer
+
+    let sock_path = temp_file("defer-send.sock");
+    let _ = std::fs::remove_file(&sock_path);
+    let listener = UnixListener::bind(&sock_path).unwrap();
+
+    // Accept, stall briefly (so the sender's buffer fills and the on-behalf send
+    // must defer), then drain everything and count the bytes.
+    let total = std::sync::Arc::new(AtomicUsize::new(0));
+    let total_w = total.clone();
+    let accepter = std::thread::spawn(move || {
+        if let Ok((mut conn, _)) = listener.accept() {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let mut buf = [0u8; 65536];
+            loop {
+                match conn.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        total_w.fetch_add(n, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+    });
+
+    let out = temp_file("defer-send-out");
+    let policy = base_policy().net_allow("127.0.0.1:80").build().unwrap();
+    // A SINGLE blocking send() of N bytes must return N — the kernel's contract
+    // for a blocking stream socket. A regression that returned on the first
+    // partial (one SO_SNDBUF worth) would write a short count here.
+    let script = format!(concat!(
+        "import socket\n",
+        "s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n",
+        "s.connect('{sock}')\n",
+        "n = s.send(b'z' * {n})\n",   // one syscall; blocking → must return all N
+        "s.close()\n",
+        "open('{out}', 'w').write('SENT:%d' % n)\n",
+    ), sock = sock_path.display(), n = N, out = out.display());
+
+    let result = policy.with_name("test")
+        .run_interactive(&["python3", "-c", &script]).await.unwrap();
+    assert!(result.success(), "exit={:?}", result.code());
+
+    let sent = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = accepter.join();
+    let got = total.load(Ordering::Relaxed);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&sock_path);
+
+    assert_eq!(
+        sent, format!("SENT:{N}"),
+        "one blocking send() must return the full {N} bytes (deferred to completion, not truncated)"
+    );
+    assert_eq!(got, N, "peer must receive all {N} bytes — no truncation on the deferred path");
+}
+
+/// `sendmmsg` of one large message on a blocking connected stream socket, to a
+/// peer that stalls before draining: the entry can't complete on the first
+/// non-blocking attempt, so it must be finished off the loop (not reported as a
+/// spurious EAGAIN or a short `msg_len`). The child must see `ret == 1` with the
+/// entry's `msg_len == N`, and the peer must receive all `N` bytes.
+#[tokio::test]
+async fn test_sendmmsg_blocking_entry_defers_and_delivers_under_net_policy() {
+    use std::io::Read;
+    use std::os::unix::net::UnixListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const N: usize = 4 * 1024 * 1024;
+
+    let sock_path = temp_file("mmsg-defer.sock");
+    let _ = std::fs::remove_file(&sock_path);
+    let listener = UnixListener::bind(&sock_path).unwrap();
+
+    let total = std::sync::Arc::new(AtomicUsize::new(0));
+    let total_w = total.clone();
+    let accepter = std::thread::spawn(move || {
+        if let Ok((mut conn, _)) = listener.accept() {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let mut buf = [0u8; 65536];
+            loop {
+                match conn.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        total_w.fetch_add(n, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+    });
+
+    let out = temp_file("mmsg-defer-out");
+    let policy = base_policy().net_allow("127.0.0.1:80").build().unwrap();
+    let script = format!(concat!(
+        "import ctypes, socket\n",
+        "libc = ctypes.CDLL('libc.so.6', use_errno=True)\n",
+        "libc.sendmmsg.restype = ctypes.c_int\n",
+        "class iovec(ctypes.Structure):\n",
+        "    _fields_ = [('iov_base', ctypes.c_void_p), ('iov_len', ctypes.c_size_t)]\n",
+        "class msghdr(ctypes.Structure):\n",
+        "    _fields_ = [('msg_name', ctypes.c_void_p), ('msg_namelen', ctypes.c_uint),\n",
+        "        ('_p1', ctypes.c_uint), ('msg_iov', ctypes.c_void_p), ('msg_iovlen', ctypes.c_size_t),\n",
+        "        ('msg_control', ctypes.c_void_p), ('msg_controllen', ctypes.c_size_t),\n",
+        "        ('msg_flags', ctypes.c_int), ('_p2', ctypes.c_uint)]\n",
+        "class mmsghdr(ctypes.Structure):\n",
+        "    _fields_ = [('msg_hdr', msghdr), ('msg_len', ctypes.c_uint), ('_p', ctypes.c_uint)]\n",
+        "s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n",   // blocking, connected
+        "s.connect('{sock}')\n",
+        "data = ctypes.create_string_buffer(b'z' * {n}, {n})\n",
+        "iov = iovec(); iov.iov_base = ctypes.cast(data, ctypes.c_void_p).value; iov.iov_len = {n}\n",
+        "vec = (mmsghdr * 1)()\n",
+        "vec[0].msg_hdr.msg_iov = ctypes.cast(ctypes.pointer(iov), ctypes.c_void_p).value\n",
+        "vec[0].msg_hdr.msg_iovlen = 1\n",   // msg_name NULL => connected
+        "ret = libc.sendmmsg(s.fileno(), vec, 1, 0)\n",
+        "open('{out}', 'w').write('ret=%d msg_len=%d' % (ret, vec[0].msg_len))\n",
+        "s.close()\n",
+    ), sock = sock_path.display(), n = N, out = out.display());
+
+    let result = policy.with_name("test")
+        .run_interactive(&["python3", "-c", &script]).await.unwrap();
+    assert!(result.success(), "exit={:?}", result.code());
+
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = accepter.join();
+    let got = total.load(Ordering::Relaxed);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&sock_path);
+
+    assert_eq!(
+        content, format!("ret=1 msg_len={N}"),
+        "blocking sendmmsg entry must complete off-loop: ret=1 with full msg_len (got {content:?})"
+    );
+    assert_eq!(got, N, "peer must receive all {N} bytes of the deferred batch entry");
+}
