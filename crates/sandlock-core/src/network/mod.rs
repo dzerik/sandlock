@@ -18,6 +18,7 @@ use crate::sys::structs::{SeccompNotif, ECONNREFUSED};
 
 mod child_abi;
 mod send_engine;
+mod verdict;
 
 use child_abi::{
     materialize_msg, mmsg_entry_ptr, mmsg_msglen_addr, named_unix_socket_path,
@@ -25,6 +26,7 @@ use child_abi::{
     MaterializedMsg, MAX_SEND_BUF,
 };
 use send_engine::{complete_batch_entry, resolve_send, send_materialized_at, wants_blocking};
+use verdict::{check_ip_destination, destination_verdict, path_under_any, real_path_under_any};
 
 /// An IPv4 or IPv6 address with a prefix length, used by `--net-deny`
 /// to match destination IPs by exact address (`/32`, `/128`) or by range.
@@ -487,24 +489,8 @@ async fn connect_on_behalf(
             pfs.live_policy.clone()
         };
         let effective = ns.effective_network_policy(notif.pid, protocol, live_policy.as_ref());
-        match (effective, dest_port) {
-            (crate::seccomp::notif::NetworkPolicy::Unrestricted, _) => {
-                // No rules for this protocol's wildcard — Landlock (TCP
-                // only) or the protocol's wildcard rule covers it; no
-                // additional check here.
-            }
-            (policy, Some(p)) => {
-                // For ICMP rules every per-IP entry is `PortAllow::Any`,
-                // so the port arg from the sockaddr (typically 0 or the
-                // ICMP id) is functionally ignored — IP is what matters.
-                if !policy.allows(ip, p) {
-                    return NotifAction::Errno(ECONNREFUSED);
-                }
-            }
-            (_, None) => {
-                // Couldn't parse port from sockaddr — fail closed.
-                return NotifAction::Errno(ECONNREFUSED);
-            }
+        if let Err(e) = destination_verdict(&effective, ip, dest_port) {
+            return NotifAction::Errno(e);
         }
         // Check for HTTP ACL redirect
         let http_acl_addr = ns.http_acl_addr;
@@ -862,15 +848,6 @@ fn sendto_named_unix_on_behalf(
     resolve_send(dup_fd, m, flags, blocking)
 }
 
-/// True if `real` (an already-canonical path) is at or under any of `prefixes`,
-/// canonicalizing each prefix so a symlinked grant path still matches.
-fn real_path_under_any(real: &std::path::Path, prefixes: &[std::path::PathBuf]) -> bool {
-    prefixes.iter().any(|p| {
-        let canon = std::fs::canonicalize(p);
-        real.starts_with(canon.as_deref().unwrap_or(p))
-    })
-}
-
 /// Apply the named-unix fs gate to a `sendmsg()` whose `msg_name` may address a
 /// unix socket. Returns `Some(action)` when the target is a named `AF_UNIX`
 /// socket (handled here), or `None` to fall through to the IP path (connected
@@ -1068,14 +1045,6 @@ fn sendmmsg_named_unix_on_behalf(
     }
 }
 
-/// True if `path`, lexically normalized (`.`/`..` resolved without touching the
-/// filesystem), is at or under any of the granted `prefixes`. Mirrors the
-/// prefix matching the chroot fs enforcement uses.
-fn path_under_any(path: &std::path::Path, prefixes: &[std::path::PathBuf]) -> bool {
-    let norm = crate::chroot::resolve::confine(&path.to_string_lossy());
-    prefixes.iter().any(|p| norm.starts_with(p))
-}
-
 // ============================================================
 // sendto_on_behalf / sendmsg_on_behalf — on-behalf (TOCTOU-safe)
 // ============================================================
@@ -1131,22 +1100,9 @@ async fn sendto_on_behalf(
             Some(p) => p,
             None => return NotifAction::Errno(ECONNREFUSED),
         };
-        let ns = ctx.network.lock().await;
-        let live_policy = {
-            let pfs = ctx.policy_fn.lock().await;
-            pfs.live_policy.clone()
-        };
-        let effective = ns.effective_network_policy(notif.pid, protocol, live_policy.as_ref());
-        if !matches!(effective, crate::seccomp::notif::NetworkPolicy::Unrestricted) {
-            match dest_port {
-                Some(p) if !effective.allows(ip, p) => {
-                    return NotifAction::Errno(ECONNREFUSED);
-                }
-                None => return NotifAction::Errno(ECONNREFUSED),
-                Some(_) => {}
-            }
+        if let Err(e) = check_ip_destination(ctx, notif.pid, protocol, ip, dest_port).await {
+            return NotifAction::Errno(e);
         }
-        drop(ns);
 
         // 3. Copy data buffer from child memory
         let data = match read_child_mem(notif_fd, notif.id, notif.pid, buf_ptr, buf_len) {
@@ -1372,21 +1328,7 @@ async fn send_msghdr_on_behalf(
         // A non-connected IP send must have a resolved protocol to key the
         // per-protocol allowlist. If it couldn't be resolved, fail closed.
         let protocol = protocol.ok_or(ECONNREFUSED)?;
-
-        let ns = ctx.network.lock().await;
-        let live_policy = {
-            let pfs = ctx.policy_fn.lock().await;
-            pfs.live_policy.clone()
-        };
-        let effective = ns.effective_network_policy(notif.pid, protocol, live_policy.as_ref());
-        if !matches!(effective, crate::seccomp::notif::NetworkPolicy::Unrestricted) {
-            match dest_port {
-                Some(p) if !effective.allows(ip, p) => return Err(ECONNREFUSED),
-                None => return Err(ECONNREFUSED),
-                Some(_) => {}
-            }
-        }
-        drop(ns);
+        check_ip_destination(ctx, notif.pid, protocol, ip, dest_port).await?;
     }
 
     // Translate SCM_RIGHTS / reject creds only for a unix socket; an IP socket's
