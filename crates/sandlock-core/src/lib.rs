@@ -1,5 +1,6 @@
 pub mod error;
 pub mod http;
+pub(crate) mod credential;
 pub mod sandbox;     // formerly `policy`; contains Sandbox + SandboxBuilder + Confinement
 pub mod profile;
 pub mod result;

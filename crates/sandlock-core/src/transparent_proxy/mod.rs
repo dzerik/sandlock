@@ -49,6 +49,7 @@ fn is_tls_client_hello(first_byte: u8) -> bool {
 pub(crate) async fn spawn_transparent_proxy(
     allow: Vec<HttpRule>,
     deny: Vec<HttpRule>,
+    inject: Arc<Vec<crate::credential::InjectRule>>,
     ca_cert_pem: Option<&str>,
     ca_key_pem: Option<&str>,
 ) -> std::io::Result<HttpAclProxyHandle> {
@@ -56,7 +57,7 @@ pub(crate) async fn spawn_transparent_proxy(
     let orig_dest: OrigDestMap =
         Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
     let forwarder = Forwarder::new()?;
-    let svc = AclService::new(allow, deny, Arc::clone(&orig_dest), forwarder);
+    let svc = AclService::new(allow, deny, inject, Arc::clone(&orig_dest), forwarder);
 
     let signer = match (ca_cert_pem, ca_key_pem) {
         (Some(c), Some(k)) => Some(Arc::new(CertSigner::new(c, k)?)),
@@ -181,7 +182,7 @@ mod tests {
             .expect("resolve_ca ok")
             .expect("ephemeral CA generated");
         let allow = vec![crate::http::HttpRule::parse("GET allowed.test/*").expect("rule parses")];
-        let handle = super::spawn_transparent_proxy(allow, vec![], Some(&ca.cert_pem), Some(&ca.key_pem))
+        let handle = super::spawn_transparent_proxy(allow, vec![], Arc::new(vec![]), Some(&ca.cert_pem), Some(&ca.key_pem))
             .await
             .expect("proxy spawns");
         let addr = handle.addr;

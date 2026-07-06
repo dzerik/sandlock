@@ -14,6 +14,7 @@ use hyper::{Request, Response, StatusCode};
 use tokio::sync::Mutex;
 
 use super::upstream::{box_incoming, Forwarder};
+use crate::credential::InjectRule;
 use crate::http::{http_acl_check, HttpRule};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -31,6 +32,7 @@ struct DnsEntry {
 pub(crate) struct AclService {
     pub(crate) allow: Arc<Vec<HttpRule>>,
     pub(crate) deny: Arc<Vec<HttpRule>>,
+    pub(crate) inject: Arc<Vec<InjectRule>>,
     pub(crate) orig_dest: OrigDestMap,
     pub(crate) forwarder: Forwarder,
     dns_cache: Arc<Mutex<HashMap<String, DnsEntry>>>,
@@ -40,12 +42,14 @@ impl AclService {
     pub(crate) fn new(
         allow: Vec<HttpRule>,
         deny: Vec<HttpRule>,
+        inject: Arc<Vec<InjectRule>>,
         orig_dest: OrigDestMap,
         forwarder: Forwarder,
     ) -> Self {
         Self {
             allow: Arc::new(allow),
             deny: Arc::new(deny),
+            inject,
             orig_dest,
             forwarder,
             dns_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -150,6 +154,33 @@ impl AclService {
 
         let (mut parts, body) = req.into_parts();
         parts.uri = uri;
+
+        // ACL passed: attach a credential if a rule matches. First match wins.
+        // The secret is rendered into the outbound request only here — never on
+        // the deny path above — and only its name is recorded, never the value.
+        for r in self.inject.iter() {
+            if r.matches(&method, &host, &path) {
+                if r.apply(&mut parts).is_err() {
+                    // Rendering failed (e.g. the secret has bytes illegal in a
+                    // header) — fail the request rather than forward it with no
+                    // credential, which would look like an auth bug to the caller.
+                    eprintln!(
+                        "sandlock: credential {:?} could not be rendered for {} {}{} — rejecting",
+                        r.name, method, host, path
+                    );
+                    return text_response(
+                        StatusCode::BAD_GATEWAY,
+                        "Blocked by sandlock: credential could not be applied",
+                    );
+                }
+                eprintln!(
+                    "sandlock: injected credential {:?} for {} {}{}",
+                    r.name, method, host, path
+                );
+                break;
+            }
+        }
+
         let out_req = Request::from_parts(parts, box_incoming(body));
 
         match self.forwarder.forward(out_req).await {

@@ -501,6 +501,12 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
     for (key, value) in &sandbox.env {
         std::env::set_var(key, value);
     }
+    // Remove env vars whose value was loaded into the supervisor as a credential
+    // source, so the agent can't read the real secret straight from its own
+    // environment (this is the child; the mutation is process-local and post-fork).
+    for name in &sandbox.inject_env_strip {
+        std::env::remove_var(name);
+    }
 
     // 13b. GPU device visibility
     if let Some(ref devices) = sandbox.gpu_devices {

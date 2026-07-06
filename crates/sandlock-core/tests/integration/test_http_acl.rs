@@ -529,3 +529,154 @@ async fn test_http_acl_ipv6_method_filtering() {
     let _ = std::fs::remove_file(&out_get);
     let _ = std::fs::remove_file(&out_post);
 }
+
+/// Spawn a server that records the `Authorization` header of the one request it
+/// receives, for credential-injection tests.
+fn spawn_capturing_http_server() -> (
+    u16,
+    thread::JoinHandle<()>,
+    std::sync::Arc<std::sync::Mutex<Option<String>>>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let cap = captured.clone();
+    let handle = thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                if line.to_lowercase().starts_with("authorization:") {
+                    *cap.lock().unwrap() =
+                        Some(line.split_once(':').unwrap().1.trim().to_string());
+                }
+                if line == "\r\n" || line == "\n" {
+                    break;
+                }
+            }
+            let resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    (port, handle, captured)
+}
+
+/// A credential declared in the supervisor is injected into the outbound request
+/// inside the proxy — the child never carries it in env/argv/headers — and
+/// reaches the upstream, after the ACL check.
+#[tokio::test]
+async fn test_credential_injected_into_upstream() {
+    let out = temp_file("cred-inject");
+    let secret_file = temp_file("cred-secret");
+    std::fs::write(&secret_file, "sk-phase1-secret\n").unwrap();
+    let (port, srv, captured) = spawn_capturing_http_server();
+
+    let policy = base_policy()
+        .http_allow("GET 127.0.0.1/*")
+        .http_port(port)
+        .credential("api", &format!("file:{}", secret_file.display()))
+        .http_inject("GET 127.0.0.1/* bearer api")
+        .build()
+        .unwrap();
+
+    let script = http_script(&format!("http://127.0.0.1:{}/data", port), &out);
+    let result = policy.with_name("test").run_interactive(&["python3", "-c", &script])
+        .await.unwrap();
+    assert!(result.success(), "exit={:?}", result.code());
+
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    assert!(content.starts_with("OK:200"), "child request should succeed, got: {}", content);
+
+    srv.join().unwrap();
+    let got = captured.lock().unwrap().clone();
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&secret_file);
+
+    // The child sent no Authorization header; the proxy injected the credential
+    // by value while the child only ever knew its name.
+    assert_eq!(
+        got.as_deref(), Some("Bearer sk-phase1-secret"),
+        "upstream must receive the injected credential (got {got:?})"
+    );
+}
+
+/// Deny-path invariant: a request that matches an inject rule but is denied by
+/// the ACL must be blocked (403) and the credential must never be rendered — the
+/// upstream sees no connection at all. Proves injection sits strictly after the
+/// ACL check.
+#[tokio::test]
+async fn test_denied_request_does_not_inject_credential() {
+    let out = temp_file("cred-deny");
+    let secret_file = temp_file("cred-deny-secret");
+    std::fs::write(&secret_file, "sk-must-not-leak\n").unwrap();
+    let (port, _srv, captured) = spawn_capturing_http_server();
+
+    // ACL allows only /allowed; the inject rule matches every path. A GET to
+    // /secret is denied by the ACL, so injection must not run.
+    let policy = base_policy()
+        .http_allow("GET 127.0.0.1/allowed")
+        .http_port(port)
+        .credential("api", &format!("file:{}", secret_file.display()))
+        .http_inject("GET 127.0.0.1/* bearer api")
+        .build()
+        .unwrap();
+
+    let script = http_script(&format!("http://127.0.0.1:{}/secret", port), &out);
+    let result = policy.with_name("test").run_interactive(&["python3", "-c", &script])
+        .await.unwrap();
+    assert!(result.success(), "exit={:?}", result.code());
+
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    // Give the (never-reached) upstream a moment; it must not have been contacted.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let got = captured.lock().unwrap().clone();
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&secret_file);
+
+    assert!(content.starts_with("HTTP:403"), "denied request should be 403, got: {}", content);
+    assert_eq!(got, None, "credential must not reach the upstream on a denied request");
+}
+
+/// An `env:`-sourced credential must be scrubbed from the child's environment,
+/// otherwise the agent could read the real secret straight out of its own env
+/// instead of relying on proxy-side injection. The child does no network here —
+/// it just reports whether it can still see the variable.
+#[tokio::test]
+async fn test_env_sourced_credential_stripped_from_child() {
+    std::env::set_var("SANDLOCK_TEST_SECRET_ENV", "sk-env-secret");
+    let out = temp_file("cred-envstrip");
+    let (port, _srv) = spawn_http_server(0); // just to obtain a valid intercept port
+    let policy = base_policy()
+        .http_allow("GET 127.0.0.1/*")
+        .http_port(port)
+        .credential("api", "env:SANDLOCK_TEST_SECRET_ENV")
+        .http_inject("GET 127.0.0.1/* bearer api")
+        .build()
+        .unwrap();
+
+    let script = format!(
+        "import os; open('{}', 'w').write(os.environ.get('SANDLOCK_TEST_SECRET_ENV', 'ABSENT'))",
+        out.display()
+    );
+    let result = policy.with_name("test").run_interactive(&["python3", "-c", &script])
+        .await.unwrap();
+    assert!(result.success(), "exit={:?}", result.code());
+
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    std::env::remove_var("SANDLOCK_TEST_SECRET_ENV");
+    assert_eq!(
+        content, "ABSENT",
+        "env-sourced credential must be stripped from the child's environment, got {content:?}"
+    );
+}
+
+// NOTE (RFC #66 follow-up): injection over the HTTPS/MITM path is not covered
+// here — this suite has no TLS upstream or ephemeral-CA harness. The rendering
+// code is scheme-agnostic (service.rs runs the same `apply` after the ACL on the
+// "https" path), and the plaintext tests above exercise it; a TLS end-to-end
+// test needs a CA-trust harness and is tracked as a separate follow-up.
