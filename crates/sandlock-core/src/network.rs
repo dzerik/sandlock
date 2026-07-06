@@ -1000,21 +1000,25 @@ fn sendto_named_unix_on_behalf(
         Ok(fd) => fd,
         Err(e) => return NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EBADF)),
     };
-    let ret = unsafe {
-        libc::sendto(
-            dup_fd.as_raw_fd(),
-            data.as_ptr() as *const libc::c_void,
-            data.len(),
-            flags,
-            &sun as *const libc::sockaddr_un as *const libc::sockaddr,
-            len,
-        )
-    };
-    if ret >= 0 {
-        NotifAction::ReturnValue(ret as i64)
-    } else {
-        NotifAction::Errno(unsafe { *libc::__errno_location() })
+    // Route through resolve_send like the sendmsg path instead of an inline
+    // blocking sendto: the dup shares the child's blocking mode, so an inline
+    // send on the notification loop wedges the whole loop when a child fills a
+    // datagram queue it never drains — the same DoS this change fixes elsewhere.
+    // The first attempt is non-blocking on the loop; a blocking child's would-
+    // block is completed off-loop.
+    let addr = unsafe {
+        std::slice::from_raw_parts(&sun as *const libc::sockaddr_un as *const u8, len as usize)
     }
+    .to_vec();
+    let m = MaterializedMsg {
+        data,
+        control: None,
+        addr,
+        _scm_fds: Vec::new(),
+        _pinned: Some(pinned),
+    };
+    let blocking = wants_blocking(dup_fd.as_raw_fd(), flags);
+    resolve_send(dup_fd, m, flags, blocking)
 }
 
 /// True if `real` (an already-canonical path) is at or under any of `prefixes`,
@@ -1694,13 +1698,20 @@ async fn defer_send(dup_fd: OwnedFd, m: MaterializedMsg, flags: i32, offset: usi
 /// Deferred tail shared by the three `sendmmsg` batch loops. Completes entry
 /// `prior_count` (which either would-block entirely, offset 0, or partially sent
 /// a stream, offset > 0) off the loop, then reports the *message* count — not a
-/// byte count — as `sendmmsg` requires: `prior_count + 1` once the entry is
-/// fully delivered (writing its full `msg_len` back so a blocking caller that
-/// ignores per-entry `msg_len` isn't silently truncated). On error it reports
-/// `prior_count` (the entries already fully sent), or the errno only when
-/// nothing at all has been sent (`prior_count == 0` and this entry made no
-/// progress). Entries beyond this one are left for the child to retry, so the
-/// batch is never materialized whole.
+/// byte count — as `sendmmsg` requires.
+///
+/// Aligns with the kernel's blocking-stream semantics: a `sendmsg` that makes
+/// any progress returns that byte count and is a completed message; a hard error
+/// after partial progress surfaces on the child's *next* call. So for any
+/// `Ok(n)` (n is the full length on success, or the bytes queued before a hard
+/// error) we write `n` back as this entry's `msg_len` and count it as
+/// `prior_count + 1`. This never returns 0 for `vlen > 0`, and — crucially —
+/// never leaves an already-queued entry uncounted, which would make the child
+/// re-send bytes the kernel already accepted (duplicate data) or spin forever on
+/// a zero-progress retry. `Err(e)` (nothing sent at all) reports the errno only
+/// when nothing has been sent yet (`prior_count == 0`), else the prior count.
+/// Entries beyond this one are left for the child to retry, so the batch is
+/// never materialized whole.
 fn complete_batch_entry(
     dup_fd: OwnedFd,
     m: MaterializedMsg,
@@ -1712,17 +1723,13 @@ fn complete_batch_entry(
     msglen_addr: u64,
     prior_count: usize,
 ) -> NotifAction {
-    let m_len = m.data.len();
     NotifAction::defer(async move {
         match push_until_done(dup_fd, m, flags, offset).await {
-            Ok(n) if n == m_len => {
-                let bytes = (m_len as u32).to_ne_bytes();
+            Ok(n) => {
+                let bytes = (n as u32).to_ne_bytes();
                 let _ = write_child_mem(notif_fd, notif_id, notif_pid, msglen_addr, &bytes);
                 NotifAction::ReturnValue((prior_count + 1) as i64)
             }
-            // Partial stream then hard error: entry not fully delivered, so it is
-            // not counted; the child retries it (and the rest).
-            Ok(_) => NotifAction::ReturnValue(prior_count as i64),
             Err(e) => {
                 if prior_count == 0 {
                     NotifAction::Errno(e)
