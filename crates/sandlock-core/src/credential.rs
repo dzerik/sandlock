@@ -263,10 +263,10 @@ impl InjectRule {
         let uri = &parts.uri;
         let path = uri.path();
         let existing = uri.query();
+        let prefix = format!("{}=", urlencode_bytes(param.as_bytes()));
         // Honor AddOnly: don't append a param the request already carries.
         if self.on_existing == OnExistingHeader::AddOnly {
             if let Some(q) = existing {
-                let prefix = format!("{}=", urlencode_bytes(param.as_bytes()));
                 if q.split('&').any(|kv| kv.starts_with(&prefix)) {
                     return Ok(());
                 }
@@ -274,13 +274,20 @@ impl InjectRule {
         }
         // Percent-encode the raw secret bytes (never lossy-stringify — a binary
         // key would be corrupted).
-        let pair = format!(
-            "{}={}",
-            urlencode_bytes(param.as_bytes()),
-            urlencode_bytes(self.secret.expose())
-        );
-        let new_pq = match existing {
-            Some(q) if !q.is_empty() => format!("{path}?{q}&{pair}"),
+        let pair = format!("{}{}", prefix, urlencode_bytes(self.secret.expose()));
+        // Drop any existing occurrence of this param before appending, so
+        // `Replace` actually replaces instead of appending a duplicate (most
+        // frameworks read the first occurrence, so a duplicate would leave the
+        // child's placeholder winning). For `AddOnly` this only runs when the
+        // param is absent, so the filter is a no-op there.
+        let kept: Option<String> = existing.map(|q| {
+            q.split('&')
+                .filter(|kv| !kv.is_empty() && !kv.starts_with(&prefix))
+                .collect::<Vec<_>>()
+                .join("&")
+        });
+        let new_pq = match kept {
+            Some(ref k) if !k.is_empty() => format!("{path}?{k}&{pair}"),
             _ => format!("{path}?{pair}"),
         };
         let mut b = hyper::http::uri::Builder::new();
@@ -297,7 +304,6 @@ impl InjectRule {
 
 /// Parse an `AuthShape` from the auth token of an `--http-inject` rule:
 /// `bearer` | `basic:<user>` | `header:<name>` | `apikey:<name>` | `query:<param>`.
-/// Returns `(shape, credential_name)`.
 pub fn parse_auth(spec: &str, credential: &str) -> Result<AuthShape, SandboxError> {
     let (kind, arg) = match spec.split_once(':') {
         Some((k, a)) => (k, Some(a)),
@@ -305,6 +311,14 @@ pub fn parse_auth(spec: &str, credential: &str) -> Result<AuthShape, SandboxErro
     };
     let shape = match (kind, arg) {
         ("bearer", None) => AuthShape::Bearer,
+        // RFC 7617 forbids ':' in the user-id: it would shift the `user:pass`
+        // boundary in the base64 payload (upstream would parse part of the secret
+        // as the password), so reject it rather than silently mis-encode.
+        ("basic", Some(user)) if user.contains(':') => {
+            return Err(SandboxError::Invalid(format!(
+                "basic auth user-id must not contain ':' (RFC 7617), got {user:?}"
+            )))
+        }
         ("basic", Some(user)) if !user.is_empty() => AuthShape::Basic { username: user.to_string() },
         // `apikey:<header>` and `header:<name>` are the same rendering.
         ("header" | "apikey", Some(name)) if !name.is_empty() => AuthShape::Header { name: name.to_string() },
@@ -550,6 +564,10 @@ mod tests {
         assert_eq!(parse_auth("query:token", "c").unwrap(), AuthShape::Query { param: "token".into() });
         assert!(parse_auth("basic:", "c").is_err());
         assert!(parse_auth("bogus", "c").is_err());
+        // RFC 7617: ':' in the user-id is rejected (would shift the user:pass
+        // boundary and leak part of the secret into the password field).
+        assert!(parse_auth("basic:a:b", "c").is_err());
+        assert!(matches!(parse_auth("basic:alice", "c"), Ok(AuthShape::Basic { username }) if username == "alice"));
     }
 
     #[test]
@@ -564,15 +582,31 @@ mod tests {
     }
 
     #[test]
-    fn query_add_only_does_not_duplicate() {
+    fn query_add_only_keeps_child_replace_overwrites() {
+        // AddOnly: a param the child already carries is left untouched.
         let mut p = parts_of("https://api.example.com/x?key=child", &[]);
         rule(AuthShape::Query { param: "key".into() }, "sk-real", OnExistingHeader::AddOnly)
             .apply(&mut p).unwrap();
-        assert_eq!(p.uri.query().unwrap(), "key=child"); // untouched
+        assert_eq!(p.uri.query().unwrap(), "key=child");
+
+        // Replace must *replace*, not append a duplicate — otherwise a framework
+        // reading the first occurrence authenticates against the child's value.
         let mut p2 = parts_of("https://api.example.com/x?key=child", &[]);
         rule(AuthShape::Query { param: "key".into() }, "sk-real", OnExistingHeader::Replace)
             .apply(&mut p2).unwrap();
-        assert_eq!(p2.uri.query().unwrap(), "key=child&key=sk-real");
+        assert_eq!(p2.uri.query().unwrap(), "key=sk-real");
+
+        // Replace preserves other params and drops only the target's duplicates.
+        let mut p3 = parts_of("https://api.example.com/x?a=1&key=old&b=2", &[]);
+        rule(AuthShape::Query { param: "key".into() }, "sk-real", OnExistingHeader::Replace)
+            .apply(&mut p3).unwrap();
+        assert_eq!(p3.uri.query().unwrap(), "a=1&b=2&key=sk-real");
+
+        // Replace on a request without the param just appends it.
+        let mut p4 = parts_of("https://api.example.com/x", &[]);
+        rule(AuthShape::Query { param: "key".into() }, "sk-real", OnExistingHeader::Replace)
+            .apply(&mut p4).unwrap();
+        assert_eq!(p4.uri.query().unwrap(), "key=sk-real");
     }
 
     #[test]
