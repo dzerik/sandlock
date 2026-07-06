@@ -14,18 +14,16 @@ use serde::{Deserialize, Serialize};
 use crate::error::SandboxError;
 use crate::seccomp::ctx::SupervisorCtx;
 use crate::seccomp::notif::{read_child_mem, write_child_mem, NotifAction};
-use crate::sys::structs::{SeccompNotif, AF_INET, AF_INET6, ECONNREFUSED};
+use crate::sys::structs::{SeccompNotif, ECONNREFUSED};
 
-/// Maximum buffer size for sendto/sendmsg on-behalf operations (64 MiB).
-/// Prevents a sandboxed process from triggering OOM in the supervisor.
-const MAX_SEND_BUF: usize = 64 << 20;
+mod child_abi;
+mod send_engine;
 
-/// Maximum ancillary (control) buffer we copy for an on-behalf `sendmsg`.
-/// A control buffer larger than this fails closed with `EMSGSIZE` rather than
-/// being silently truncated into a partial cmsg chain (`SCM_MAX_FD` is 253 fds
-/// ≈ 1 KiB, so 16 KiB is far above any legitimate use while bounding supervisor
-/// memory per trapped send).
-const MAX_CONTROL_BUF: usize = 16 << 10;
+use child_abi::{
+    flatten_iovecs, materialize_control, named_unix_socket_path, parse_ip_from_sockaddr,
+    parse_port_from_sockaddr, set_port_in_sockaddr, MaterializedMsg, MAX_SEND_BUF,
+};
+use send_engine::{complete_batch_entry, resolve_send, send_materialized_at, wants_blocking};
 
 /// An IPv4 or IPv6 address with a prefix length, used by `--net-deny`
 /// to match destination IPs by exact address (`/32`, `/128`) or by range.
@@ -372,65 +370,6 @@ impl Protocol {
 }
 
 // ============================================================
-// parse_ip_from_sockaddr — parse IP from a sockaddr byte buffer
-// ============================================================
-
-/// Parse IP address from a sockaddr byte buffer.
-/// Returns None for non-IP families (AF_UNIX etc.) — always allowed.
-fn parse_ip_from_sockaddr(bytes: &[u8]) -> Option<IpAddr> {
-    if bytes.len() < 2 {
-        return None;
-    }
-    let family = u16::from_ne_bytes([bytes[0], bytes[1]]) as u32;
-    match family {
-        f if f == AF_INET => {
-            if bytes.len() < 8 {
-                return None;
-            }
-            Some(IpAddr::V4(Ipv4Addr::new(
-                bytes[4], bytes[5], bytes[6], bytes[7],
-            )))
-        }
-        f if f == AF_INET6 => {
-            if bytes.len() < 24 {
-                return None;
-            }
-            let mut addr_bytes = [0u8; 16];
-            addr_bytes.copy_from_slice(&bytes[8..24]);
-            Some(IpAddr::V6(Ipv6Addr::from(addr_bytes)))
-        }
-        _ => None,
-    }
-}
-
-// ============================================================
-// parse_port_from_sockaddr — parse TCP port from sockaddr bytes
-// ============================================================
-
-/// Parse TCP port from a sockaddr byte buffer.
-/// Returns None for non-IP families (AF_UNIX etc.).
-fn parse_port_from_sockaddr(bytes: &[u8]) -> Option<u16> {
-    if bytes.len() < 4 {
-        return None;
-    }
-    let family = u16::from_ne_bytes([bytes[0], bytes[1]]) as u32;
-    match family {
-        f if f == AF_INET || f == AF_INET6 => {
-            Some(u16::from_be_bytes([bytes[2], bytes[3]]))
-        }
-        _ => None,
-    }
-}
-
-fn set_port_in_sockaddr(bytes: &mut [u8], port: u16) {
-    if bytes.len() >= 4 {
-        let port_bytes = port.to_be_bytes();
-        bytes[2] = port_bytes[0];
-        bytes[3] = port_bytes[1];
-    }
-}
-
-// ============================================================
 // query_socket_protocol — derive the rule Protocol from a fd via getsockopt
 // ============================================================
 
@@ -466,71 +405,6 @@ pub(crate) fn query_socket_protocol(fd: RawFd) -> Option<Protocol> {
     }
 }
 
-/// Rewrite the `SCM_RIGHTS` file descriptors in a copied control buffer from
-/// the child's fd numbers to supervisor fd numbers, rejecting identity cmsgs.
-///
-/// On-behalf sends run in the supervisor, so a control buffer copied verbatim
-/// from the child carries fd numbers that are meaningless (or, worse, alias
-/// unrelated files) in the supervisor. For every `SOL_SOCKET`/`SCM_RIGHTS`
-/// message we `pidfd_getfd` each child fd into the supervisor and patch its
-/// number in place. The returned `OwnedFd`s must stay alive until after
-/// `sendmsg` (the kernel installs its own copies into the socket buffer during
-/// the send), then drop to close the supervisor's copies.
-///
-/// `SCM_CREDENTIALS` is rejected with `EPERM`: on the on-behalf path the
-/// *supervisor* is the syscall's sender, so forwarding the child's crafted
-/// `pid/uid/gid` would either fail `EPERM` anyway (an unprivileged supervisor
-/// can't assert them) or, for a privileged supervisor, let the child forge
-/// credentials it could never send itself. Failing closed is the safe choice.
-///
-/// Errors: `EBADF` if a child fd can't be fetched (matching the kernel's own
-/// error for a bad fd), `EPERM` for a credential cmsg, `EINVAL` for a malformed
-/// cmsg header (too short or extending past the buffer) — all fail closed, none
-/// sends a partial or forged control chain.
-fn translate_scm_rights(child_pid: u32, control: &[u8]) -> Result<(Vec<u8>, Vec<OwnedFd>), i32> {
-    // sizeof(struct cmsghdr) on LP64: cmsg_len(8) + cmsg_level(4) + cmsg_type(4).
-    // CMSG_ALIGN(16) == 16, so cmsg data begins right after the header.
-    const CMSG_HDR: usize = 16;
-    const FD: usize = std::mem::size_of::<i32>();
-    let mut out = control.to_vec();
-    let mut held: Vec<OwnedFd> = Vec::new();
-    let mut off = 0usize;
-    while off + CMSG_HDR <= out.len() {
-        let cmsg_len = usize::from_ne_bytes(out[off..off + 8].try_into().unwrap());
-        let level = i32::from_ne_bytes(out[off + 8..off + 12].try_into().unwrap());
-        let ctype = i32::from_ne_bytes(out[off + 12..off + 16].try_into().unwrap());
-        // `cmsg_len` is child-controlled. Compare against the *remaining* space
-        // (never `off + cmsg_len`, which could overflow `usize`). A header that
-        // is too short or claims to run past the buffer is malformed — fail
-        // closed, as the kernel would `EINVAL` it. `off <= out.len() - CMSG_HDR`
-        // holds from the loop guard, so `out.len() - off` cannot underflow.
-        if cmsg_len < CMSG_HDR || cmsg_len > out.len() - off {
-            return Err(libc::EINVAL);
-        }
-        if level == libc::SOL_SOCKET {
-            if ctype == libc::SCM_RIGHTS {
-                let data_off = off + CMSG_HDR;
-                let nfds = (cmsg_len - CMSG_HDR) / FD;
-                for i in 0..nfds {
-                    let p = data_off + i * FD;
-                    let child_fd = i32::from_ne_bytes(out[p..p + FD].try_into().unwrap());
-                    let sup_fd = crate::seccomp::notif::dup_fd_from_pid(child_pid, child_fd)
-                        .map_err(|e| e.raw_os_error().unwrap_or(libc::EBADF))?;
-                    out[p..p + FD].copy_from_slice(&sup_fd.as_raw_fd().to_ne_bytes());
-                    held.push(sup_fd);
-                }
-            } else if ctype == libc::SCM_CREDENTIALS {
-                return Err(libc::EPERM);
-            }
-        }
-        // Advance to CMSG_ALIGN(cmsg_len). `cmsg_len <= out.len() - off` bounds
-        // the aligned add well under `usize::MAX`; each step is >= CMSG_HDR so
-        // the loop always makes progress.
-        off += (cmsg_len + 7) & !7;
-    }
-    Ok((out, held))
-}
-
 /// True iff `fd` is an `AF_UNIX` socket, probed via `SO_DOMAIN`. `SCM_RIGHTS`
 /// and `SCM_CREDENTIALS` are unix-only, so control rewriting/gating is applied
 /// only to unix sockets — an IP socket's control (e.g. `IP_PKTINFO`) carries no
@@ -548,40 +422,6 @@ fn socket_is_unix(fd: RawFd) -> bool {
         )
     };
     rc == 0 && domain == libc::AF_UNIX
-}
-
-/// Copy (and, for a unix socket, translate) the control buffer of an on-behalf
-/// send. Shared by `send_msghdr_on_behalf` and `send_named_unix_msghdr`.
-///
-/// Returns `(control_bytes, held_fds)` — the fds keep the translated
-/// `SCM_RIGHTS` files open across the send. Fails closed: oversized control →
-/// `EMSGSIZE`; unreadable control → `EIO` (never a silent send that drops the
-/// caller's cmsgs). For a unix socket, `SCM_RIGHTS` fds are translated and
-/// `SCM_CREDENTIALS` is rejected; a non-unix socket's control passes through
-/// verbatim.
-fn materialize_control(
-    notif: &SeccompNotif,
-    notif_fd: RawFd,
-    msg_control_ptr: u64,
-    msg_controllen: u64,
-    is_unix: bool,
-) -> Result<(Option<Vec<u8>>, Vec<OwnedFd>), i32> {
-    if msg_control_ptr == 0 || msg_controllen == 0 {
-        return Ok((None, Vec::new()));
-    }
-    // Fail closed on an oversized control buffer instead of silently truncating
-    // (which could drop SCM_RIGHTS fds or send a malformed tail).
-    if msg_controllen as usize > MAX_CONTROL_BUF {
-        return Err(libc::EMSGSIZE);
-    }
-    let raw = read_child_mem(notif_fd, notif.id, notif.pid, msg_control_ptr, msg_controllen as usize)
-        .map_err(|_| libc::EIO)?;
-    if is_unix {
-        let (buf, fds) = translate_scm_rights(notif.pid, &raw)?;
-        Ok((Some(buf), fds))
-    } else {
-        Ok((Some(raw), Vec::new()))
-    }
 }
 
 // ============================================================
@@ -1258,32 +1098,6 @@ fn sendmmsg_named_unix_on_behalf(
     }
 }
 
-/// Extract the filesystem path of a NAMED `AF_UNIX` connect target from a raw
-/// `sockaddr`. Returns `None` for abstract sockets (`sun_path[0] == 0`),
-/// unnamed sockets, or any non-`AF_UNIX` family (none of which the fs gate
-/// applies to).
-fn named_unix_socket_path(addr_bytes: &[u8]) -> Option<std::path::PathBuf> {
-    // sockaddr_un layout: u16 sun_family, then sun_path. Need the family plus
-    // at least one path byte.
-    if addr_bytes.len() < 3 {
-        return None;
-    }
-    let family = u16::from_ne_bytes([addr_bytes[0], addr_bytes[1]]);
-    if family != libc::AF_UNIX as u16 {
-        return None;
-    }
-    let sun_path = &addr_bytes[2..];
-    if sun_path[0] == 0 {
-        return None; // abstract namespace (Landlock scope handles it)
-    }
-    let end = sun_path.iter().position(|&b| b == 0).unwrap_or(sun_path.len());
-    let raw = &sun_path[..end];
-    if raw.is_empty() {
-        return None;
-    }
-    std::str::from_utf8(raw).ok().map(std::path::PathBuf::from)
-}
-
 /// True if `path`, lexically normalized (`.`/`..` resolved without touching the
 /// filesystem), is at or under any of the granted `prefixes`. Mirrors the
 /// prefix matching the chroot fs enforcement uses.
@@ -1532,213 +1346,6 @@ fn prescan_msghdr(
         return PrescanResult::ContinueWholeCall;
     }
     PrescanResult::OnBehalf
-}
-
-/// A fully-materialized on-behalf send. Owns the (flattened) iovec payload, the
-/// translated control buffer (with its `SCM_RIGHTS` fds and any named-unix inode
-/// pin kept alive), and the destination sockaddr (empty = connected). Owning
-/// everything lets the send be retried — from a byte offset, on a deferred
-/// worker — without borrowing supervisor state, so a blocked send can leave the
-/// sequential notification loop while still delivering the whole message.
-struct MaterializedMsg {
-    data: Vec<u8>,
-    control: Option<Vec<u8>>,
-    addr: Vec<u8>,
-    _scm_fds: Vec<OwnedFd>,
-    _pinned: Option<OwnedFd>,
-}
-
-/// True iff this send should block until it completes: the socket is in blocking
-/// mode (`O_NONBLOCK` clear — the dup shares the child's file description, so it
-/// reflects the child's own mode) *and* the per-call `send_flags` did not request
-/// non-blocking with `MSG_DONTWAIT`. A child that passes `MSG_DONTWAIT` on a
-/// blocking socket wants the immediate short-count/`EAGAIN`, not a deferred
-/// block-to-completion, so it must not be deferred.
-fn wants_blocking(fd: RawFd, send_flags: i32) -> bool {
-    if send_flags & libc::MSG_DONTWAIT != 0 {
-        return false;
-    }
-    let fl = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    fl >= 0 && (fl & libc::O_NONBLOCK) == 0
-}
-
-/// One `sendmsg` of `m` starting at byte `offset`. The destination address and
-/// control ancillary are attached only at `offset == 0`: `SCM_RIGHTS` transmits
-/// exactly once, and a stream continuation carries no new address. Returns the
-/// kernel result (>= 0 bytes, or -1 with errno in `*__errno_location`).
-fn send_materialized_at(fd: RawFd, m: &MaterializedMsg, offset: usize, flags: i32) -> isize {
-    let iov = libc::iovec {
-        iov_base: unsafe { m.data.as_ptr().add(offset) } as *mut libc::c_void,
-        iov_len: m.data.len() - offset,
-    };
-    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    if offset == 0 {
-        if !m.addr.is_empty() {
-            msg.msg_name = m.addr.as_ptr() as *mut libc::c_void;
-            msg.msg_namelen = m.addr.len() as u32;
-        }
-        if let Some(ref c) = m.control {
-            msg.msg_control = c.as_ptr() as *mut libc::c_void;
-            msg.msg_controllen = c.len();
-        }
-    }
-    msg.msg_iov = &iov as *const libc::iovec as *mut libc::iovec;
-    msg.msg_iovlen = 1;
-    unsafe { libc::sendmsg(fd, &msg, flags) }
-}
-
-/// Read a child's iovec array (`iov_bytes` = the raw `struct iovec[]`) and
-/// concatenate the referenced buffers into one owned payload, capped at
-/// `MAX_SEND_BUF` total so a hostile child can't OOM the supervisor. A null
-/// base or zero length contributes nothing (matching the prior per-iovec copy).
-fn flatten_iovecs(
-    notif: &SeccompNotif,
-    notif_fd: RawFd,
-    iov_bytes: &[u8],
-    iovlen: usize,
-) -> Result<Vec<u8>, i32> {
-    let mut data: Vec<u8> = Vec::new();
-    for i in 0..iovlen {
-        let off = i * 16;
-        if off + 16 > iov_bytes.len() {
-            break;
-        }
-        let base = u64::from_ne_bytes(iov_bytes[off..off + 8].try_into().unwrap());
-        let len = u64::from_ne_bytes(iov_bytes[off + 8..off + 16].try_into().unwrap()) as usize;
-        if base == 0 || len == 0 {
-            continue;
-        }
-        if len > MAX_SEND_BUF || data.len().saturating_add(len) > MAX_SEND_BUF {
-            return Err(libc::EMSGSIZE);
-        }
-        data.extend_from_slice(
-            &read_child_mem(notif_fd, notif.id, notif.pid, base, len).map_err(|_| libc::EIO)?,
-        );
-    }
-    Ok(data)
-}
-
-/// Resolve a materialized send to a terminal action. The first attempt is
-/// non-blocking (`MSG_DONTWAIT`) on the seccomp loop, so it never blocks there.
-/// A non-blocking child gets whatever that one attempt returns (short count or
-/// `EAGAIN`), exactly as the kernel would give it. A blocking child whose whole
-/// message didn't fit is completed off the loop (`defer_send`), preserving the
-/// kernel's "a blocking send of N returns N" contract without occupying the
-/// loop or a worker thread — a stream send that partially fit continues from
-/// the sent offset; a full send buffer defers from offset 0.
-fn resolve_send(dup_fd: OwnedFd, m: MaterializedMsg, flags: i32, child_blocking: bool) -> NotifAction {
-    let ret = send_materialized_at(dup_fd.as_raw_fd(), &m, 0, flags | libc::MSG_DONTWAIT);
-    if ret >= 0 {
-        let sent = ret as usize;
-        if !child_blocking || sent >= m.data.len() {
-            return NotifAction::ReturnValue(ret as i64);
-        }
-        // Blocking stream socket, partial fit: finish the remainder off the loop.
-        return NotifAction::defer(defer_send(dup_fd, m, flags, sent));
-    }
-    let err = unsafe { *libc::__errno_location() };
-    if err == libc::EAGAIN || err == libc::EWOULDBLOCK {
-        if child_blocking {
-            return NotifAction::defer(defer_send(dup_fd, m, flags, 0));
-        }
-        return NotifAction::Errno(libc::EAGAIN);
-    }
-    NotifAction::Errno(err)
-}
-
-/// Byte-level completion core: await writability on the dup'd fd through the
-/// Tokio IO driver's epoll (never blocking a worker thread) and push the rest of
-/// the message, advancing `offset` past each partial send, until the whole
-/// message is delivered or a real error occurs. Bounded by the supervisor's
-/// deferred-work timeout, so a peer that never drains can wedge only this one
-/// send for that bound — never the notification loop.
-///
-/// `Ok(n)` is the total bytes sent: the full length on success, or the bytes
-/// queued before a hard error interrupted a partially-sent stream. `Err(e)` is
-/// returned only when nothing at all was sent. Shared by the single-message
-/// deferral ([`defer_send`]) and the batch tail ([`complete_batch_entry`]).
-async fn push_until_done(
-    dup_fd: OwnedFd,
-    m: MaterializedMsg,
-    flags: i32,
-    mut offset: usize,
-) -> Result<usize, i32> {
-    let afd = tokio::io::unix::AsyncFd::with_interest(dup_fd, tokio::io::Interest::WRITABLE)
-        .map_err(|_| libc::EIO)?;
-    loop {
-        let mut guard = afd.writable().await.map_err(|_| libc::EIO)?;
-        let ret = send_materialized_at(afd.get_ref().as_raw_fd(), &m, offset, flags | libc::MSG_DONTWAIT);
-        if ret >= 0 {
-            offset += ret as usize;
-            if offset >= m.data.len() {
-                return Ok(m.data.len());
-            }
-            // More to send; the next writability edge (or an EAGAIN below) gates it.
-            continue;
-        }
-        let err = unsafe { *libc::__errno_location() };
-        if err == libc::EAGAIN || err == libc::EWOULDBLOCK {
-            guard.clear_ready();
-            continue;
-        }
-        return if offset > 0 { Ok(offset) } else { Err(err) };
-    }
-}
-
-/// Deferred tail of [`resolve_send`] for a single message: complete the send and
-/// return the byte count (matching a blocking send of N returning N; a partial
-/// stream then error returns the partial count).
-async fn defer_send(dup_fd: OwnedFd, m: MaterializedMsg, flags: i32, offset: usize) -> NotifAction {
-    match push_until_done(dup_fd, m, flags, offset).await {
-        Ok(n) => NotifAction::ReturnValue(n as i64),
-        Err(e) => NotifAction::Errno(e),
-    }
-}
-
-/// Deferred tail shared by the three `sendmmsg` batch loops. Completes entry
-/// `prior_count` (which either would-block entirely, offset 0, or partially sent
-/// a stream, offset > 0) off the loop, then reports the *message* count — not a
-/// byte count — as `sendmmsg` requires.
-///
-/// Aligns with the kernel's blocking-stream semantics: a `sendmsg` that makes
-/// any progress returns that byte count and is a completed message; a hard error
-/// after partial progress surfaces on the child's *next* call. So for any
-/// `Ok(n)` (n is the full length on success, or the bytes queued before a hard
-/// error) we write `n` back as this entry's `msg_len` and count it as
-/// `prior_count + 1`. This never returns 0 for `vlen > 0`, and — crucially —
-/// never leaves an already-queued entry uncounted, which would make the child
-/// re-send bytes the kernel already accepted (duplicate data) or spin forever on
-/// a zero-progress retry. `Err(e)` (nothing sent at all) reports the errno only
-/// when nothing has been sent yet (`prior_count == 0`), else the prior count.
-/// Entries beyond this one are left for the child to retry, so the batch is
-/// never materialized whole.
-fn complete_batch_entry(
-    dup_fd: OwnedFd,
-    m: MaterializedMsg,
-    flags: i32,
-    offset: usize,
-    notif_fd: RawFd,
-    notif_id: u64,
-    notif_pid: u32,
-    msglen_addr: u64,
-    prior_count: usize,
-) -> NotifAction {
-    NotifAction::defer(async move {
-        match push_until_done(dup_fd, m, flags, offset).await {
-            Ok(n) => {
-                let bytes = (n as u32).to_ne_bytes();
-                let _ = write_child_mem(notif_fd, notif_id, notif_pid, msglen_addr, &bytes);
-                NotifAction::ReturnValue((prior_count + 1) as i64)
-            }
-            Err(e) => {
-                if prior_count == 0 {
-                    NotifAction::Errno(e)
-                } else {
-                    NotifAction::ReturnValue(prior_count as i64)
-                }
-            }
-        }
-    })
 }
 
 /// Validate, materialize, and send one `struct msghdr` on behalf of
@@ -2403,57 +2010,6 @@ pub fn compose_virtual_etc_hosts(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // --- translate_scm_rights tests (control-buffer parsing, child-controlled) ---
-
-    fn cmsg_hdr(cmsg_len: usize, level: i32, ctype: i32) -> Vec<u8> {
-        let mut b = vec![0u8; 16];
-        b[0..8].copy_from_slice(&cmsg_len.to_ne_bytes());
-        b[8..12].copy_from_slice(&level.to_ne_bytes());
-        b[12..16].copy_from_slice(&ctype.to_ne_bytes());
-        b
-    }
-
-    #[test]
-    fn scm_rights_rejects_overflowing_cmsg_len() {
-        // A child-crafted cmsg_len near usize::MAX must fail closed (EINVAL),
-        // never overflow-panic (debug) or wrap past the bounds check (release).
-        let buf = cmsg_hdr(usize::MAX - 7, libc::SOL_SOCKET, libc::SCM_RIGHTS);
-        assert_eq!(translate_scm_rights(0, &buf).map(drop), Err(libc::EINVAL));
-    }
-
-    #[test]
-    fn scm_rights_rejects_short_header() {
-        let buf = cmsg_hdr(8, libc::SOL_SOCKET, libc::SCM_RIGHTS); // < CMSG_HDR (16)
-        assert_eq!(translate_scm_rights(0, &buf).map(drop), Err(libc::EINVAL));
-    }
-
-    #[test]
-    fn scm_rights_rejects_cmsg_running_past_buffer() {
-        let buf = cmsg_hdr(17, libc::SOL_SOCKET, libc::SCM_RIGHTS); // claims 17, has 16
-        assert_eq!(translate_scm_rights(0, &buf).map(drop), Err(libc::EINVAL));
-    }
-
-    #[test]
-    fn scm_rights_rejects_credentials() {
-        // Identity ancillary data on the on-behalf path must fail closed, not be
-        // forwarded with the child's crafted pid/uid/gid.
-        let buf = cmsg_hdr(16, libc::SOL_SOCKET, libc::SCM_CREDENTIALS);
-        assert_eq!(translate_scm_rights(0, &buf).map(drop), Err(libc::EPERM));
-    }
-
-    #[test]
-    fn scm_rights_passes_through_empty_and_non_socket_cmsg() {
-        // Empty control → no-op. A non-SOL_SOCKET cmsg (e.g. an IP-level control)
-        // passes through byte-for-byte with no fetched fds.
-        let (out, fds) = translate_scm_rights(0, &[]).unwrap();
-        assert!(out.is_empty() && fds.is_empty());
-
-        let buf = cmsg_hdr(16, libc::IPPROTO_IP, 2 /* IP_TTL-ish */);
-        let (out, fds) = translate_scm_rights(0, &buf).unwrap();
-        assert_eq!(out, buf);
-        assert!(fds.is_empty());
-    }
 
     // --- NetAllow::parse tests ---
 
