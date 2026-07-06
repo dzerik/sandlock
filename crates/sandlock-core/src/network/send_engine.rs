@@ -29,7 +29,7 @@ pub(crate) fn wants_blocking(fd: RawFd, send_flags: i32) -> bool {
 /// control ancillary are attached only at `offset == 0`: `SCM_RIGHTS` transmits
 /// exactly once, and a stream continuation carries no new address. Returns the
 /// kernel result (>= 0 bytes, or -1 with errno in `*__errno_location`).
-pub(crate) fn send_materialized_at(fd: RawFd, m: &MaterializedMsg, offset: usize, flags: i32) -> isize {
+fn send_materialized_at(fd: RawFd, m: &MaterializedMsg, offset: usize, flags: i32) -> isize {
     let iov = libc::iovec {
         iov_base: unsafe { m.data.as_ptr().add(offset) } as *mut libc::c_void,
         iov_len: m.data.len() - offset,
@@ -144,7 +144,7 @@ async fn defer_send(dup_fd: OwnedFd, m: MaterializedMsg, flags: i32, offset: usi
 /// when nothing has been sent yet (`prior_count == 0`), else the prior count.
 /// Entries beyond this one are left for the child to retry, so the batch is
 /// never materialized whole.
-pub(crate) fn complete_batch_entry(
+fn complete_batch_entry(
     dup_fd: OwnedFd,
     m: MaterializedMsg,
     flags: i32,
@@ -171,4 +171,74 @@ pub(crate) fn complete_batch_entry(
             }
         }
     })
+}
+
+/// Outcome of one `sendmmsg` batch entry.
+pub(crate) enum BatchStep {
+    /// Entry completed inline; its `msg_len` was written back. Count it and
+    /// move to the next entry.
+    Sent,
+    /// Entry left the loop (entry 0 fully blocked, or a blocking stream entry
+    /// that partially sent); the whole syscall resolves to this action.
+    Done(NotifAction),
+    /// Batch stops at this entry; the errno to report when nothing was sent.
+    Stop(i32),
+}
+
+/// Execute phase for one batch entry, shared by the three `sendmmsg` loops:
+/// one `MSG_DONTWAIT` attempt on the notification loop, then the only two
+/// cases that may leave it (entry 0 fully blocked, or a blocking stream entry
+/// that partially sent) are completed off the loop via `complete_batch_entry`,
+/// so a caller ignoring per-entry `msg_len` is never silently truncated and a
+/// blocking child never sees a spurious `EAGAIN`. A would-block at a later
+/// entry, or at entry 0 of a non-blocking child, is a contract-legal
+/// `Stop(EAGAIN)`; a hard error is `Stop(err)`.
+///
+/// `dup_fd` is borrowed; the two deferred cases `try_clone` it (a `dup(2)` of
+/// the same file description, so semantics match handing over the original).
+pub(crate) fn batch_send_step(
+    dup_fd: &OwnedFd,
+    m: MaterializedMsg,
+    flags: i32,
+    notif_fd: RawFd,
+    notif_id: u64,
+    notif_pid: u32,
+    msglen_addr: u64,
+    prior_count: usize,
+) -> BatchStep {
+    let blocking = wants_blocking(dup_fd.as_raw_fd(), flags);
+    let ret = send_materialized_at(dup_fd.as_raw_fd(), &m, 0, flags | libc::MSG_DONTWAIT);
+    if ret >= 0 {
+        if blocking && (ret as usize) < m.data.len() {
+            // Partial stream on a blocking socket: finish this entry off the
+            // loop and report it as completed with its full byte count.
+            let dup = match dup_fd.try_clone() {
+                Ok(d) => d,
+                Err(_) => return BatchStep::Stop(libc::EIO),
+            };
+            return BatchStep::Done(complete_batch_entry(
+                dup, m, flags, ret as usize, notif_fd, notif_id, notif_pid, msglen_addr,
+                prior_count,
+            ));
+        }
+        let bytes = (ret as u32).to_ne_bytes();
+        let _ = write_child_mem(notif_fd, notif_id, notif_pid, msglen_addr, &bytes);
+        return BatchStep::Sent;
+    }
+    let err = unsafe { *libc::__errno_location() };
+    if err == libc::EAGAIN || err == libc::EWOULDBLOCK {
+        if prior_count == 0 && blocking {
+            // Entry 0 would block entirely: a blocking socket never returns
+            // EAGAIN, so complete it off the loop.
+            let dup = match dup_fd.try_clone() {
+                Ok(d) => d,
+                Err(_) => return BatchStep::Stop(libc::EIO),
+            };
+            return BatchStep::Done(complete_batch_entry(
+                dup, m, flags, 0, notif_fd, notif_id, notif_pid, msglen_addr, 0,
+            ));
+        }
+        return BatchStep::Stop(libc::EAGAIN);
+    }
+    BatchStep::Stop(err)
 }

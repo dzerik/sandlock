@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::SandboxError;
 use crate::seccomp::ctx::SupervisorCtx;
-use crate::seccomp::notif::{read_child_mem, write_child_mem, NotifAction};
+use crate::seccomp::notif::{read_child_mem, NotifAction};
 use crate::sys::structs::{SeccompNotif, ECONNREFUSED};
 
 mod child_abi;
@@ -25,7 +25,7 @@ use child_abi::{
     parse_ip_from_sockaddr, parse_port_from_sockaddr, set_port_in_sockaddr, ChildMsghdr,
     MaterializedMsg, MAX_SEND_BUF,
 };
-use send_engine::{complete_batch_entry, resolve_send, send_materialized_at, wants_blocking};
+use send_engine::{batch_send_step, resolve_send, wants_blocking, BatchStep};
 use verdict::{check_ip_destination, destination_verdict, path_under_any, real_path_under_any};
 
 /// An IPv4 or IPv6 address with a prefix length, used by `--net-deny`
@@ -997,45 +997,18 @@ fn sendmmsg_named_unix_on_behalf(
                 break;
             }
         };
-        // Non-blocking per entry so a batch never occupies the notification loop;
-        // the two cases that must leave the loop are deferred (see below).
-        let blocking = wants_blocking(dup_fd.as_raw_fd(), flags);
-        let ret = send_materialized_at(dup_fd.as_raw_fd(), &m, 0, flags | libc::MSG_DONTWAIT);
-        if ret >= 0 {
-            if blocking && (ret as usize) < m.data.len() {
-                // Partial stream on a blocking socket: complete this entry off the
-                // loop and report it, so a caller ignoring per-entry msg_len isn't
-                // silently truncated.
-                return complete_batch_entry(
-                    dup_fd, m, flags, ret as usize, notif_fd, notif.id, notif.pid,
-                    mmsg_msglen_addr(entry_ptr), sent,
-                );
-            }
-            let bytes = (ret as u32).to_ne_bytes();
-            let _ = write_child_mem(
-                notif_fd, notif.id, notif.pid, mmsg_msglen_addr(entry_ptr), &bytes,
-            );
-            sent += 1;
-        } else {
-            let err = unsafe { *libc::__errno_location() };
-            if err == libc::EAGAIN || err == libc::EWOULDBLOCK {
-                if sent == 0 && blocking {
-                    // Entry 0 would block entirely: a blocking socket never returns
-                    // EAGAIN, so complete it off the loop.
-                    return complete_batch_entry(
-                        dup_fd, m, flags, 0, notif_fd, notif.id, notif.pid,
-                        mmsg_msglen_addr(entry_ptr), 0,
-                    );
-                }
-                // i>0 with nothing sent is a contract-legal short count; a
-                // non-blocking child at entry 0 gets EAGAIN.
+        match batch_send_step(
+            &dup_fd, m, flags, notif_fd, notif.id, notif.pid,
+            mmsg_msglen_addr(entry_ptr), sent,
+        ) {
+            BatchStep::Sent => sent += 1,
+            BatchStep::Done(action) => return action,
+            BatchStep::Stop(errno) => {
                 if sent == 0 {
-                    first_errno = Some(libc::EAGAIN);
+                    first_errno = Some(errno);
                 }
                 break;
             }
-            first_errno = Some(err);
-            break;
         }
     }
     if sent > 0 {
@@ -1452,40 +1425,18 @@ async fn sendmmsg_on_behalf(
                     break;
                 }
             };
-            // A batch sends each entry non-blocking so it never occupies the loop;
-            // the two cases that must not (entry 0 fully blocked, or a partial
-            // stream entry) are completed off the loop instead of the child
-            // seeing a spurious EAGAIN or a silently-truncated msg_len.
-            let blocking = wants_blocking(dup_fd.as_raw_fd(), flags);
-            let ret = send_materialized_at(dup_fd.as_raw_fd(), &m, 0, flags | libc::MSG_DONTWAIT);
-            if ret >= 0 {
-                if blocking && (ret as usize) < m.data.len() {
-                    return complete_batch_entry(
-                        dup_fd, m, flags, ret as usize, notif_fd, notif.id, notif.pid,
-                        mmsg_msglen_addr(entry_ptr), sent,
-                    );
-                }
-                let bytes = (ret as u32).to_ne_bytes();
-                let _ = write_child_mem(
-                    notif_fd, notif.id, notif.pid, mmsg_msglen_addr(entry_ptr), &bytes,
-                );
-                sent += 1;
-            } else {
-                let err = unsafe { *libc::__errno_location() };
-                if err == libc::EAGAIN || err == libc::EWOULDBLOCK {
-                    if sent == 0 && blocking {
-                        return complete_batch_entry(
-                            dup_fd, m, flags, 0, notif_fd, notif.id, notif.pid,
-                            mmsg_msglen_addr(entry_ptr), 0,
-                        );
-                    }
+            match batch_send_step(
+                &dup_fd, m, flags, notif_fd, notif.id, notif.pid,
+                mmsg_msglen_addr(entry_ptr), sent,
+            ) {
+                BatchStep::Sent => sent += 1,
+                BatchStep::Done(action) => return action,
+                BatchStep::Stop(errno) => {
                     if sent == 0 {
-                        first_errno = Some(libc::EAGAIN);
+                        first_errno = Some(errno);
                     }
                     break;
                 }
-                first_errno = Some(err);
-                break;
             }
         }
         return if sent > 0 {
@@ -1532,38 +1483,18 @@ async fn sendmmsg_on_behalf(
                 break;
             }
         };
-        // Non-blocking per entry (see the destination-policy batch above); the
-        // entry-0-fully-blocked and partial-stream cases complete off the loop.
-        let blocking = wants_blocking(dup_fd.as_raw_fd(), flags);
-        let ret = send_materialized_at(dup_fd.as_raw_fd(), &m, 0, flags | libc::MSG_DONTWAIT);
-        if ret >= 0 {
-            if blocking && (ret as usize) < m.data.len() {
-                return complete_batch_entry(
-                    dup_fd, m, flags, ret as usize, notif_fd, notif.id, notif.pid,
-                    mmsg_msglen_addr(entry_ptr), sent,
-                );
-            }
-            let bytes = (ret as u32).to_ne_bytes();
-            let _ = write_child_mem(
-                notif_fd, notif.id, notif.pid, mmsg_msglen_addr(entry_ptr), &bytes,
-            );
-            sent += 1;
-        } else {
-            let err = unsafe { *libc::__errno_location() };
-            if err == libc::EAGAIN || err == libc::EWOULDBLOCK {
-                if sent == 0 && blocking {
-                    return complete_batch_entry(
-                        dup_fd, m, flags, 0, notif_fd, notif.id, notif.pid,
-                        mmsg_msglen_addr(entry_ptr), 0,
-                    );
-                }
+        match batch_send_step(
+            &dup_fd, m, flags, notif_fd, notif.id, notif.pid,
+            mmsg_msglen_addr(entry_ptr), sent,
+        ) {
+            BatchStep::Sent => sent += 1,
+            BatchStep::Done(action) => return action,
+            BatchStep::Stop(errno) => {
                 if sent == 0 {
-                    first_errno = Some(libc::EAGAIN);
+                    first_errno = Some(errno);
                 }
                 break;
             }
-            first_errno = Some(err);
-            break;
         }
     }
 
