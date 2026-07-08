@@ -196,6 +196,10 @@ pub(crate) enum BatchStep {
 ///
 /// `dup_fd` is borrowed; the two deferred cases `try_clone` it (a `dup(2)` of
 /// the same file description, so semantics match handing over the original).
+/// If the clone fails after a partial send, the entry is counted with its
+/// truthful partial `msg_len` (`Sent`) — bytes already committed to the stream
+/// must never be re-sent by a retry. A clone failure before anything was sent
+/// (entry 0 fully blocked) is a fail-closed `Stop(EIO)`.
 pub(crate) fn batch_send_step(
     dup_fd: &OwnedFd,
     m: MaterializedMsg,
@@ -214,7 +218,14 @@ pub(crate) fn batch_send_step(
             // loop and report it as completed with its full byte count.
             let dup = match dup_fd.try_clone() {
                 Ok(d) => d,
-                Err(_) => return BatchStep::Stop(libc::EIO),
+                Err(_) => {
+                    // Can't complete off-loop, but `ret` bytes are already
+                    // committed to the stream: report the partial count
+                    // truthfully so a retry never duplicates them.
+                    let bytes = (ret as u32).to_ne_bytes();
+                    let _ = write_child_mem(notif_fd, notif_id, notif_pid, msglen_addr, &bytes);
+                    return BatchStep::Sent;
+                }
             };
             return BatchStep::Done(complete_batch_entry(
                 dup, m, flags, ret as usize, notif_fd, notif_id, notif_pid, msglen_addr,
