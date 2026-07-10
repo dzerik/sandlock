@@ -75,8 +75,8 @@ pub struct SandboxBuilder {
     /// proxy, after the ACL check. The trailing token defaults to `replace` (the
     /// proxy overwrites the placeholder auth SDKs send); pass `add-only` to keep a
     /// value the child set.
-    #[cfg_attr(feature = "cli", arg(long = "http-inject", value_name = "RULE"))]
-    pub http_inject: Vec<String>,
+    #[cfg_attr(feature = "cli", arg(long = "http-auth", value_name = "RULE"))]
+    pub http_auth: Vec<String>,
 
     /// TCP ports to intercept for HTTP ACL (default: 80, plus 443 with --http-ca)
     #[cfg_attr(feature = "cli", arg(long = "http-port", value_name = "PORT"))]
@@ -249,7 +249,7 @@ impl Clone for SandboxBuilder {
             http_allow: self.http_allow.clone(),
             http_deny: self.http_deny.clone(),
             credentials: self.credentials.clone(),
-            http_inject: self.http_inject.clone(),
+            http_auth: self.http_auth.clone(),
             http_ports: self.http_ports.clone(),
             http_ca: self.http_ca.clone(),
             http_key: self.http_key.clone(),
@@ -430,9 +430,9 @@ impl SandboxBuilder {
         self
     }
 
-    /// Add a credential-injection rule (see the `--http-inject` field docs).
-    pub fn http_inject(mut self, rule: &str) -> Self {
-        self.http_inject.push(rule.to_string());
+    /// Add a credential-injection rule (see the `--http-auth` field docs).
+    pub fn http_auth(mut self, rule: &str) -> Self {
+        self.http_auth.push(rule.to_string());
         self
     }
 
@@ -724,9 +724,9 @@ impl SandboxBuilder {
         // additionally needs a CA (--http-ca / --http-inject-ca) to MITM 443;
         // without one only plaintext HTTP is intercepted. Reject a rule that
         // could never fire (no proxy).
-        if !self.http_inject.is_empty() && http_allow.is_empty() && http_deny.is_empty() {
+        if !self.http_auth.is_empty() && http_allow.is_empty() && http_deny.is_empty() {
             return Err(SandboxError::Invalid(
-                "--http-inject requires an HTTP ACL proxy (--http-allow or --http-deny); \
+                "--http-auth requires an HTTP ACL proxy (--http-allow or --http-deny); \
                  HTTPS injection additionally needs --http-ca or --http-inject-ca"
                     .into(),
             ));
@@ -735,9 +735,9 @@ impl SandboxBuilder {
         // (the common case: `bearer openai` → api.openai.com:443) silently never
         // fires — the request bypasses the proxy and goes out uncredentialed. We
         // can't know a rule's scheme at build time, so warn rather than reject.
-        if !self.http_inject.is_empty() && self.http_ca.is_none() && self.http_inject_ca.is_empty() {
+        if !self.http_auth.is_empty() && self.http_ca.is_none() && self.http_inject_ca.is_empty() {
             eprintln!(
-                "sandlock: warning: --http-inject with no CA (--http-ca/--http-inject-ca) only \
+                "sandlock: warning: --http-auth with no CA (--http-ca/--http-inject-ca) only \
                  injects into plaintext HTTP (port 80); requests to HTTPS hosts bypass the proxy \
                  and are sent without the credential"
             );
@@ -748,7 +748,7 @@ impl SandboxBuilder {
         // `env:` var names to remove from the child, so an env-sourced secret
         // can't just be read out of the child's own environment.
         let (inject_rules, inject_env_strip) =
-            crate::credential::resolve_inject_rules(&self.credentials, &self.http_inject)?;
+            crate::credential::resolve_inject_rules(&self.credentials, &self.http_auth)?;
         let inject = std::sync::Arc::new(inject_rules);
 
         // Default HTTP intercept ports: 80 always, 443 when HTTPS CA is configured.

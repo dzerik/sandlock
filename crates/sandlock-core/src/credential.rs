@@ -171,7 +171,7 @@ pub enum OnExistingHeader {
     /// key to be set and always sends its own `Authorization: Bearer <placeholder>`
     /// — so keeping the child's value would forward the placeholder and never
     /// inject. Replacing that one header the rule targets is what makes
-    /// `--http-inject "* api.openai.com/* bearer openai"` work at all.
+    /// `--http-auth "* api.openai.com/* bearer openai"` work at all.
     #[default]
     Replace,
     /// Leave the header/param the child already set, injecting only when absent.
@@ -302,7 +302,7 @@ impl InjectRule {
     }
 }
 
-/// Parse an `AuthShape` from the auth token of an `--http-inject` rule:
+/// Parse an `AuthShape` from the auth token of an `--http-auth` rule:
 /// `bearer` | `basic:<user>` | `header:<name>` | `apikey:<name>` | `query:<param>`.
 pub fn parse_auth(spec: &str, credential: &str) -> Result<AuthShape, SandboxError> {
     let (kind, arg) = match spec.split_once(':') {
@@ -333,7 +333,7 @@ pub fn parse_auth(spec: &str, credential: &str) -> Result<AuthShape, SandboxErro
     Ok(shape)
 }
 
-/// Resolve `--credential`/`--http-inject` specs into ready-to-apply rules,
+/// Resolve `--credential`/`--http-auth` specs into ready-to-apply rules,
 /// loading each secret into the supervisor.
 ///
 /// - `credentials`: `NAME=SOURCE` where SOURCE is `env:`/`file:`/`fd:` (see
@@ -380,7 +380,7 @@ pub fn resolve_inject_rules(
         let toks: Vec<&str> = spec.split_whitespace().collect();
         if toks.len() < 4 {
             return Err(SandboxError::Invalid(format!(
-                "--http-inject must be 'METHOD HOST/PATH AUTHSPEC CREDNAME [replace|add-only]', got {spec:?}"
+                "--http-auth must be 'METHOD HOST/PATH AUTHSPEC CREDNAME [replace|add-only]', got {spec:?}"
             )));
         }
         let matcher = HttpRule::parse(&format!("{} {}", toks[0], toks[1]))?;
@@ -393,12 +393,12 @@ pub fn resolve_inject_rules(
             Some(&"add-only") => OnExistingHeader::AddOnly,
             Some(other) => {
                 return Err(SandboxError::Invalid(format!(
-                    "--http-inject trailing token must be 'replace', 'add-only', or absent, got {other:?}"
+                    "--http-auth trailing token must be 'replace', 'add-only', or absent, got {other:?}"
                 )))
             }
         };
         let source = *sources.get(cred).ok_or_else(|| {
-            SandboxError::Invalid(format!("--http-inject references undeclared credential {cred:?}"))
+            SandboxError::Invalid(format!("--http-auth references undeclared credential {cred:?}"))
         })?;
         parsed.push(Parsed { name: cred, matcher, auth, on_existing, source });
     }

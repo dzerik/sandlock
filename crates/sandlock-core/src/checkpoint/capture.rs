@@ -303,7 +303,7 @@ pub(crate) fn capture(pid: i32, policy: &Sandbox) -> Result<Checkpoint, Sandlock
     // uncredentialed — reject rather than silently drop them.
     if !policy.inject.is_empty() {
         return Err(SandlockError::Runtime(SandboxRuntimeError::Child(
-            "checkpoint is not supported with credential injection (--http-inject); \
+            "checkpoint is not supported with credential injection (--http-auth); \
              the injected secrets cannot be serialized into the image"
                 .into(),
         )));

@@ -145,7 +145,7 @@ impl TryFrom<&Sandbox> for Confinement {
         if sandbox.allows_sysv_ipc() { unsupported.push("extra_allow_syscalls=[\"sysv_ipc\"]"); }
         if !sandbox.http_allow.is_empty() { unsupported.push("http_allow"); }
         if !sandbox.http_deny.is_empty() { unsupported.push("http_deny"); }
-        if !sandbox.inject.is_empty() { unsupported.push("http_inject"); }
+        if !sandbox.inject.is_empty() { unsupported.push("http_auth"); }
         if !sandbox.http_ports.is_empty() { unsupported.push("http_ports"); }
         if sandbox.http_ca.is_some() { unsupported.push("http_ca"); }
         if sandbox.http_key.is_some() { unsupported.push("http_key"); }

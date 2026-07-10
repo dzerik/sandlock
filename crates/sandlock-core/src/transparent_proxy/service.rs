@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -36,6 +37,18 @@ pub(crate) struct AclService {
     pub(crate) orig_dest: OrigDestMap,
     pub(crate) forwarder: Forwarder,
     dns_cache: Arc<Mutex<HashMap<String, DnsEntry>>>,
+    /// Latched once the first cleartext (`http`) credential injection is warned,
+    /// so a library/API caller gets the warning once per run instead of per
+    /// request. See [`first_cleartext_warn`].
+    cleartext_warned: Arc<AtomicBool>,
+}
+
+/// Whether this cleartext injection should emit the one-per-run warning: true the
+/// first time a credential is injected over plaintext `http` (and latches `seen`),
+/// false afterwards and always false for `https`. Split out so the warn-once
+/// contract is unit-tested without capturing the supervisor's stderr.
+fn first_cleartext_warn(scheme: &str, seen: &AtomicBool) -> bool {
+    scheme == "http" && !seen.swap(true, Ordering::Relaxed)
 }
 
 impl AclService {
@@ -53,6 +66,7 @@ impl AclService {
             orig_dest,
             forwarder,
             dns_cache: Arc::new(Mutex::new(HashMap::new())),
+            cleartext_warned: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -177,6 +191,17 @@ impl AclService {
                     "sandlock: injected credential {:?} for {} {}{}",
                     r.name, method, host, path
                 );
+                // Fires for any caller (library/API, not just the CLI) since the
+                // proxy is in core: the scheme is only known here at request time.
+                // Once per run — over cleartext the secret is exposed on the wire.
+                if first_cleartext_warn(scheme, &self.cleartext_warned) {
+                    eprintln!(
+                        "sandlock: warning: credential {:?} injected over cleartext HTTP (no TLS) \
+                         to {} — the secret is exposed on the wire; prefer an HTTPS host \
+                         (configure MITM via --http-ca / --http-inject-ca)",
+                        r.name, host
+                    );
+                }
                 break;
             }
         }
@@ -195,4 +220,23 @@ fn text_response(status: StatusCode, msg: &str) -> Response<BoxBody<Bytes, BoxEr
         .status(status)
         .body(Full::new(Bytes::from(msg.to_string())).map_err(|e| match e {}).boxed())
         .expect("response build")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::first_cleartext_warn;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn cleartext_warns_once_and_https_never() {
+        let seen = AtomicBool::new(false);
+        // First cleartext injection warns and latches; later ones are silent.
+        assert!(first_cleartext_warn("http", &seen));
+        assert!(!first_cleartext_warn("http", &seen));
+        // https never warns, and must not consume a fresh latch.
+        let fresh = AtomicBool::new(false);
+        assert!(!first_cleartext_warn("https", &fresh));
+        assert!(!fresh.load(Ordering::Relaxed));
+        assert!(first_cleartext_warn("http", &fresh));
+    }
 }
