@@ -8,7 +8,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
 
 use crate::seccomp::ctx::SupervisorCtx;
-use crate::seccomp::notif::{read_child_mem, NotifAction};
+use crate::seccomp::notif::NotifAction;
 use crate::sys::structs::{SeccompNotif, ECONNREFUSED};
 
 use super::materialize::{
@@ -42,9 +42,9 @@ pub(super) async fn connect_on_behalf(
 
     // 1. Copy sockaddr from child memory
     let addr_bytes =
-        match read_child_mem(notif_fd, notif.id, notif.pid, addr_ptr, addr_len as usize) {
+        match super::read_sockaddr(notif_fd, notif.id, notif.pid, addr_ptr, addr_len as usize) {
             Ok(b) => b,
-            Err(_) => return NotifAction::Errno(libc::EIO),
+            Err(e) => return NotifAction::Errno(e),
         };
 
     // 2. Check destination against the per-protocol endpoint allowlist.
