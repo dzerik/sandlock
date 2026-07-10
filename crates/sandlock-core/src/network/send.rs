@@ -61,9 +61,9 @@ pub(super) async fn sendto_on_behalf(
 
     // 1. Copy sockaddr from child memory (small: 16-28 bytes)
     let addr_bytes =
-        match read_child_mem(notif_fd, notif.id, notif.pid, addr_ptr, addr_len as usize) {
+        match super::read_sockaddr(notif_fd, notif.id, notif.pid, addr_ptr, addr_len as usize) {
             Ok(b) => b,
-            Err(_) => return NotifAction::Errno(libc::EIO),
+            Err(e) => return NotifAction::Errno(e),
         };
 
     // 2. Check (ip, port) against the per-protocol endpoint allowlist.
@@ -241,9 +241,9 @@ fn prescan_msghdr(
     if hdr.connected() {
         return PrescanResult::ContinueWholeCall;
     }
-    let addr_bytes = match read_child_mem(notif_fd, notif.id, notif.pid, hdr.name_ptr, hdr.namelen as usize) {
+    let addr_bytes = match super::read_sockaddr(notif_fd, notif.id, notif.pid, hdr.name_ptr, hdr.namelen as usize) {
         Ok(b) => b,
-        Err(_) => return PrescanResult::Errno(libc::EIO),
+        Err(e) => return PrescanResult::Errno(e),
     };
     if parse_ip_from_sockaddr(&addr_bytes).is_none() {
         return PrescanResult::ContinueWholeCall;
@@ -291,9 +291,9 @@ async fn send_msghdr_on_behalf(
     let addr_bytes = if connected {
         Vec::new()
     } else {
-        match read_child_mem(notif_fd, notif.id, notif.pid, hdr.name_ptr, hdr.namelen as usize) {
+        match super::read_sockaddr(notif_fd, notif.id, notif.pid, hdr.name_ptr, hdr.namelen as usize) {
             Ok(b) => b,
-            Err(_) => return Err(libc::EIO),
+            Err(e) => return Err(e),
         }
     };
     if !connected {

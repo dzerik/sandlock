@@ -62,6 +62,59 @@ async fn test_udp_rule_scopes_destination_by_host() {
     assert_eq!(blocked, "ERR:111", "sendto to disallowed host should ECONNREFUSED");
 }
 
+/// Regression for the uncapped-sockaddr-length DoS: a child can pass
+/// `addr_len = 0xFFFFFFFF` to `sendto`. The seccomp-notify trap fires before the
+/// kernel's `addrlen > sizeof(sockaddr_storage) -> EINVAL` check, so without the
+/// `read_sockaddr` guard the supervisor did `vec![0u8; 0xFFFFFFFF]` (~4 GiB) and
+/// could OOM/abort, taking down every sandbox. The child sends with a bogus 4 GiB
+/// `addr_len` via raw `libc.sendto`. The supervisor must (a) survive — the whole
+/// run completes — and (b) reject the oversized length with `EINVAL` (22),
+/// matching the kernel, rather than reading it (or silently truncating). The
+/// destination gate never runs, so both the allowed and blocked host fail the
+/// same way.
+#[tokio::test]
+async fn test_sendto_huge_addrlen_rejected_with_einval() {
+    let out = temp_file("huge-addrlen");
+
+    let policy = base_policy()
+        .net_allow("udp://127.0.0.1:53")
+        .build()
+        .unwrap();
+
+    let script = format!(concat!(
+        "import ctypes, socket, struct, os\n",
+        "libc = ctypes.CDLL('libc.so.6', use_errno=True)\n",
+        "libc.sendto.restype = ctypes.c_ssize_t\n",
+        "def sai(ip, port):\n",
+        "    return struct.pack('<H', socket.AF_INET) + struct.pack('!H', port) + socket.inet_aton(ip) + b'\\x00'*8\n",
+        "s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n",
+        "buf = ctypes.create_string_buffer(b'x')\n",
+        "def send(ip):\n",
+        "    a = ctypes.create_string_buffer(sai(ip, 53))\n",
+        // addrlen = 0xFFFFFFFF: without the clamp this forces a ~4 GiB supervisor alloc.
+        "    ctypes.set_errno(0)\n",
+        "    r = libc.sendto(s.fileno(), buf, 1, 0, a, 0xFFFFFFFF)\n",
+        "    return 'OK' if r >= 0 else f'ERR:{{ctypes.get_errno()}}'\n",
+        "allowed = send('127.0.0.1')\n",
+        "blocked = send('1.1.1.1')\n",
+        "open('{out}', 'w').write(allowed + '|' + blocked)\n",
+        "s.close()\n",
+    ), out = out.display());
+
+    let result = policy.clone().with_name("test").run_interactive(&["python3", "-c", &script])
+        .await.unwrap();
+    // The run completing at all is the core assertion: an OOM-aborted supervisor
+    // would kill the child instead of letting it finish.
+    assert!(result.success(), "supervisor should survive a 4 GiB addr_len; exit={:?}", result.code());
+
+    let got = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    // EINVAL (22) for both: the oversized addr_len is rejected before the
+    // destination gate, so allowed vs blocked is never reached.
+    assert_eq!(got, "ERR:22|ERR:22",
+        "a bogus 4 GiB addr_len must be rejected with EINVAL, matching the kernel");
+}
+
 /// `udp://*:*` is the "any UDP destination" gate — it should not regress
 /// after Phase 2's per-protocol routing. Both sendtos succeed.
 #[tokio::test]

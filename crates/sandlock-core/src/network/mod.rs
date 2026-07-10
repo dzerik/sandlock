@@ -25,7 +25,7 @@ use std::os::unix::io::RawFd;
 use std::sync::Arc;
 
 use crate::seccomp::ctx::SupervisorCtx;
-use crate::seccomp::notif::NotifAction;
+use crate::seccomp::notif::{read_child_mem, NotifAction};
 use crate::sys::structs::SeccompNotif;
 
 mod connect;
@@ -47,6 +47,37 @@ pub use rules::{
 
 use connect::connect_on_behalf;
 use send::{sendmmsg_on_behalf, sendmsg_on_behalf, sendto_on_behalf};
+
+/// Largest sockaddr length we copy from the child when gating a `connect`/
+/// `sendto`/`sendmsg` destination. The seccomp-notify trap fires at syscall
+/// entry, *before* the kernel's own `addrlen > sizeof(sockaddr_storage)`
+/// (`EINVAL`) check, so a child can pass `addr_len`/`msg_namelen` up to
+/// `u32::MAX`. Reading that verbatim into `vec![0u8; len]` would let the child
+/// force a multi-GiB supervisor allocation (OOM / alloc-abort of the monitor)
+/// for an address that is at most this many bytes. Every legitimate sockaddr
+/// fits in `sizeof(sockaddr_storage)`, so a larger length is rejected before the
+/// read (see [`read_sockaddr`]).
+const MAX_SOCKADDR_LEN: usize = std::mem::size_of::<libc::sockaddr_storage>();
+
+/// Copy a sockaddr from child memory, rejecting an oversized length *before* the
+/// allocation. `len` is child-controlled (`addr_len` / `msg_namelen`, a `u32`),
+/// and the trap fires before the kernel's `addrlen > sizeof(sockaddr_storage)`
+/// check, so an uncapped read would let the child force a multi-GiB supervisor
+/// allocation. A length larger than a `sockaddr_storage` cannot address a valid
+/// sockaddr, so it fails closed with `EINVAL` (matching what the kernel would
+/// return) rather than being silently truncated; a read fault maps to `EIO`.
+pub(super) fn read_sockaddr(
+    notif_fd: RawFd,
+    id: u64,
+    pid: u32,
+    ptr: u64,
+    len: usize,
+) -> Result<Vec<u8>, i32> {
+    if len > MAX_SOCKADDR_LEN {
+        return Err(libc::EINVAL);
+    }
+    read_child_mem(notif_fd, id, pid, ptr, len).map_err(|_| libc::EIO)
+}
 
 // ============================================================
 // query_socket_protocol — derive the rule Protocol from a fd via getsockopt

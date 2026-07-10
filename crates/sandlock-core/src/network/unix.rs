@@ -175,7 +175,7 @@ pub(super) fn unix_sendmsg_gate(
         return None; // connected socket: no address to gate
     }
     let addr_bytes =
-        read_child_mem(notif_fd, notif.id, notif.pid, hdr.name_ptr, hdr.namelen as usize).ok()?;
+        super::read_sockaddr(notif_fd, notif.id, notif.pid, hdr.name_ptr, hdr.namelen as usize).ok()?;
     // None unless this is a NAMED AF_UNIX target; IP/abstract fall through.
     let path = named_unix_socket_path(&addr_bytes)?;
 
@@ -271,7 +271,7 @@ pub(super) fn mmsg_entry_named_unix_path(
         return None;
     }
     let addr_bytes =
-        read_child_mem(notif_fd, notif.id, notif.pid, hdr.name_ptr, hdr.namelen as usize).ok()?;
+        super::read_sockaddr(notif_fd, notif.id, notif.pid, hdr.name_ptr, hdr.namelen as usize).ok()?;
     named_unix_socket_path(&addr_bytes)
 }
 
