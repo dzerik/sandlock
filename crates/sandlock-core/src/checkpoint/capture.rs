@@ -297,6 +297,18 @@ fn parse_fdinfo(pid: i32, fd: i32) -> io::Result<(i32, u64)> {
 /// Capture a checkpoint from a running, stopped sandbox.
 /// The sandbox must already be frozen (SIGSTOP'd and fork-held).
 pub(crate) fn capture(pid: i32, policy: &Sandbox) -> Result<Checkpoint, SandlockError> {
+    // Credential-injection rules hold supervisor-only secrets that are
+    // deliberately not serialized (`#[serde(skip)]`). A checkpoint image would
+    // therefore restore with no injection rules and send every request
+    // uncredentialed — reject rather than silently drop them.
+    if !policy.inject.is_empty() {
+        return Err(SandlockError::Runtime(SandboxRuntimeError::Child(
+            "checkpoint is not supported with credential injection (--http-auth); \
+             the injected secrets cannot be serialized into the image"
+                .into(),
+        )));
+    }
+
     // Seize via ptrace (PTRACE_SEIZE + PTRACE_INTERRUPT -- doesn't auto-SIGSTOP)
     ptrace_seize(pid).map_err(|e| {
         SandlockError::Runtime(SandboxRuntimeError::Child(format!("ptrace seize: {}", e)))

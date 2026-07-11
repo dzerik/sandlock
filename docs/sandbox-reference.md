@@ -150,6 +150,86 @@ compiled-in CA list such as Node and Java are not reachable by file
 injection; for those use `http_ca_out` to export the public cert and
 point the runtime's own env var at it (e.g. `NODE_EXTRA_CA_CERTS`).
 
+### Credential injection
+
+`--credential NAME=SOURCE` loads a secret into the supervisor, where SOURCE is
+`env:VAR` (the var is also stripped from the child's environment so it can't read
+it back), `file:PATH`, or `fd:N`. `--http-auth "METHOD HOST/PATH AUTHSPEC NAME
+[replace|add-only]"` then attaches that credential to a matching request **in the
+proxy, strictly after the ACL check** — the child process never carries the
+secret value. AUTHSPEC is one of `bearer`, `basic:<user>`, `header:<name>`,
+`apikey:<name>`, or `query:<param>`; the default `replace` overwrites an existing
+credential of that shape, `add-only` leaves a caller-supplied one in place.
+Injection requires an HTTP ACL proxy (at least one `http_allow` / `http_deny`);
+injecting into an HTTPS host additionally needs `http_ca` / `http_inject_ca` so
+the proxy can MITM port 443. Over cleartext HTTP the secret is sent to the
+upstream in plaintext, so sandlock emits a one-per-run warning. `--credential` /
+`--http-auth` are CLI/builder flags, not `[config]` profile keys.
+
+Examples, each showing the salient flags of a `sandlock run` invocation:
+
+```console
+# Bearer token from an env var (OpenAI-style). The var is stripped from the
+# child, so the agent can't read OPENAI_API_KEY back out of its own environment.
+--credential openai=env:OPENAI_API_KEY \
+--http-auth "POST api.openai.com/v1/* bearer openai"
+
+# Custom header from a mounted secret file (Anthropic-style). `apikey:<name>` is
+# an alias of `header:<name>`, and `file:` / `fd:` are alternatives to `env:`.
+--credential anthropic=file:/run/secrets/anthropic-key \
+--http-auth "* api.anthropic.com/* header:x-api-key anthropic"
+
+# HTTP Basic with a fixed user-id. A ':' in the user-id is rejected (RFC 7617):
+# it would shift the user:pass boundary and leak part of the secret.
+--credential registry=env:REGISTRY_PASSWORD \
+--http-auth "* registry.internal/* basic:deploy registry"
+
+# Query parameter — the least private shape. The value lands in the upstream's
+# access logs and any Referer, so use it only for APIs that require it.
+--credential maps=file:/run/secrets/maps-key \
+--http-auth "GET maps.example.com/* query:key maps"
+
+# One credential backing several hosts. The trailing `add-only` makes the second
+# rule a fallback: if the agent already set x-token itself, its value is kept
+# (the default, `replace`, would overwrite it — needed for SDKs that always send
+# a placeholder auth header).
+--credential shared=env:SHARED_TOKEN \
+--http-auth "* a.example.com/* bearer shared" \
+--http-auth "* b.example.com/* header:x-token shared add-only"
+```
+
+Sandlock has no built-in secret-manager client — instead an external fetcher
+materializes the secret into a `file:` or `fd:` source, keeping the value off
+`ps`, the shell history, and the child's environment. This composes with any
+manager (Vault, AWS/GCP/Azure secret stores, a CSI driver) rather than pinning
+one into the supervisor.
+
+```console
+# fd: via process substitution — the secret never touches disk. The fetcher
+# writes to fd 3, sandlock reads it through a dup, and the child never sees it.
+sandlock run \
+  --http-allow "POST api.internal/*" \
+  --http-inject-ca /etc/ssl/certs/ca-certificates.crt \
+  --credential api=fd:3 \
+  --http-auth "POST api.internal/* bearer api" \
+  3< <(vault read -field=token secret/data/api) \
+  -r /usr -r /lib -r /etc -- python3 agent.py
+
+# file: from a mounted secret — e.g. a Vault Agent sidecar or a CSI
+# secrets-store driver renders the value onto an in-memory tmpfs. The whole
+# file is the secret (a single trailing newline is stripped).
+sandlock run \
+  --http-allow "* api.internal/*" \
+  --http-inject-ca /etc/ssl/certs/ca-certificates.crt \
+  --credential api=file:/vault/secrets/api-key \
+  --http-auth "* api.internal/* bearer api" \
+  -r /usr -r /lib -r /etc -- python3 agent.py
+```
+
+Dynamic/leased secrets (Vault leases with a TTL, rotating keys) are out of scope:
+the secret is loaded once at supervisor start, so a rotated value is picked up
+only on the next `sandlock run`.
+
 ## `[determinism]`
 
 Knobs that pin sources of non-determinism in the child process.

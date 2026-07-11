@@ -145,6 +145,7 @@ impl TryFrom<&Sandbox> for Confinement {
         if sandbox.allows_sysv_ipc() { unsupported.push("extra_allow_syscalls=[\"sysv_ipc\"]"); }
         if !sandbox.http_allow.is_empty() { unsupported.push("http_allow"); }
         if !sandbox.http_deny.is_empty() { unsupported.push("http_deny"); }
+        if !sandbox.inject.is_empty() { unsupported.push("http_auth"); }
         if !sandbox.http_ports.is_empty() { unsupported.push("http_ports"); }
         if sandbox.http_ca.is_some() { unsupported.push("http_ca"); }
         if sandbox.http_key.is_some() { unsupported.push("http_key"); }
@@ -341,6 +342,17 @@ pub struct Sandbox {
     // HTTP ACL
     pub http_allow: Vec<HttpRule>,
     pub http_deny: Vec<HttpRule>,
+    /// Credential-injection rules, applied in the MITM proxy after the ACL
+    /// check. `Arc` so the (non-Clone) secrets flow to the proxy by sharing.
+    /// Not serialized: the resolved secrets live only in the supervisor and are
+    /// re-loaded from their sources on each build, never persisted in a policy.
+    #[serde(skip)]
+    pub(crate) inject: std::sync::Arc<Vec<crate::credential::InjectRule>>,
+    /// `env:` var names to remove from the child's environment (so an env-sourced
+    /// credential can't be read straight out of the agent's own env). Just names,
+    /// no secrets — safe to serialize, but tied to `inject` which isn't restored.
+    #[serde(skip)]
+    pub(crate) inject_env_strip: Vec<String>,
     /// TCP ports to intercept for HTTP ACL. Defaults to [80] (plus 443 when
     /// http_ca is set). Override with `http_ports` to intercept custom ports.
     pub http_ports: Vec<u16>,
@@ -484,6 +496,8 @@ impl Clone for Sandbox {
             net_deny_bind: self.net_deny_bind.clone(),
             http_allow: self.http_allow.clone(),
             http_deny: self.http_deny.clone(),
+            inject: self.inject.clone(),
+            inject_env_strip: self.inject_env_strip.clone(),
             http_ports: self.http_ports.clone(),
             http_ca: self.http_ca.clone(),
             http_key: self.http_key.clone(),
@@ -1507,6 +1521,7 @@ impl Sandbox {
             let handle = crate::transparent_proxy::spawn_transparent_proxy(
                 self.http_allow.clone(),
                 self.http_deny.clone(),
+                std::sync::Arc::clone(&self.inject),
                 cert_pem,
                 key_pem,
             )

@@ -461,6 +461,8 @@ async fn run_command(args: RunArgs) -> Result<i32> {
     if !pb.extra_deny_syscalls.is_empty() { builder = builder.extra_deny_syscalls(pb.extra_deny_syscalls.clone()); }
     for rule in &pb.http_allow { builder = builder.http_allow(rule); }
     for rule in &pb.http_deny { builder = builder.http_deny(rule); }
+    for c in &pb.credentials { builder = builder.credential_spec(c); }
+    for rule in &pb.http_auth { builder = builder.http_auth(rule); }
     for port in &pb.http_ports { builder = builder.http_port(*port); }
     if let Some(ref ca) = pb.http_ca { builder = builder.http_ca(ca); }
     if let Some(ref key) = pb.http_key { builder = builder.http_key(key); }

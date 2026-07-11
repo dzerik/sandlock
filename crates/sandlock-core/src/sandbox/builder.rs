@@ -59,6 +59,25 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", arg(long = "http-deny", value_name = "RULE"))]
     pub http_deny: Vec<String>,
 
+    /// Named credential loaded into the supervisor: `NAME=SOURCE`, where SOURCE
+    /// is `env:VAR`, `file:/path`, or `fd:N`. The resolved secret is never handed
+    /// to the child: an `env:` var is stripped from the child's environment and an
+    /// `fd:` is read supervisor-side only. A `file:` source, however, is only as
+    /// private as the path — keep it outside the sandbox's readable paths, or the
+    /// child can open it directly.
+    #[cfg_attr(feature = "cli", arg(long = "credential", value_name = "NAME=SOURCE"))]
+    pub credentials: Vec<String>,
+
+    /// Credential-injection rule (needs an HTTPS MITM proxy, i.e. `--http-ca` /
+    /// `--http-inject-ca`): `METHOD HOST/PATH AUTHSPEC CREDNAME [replace|add-only]`,
+    /// where AUTHSPEC is `bearer | basic:<user> | header:<name> | apikey:<name> |
+    /// query:<param>`. The matching request gets the credential attached in the
+    /// proxy, after the ACL check. The trailing token defaults to `replace` (the
+    /// proxy overwrites the placeholder auth SDKs send); pass `add-only` to keep a
+    /// value the child set.
+    #[cfg_attr(feature = "cli", arg(long = "http-auth", value_name = "RULE"))]
+    pub http_auth: Vec<String>,
+
     /// TCP ports to intercept for HTTP ACL (default: 80, plus 443 with --http-ca)
     #[cfg_attr(feature = "cli", arg(long = "http-port", value_name = "PORT"))]
     pub http_ports: Vec<u16>,
@@ -229,6 +248,8 @@ impl Clone for SandboxBuilder {
             net_deny_bind: self.net_deny_bind.clone(),
             http_allow: self.http_allow.clone(),
             http_deny: self.http_deny.clone(),
+            credentials: self.credentials.clone(),
+            http_auth: self.http_auth.clone(),
             http_ports: self.http_ports.clone(),
             http_ca: self.http_ca.clone(),
             http_key: self.http_key.clone(),
@@ -394,6 +415,24 @@ impl SandboxBuilder {
 
     pub fn http_deny(mut self, rule: &str) -> Self {
         self.http_deny.push(rule.to_string());
+        self
+    }
+
+    /// Declare a named credential: `name` and a `source` (`env:`/`file:`/`fd:`).
+    pub fn credential(mut self, name: &str, source: &str) -> Self {
+        self.credentials.push(format!("{name}={source}"));
+        self
+    }
+
+    /// Declare a credential from a raw `NAME=SOURCE` spec (as the CLI parses it).
+    pub fn credential_spec(mut self, spec: &str) -> Self {
+        self.credentials.push(spec.to_string());
+        self
+    }
+
+    /// Add a credential-injection rule (see the `--http-auth` field docs).
+    pub fn http_auth(mut self, rule: &str) -> Self {
+        self.http_auth.push(rule.to_string());
         self
     }
 
@@ -680,6 +719,74 @@ impl SandboxBuilder {
             .map(|s| HttpRule::parse(&s))
             .collect::<Result<_, _>>()?;
 
+        // Credential injection happens inside the ACL proxy, so it needs the
+        // proxy to run at all (i.e. some http rule). Injecting into HTTPS
+        // additionally needs a CA (--http-ca / --http-inject-ca) to MITM 443;
+        // without one only plaintext HTTP is intercepted. Reject a rule that
+        // could never fire (no proxy).
+        if !self.http_auth.is_empty() && http_allow.is_empty() && http_deny.is_empty() {
+            return Err(SandboxError::Invalid(
+                "--http-auth requires an HTTP ACL proxy (--http-allow or --http-deny); \
+                 HTTPS injection additionally needs --http-ca or --http-inject-ca"
+                    .into(),
+            ));
+        }
+        // Without a CA only port 80 is intercepted, so a rule for an HTTPS host
+        // (the common case: `bearer openai` → api.openai.com:443) silently never
+        // fires — the request bypasses the proxy and goes out uncredentialed. We
+        // can't know a rule's scheme at build time, so warn rather than reject.
+        if !self.http_auth.is_empty() && self.http_ca.is_none() && self.http_inject_ca.is_empty() {
+            eprintln!(
+                "sandlock: warning: --http-auth with no CA (--http-ca/--http-inject-ca) only \
+                 injects into plaintext HTTP (port 80); requests to HTTPS hosts bypass the proxy \
+                 and are sent without the credential"
+            );
+        }
+        // A `file:` credential is the one source with no automatic backstop:
+        // `env:` vars are stripped from the child and `fd:` is read through a
+        // dup, but a secret file sitting inside any grant that lets the child
+        // reach it is `cat`-able directly. We can't safely auto-deny (the grant
+        // is often a broad dir the workload needs), so warn on the overlap. Every
+        // exposing grant is covered: read grants, write grants (write access
+        // includes read), bind-mounted host dirs, and the chroot root (visible
+        // regardless of Landlock). Best-effort — canonicalize where possible.
+        for c in &self.credentials {
+            let Some(path) = c.split_once('=').and_then(|(_, s)| s.strip_prefix("file:")) else {
+                continue;
+            };
+            let secret = std::path::Path::new(path);
+            let secret_abs = secret.canonicalize();
+            let secret_ref = secret_abs.as_deref().unwrap_or(secret);
+            let grants = self
+                .fs_readable
+                .iter()
+                .chain(self.fs_writable.iter())
+                .chain(self.fs_mount.iter().map(|(_, host)| host))
+                .chain(self.chroot.as_ref());
+            for grant in grants {
+                let grant_abs = grant.canonicalize();
+                let grant_ref = grant_abs.as_deref().unwrap_or(grant.as_path());
+                if secret_ref.starts_with(grant_ref) {
+                    eprintln!(
+                        "sandlock: warning: credential file {} is inside the sandbox grant {} — \
+                         the sandboxed child can read the secret directly; keep it outside every \
+                         fs grant (or add an fs-deny for it)",
+                        path,
+                        grant.display()
+                    );
+                    break;
+                }
+            }
+        }
+        // Resolve credentials + injection rules, loading each secret into the
+        // supervisor. Wrapped in Arc so it flows to the proxy without cloning
+        // the (deliberately non-Clone) secrets. `inject_env_strip` is the set of
+        // `env:` var names to remove from the child, so an env-sourced secret
+        // can't just be read out of the child's own environment.
+        let (inject_rules, inject_env_strip) =
+            crate::credential::resolve_inject_rules(&self.credentials, &self.http_auth)?;
+        let inject = std::sync::Arc::new(inject_rules);
+
         // Default HTTP intercept ports: 80 always, 443 when HTTPS CA is configured.
         let http_ports = if self.http_ports.is_empty() && (!http_allow.is_empty() || !http_deny.is_empty()) {
             let mut ports = vec![80];
@@ -744,6 +851,8 @@ impl SandboxBuilder {
             net_deny_bind,
             http_allow,
             http_deny,
+            inject,
+            inject_env_strip,
             http_ports,
             http_ca: self.http_ca,
             http_key: self.http_key,

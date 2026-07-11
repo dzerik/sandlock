@@ -498,6 +498,15 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
             std::env::remove_var(&key);
         }
     }
+    // Remove env vars whose value was loaded into the supervisor as a credential
+    // source, so the agent can't read the real secret straight from its own
+    // environment (this is the child; the mutation is process-local and post-fork).
+    // This runs *before* applying `sandbox.env`, so the inherited real secret is
+    // dropped but a deliberate placeholder the user passes (e.g.
+    // `--env OPENAI_API_KEY=dummy`, which SDKs need set to start) still survives.
+    for name in &sandbox.inject_env_strip {
+        std::env::remove_var(name);
+    }
     for (key, value) in &sandbox.env {
         std::env::set_var(key, value);
     }

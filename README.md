@@ -183,6 +183,17 @@ sandlock run \
   --http-ca ca.pem --http-key ca-key.pem \
   -r /usr -r /lib -r /etc -- python3 agent.py
 
+# Credential injection: the secret lives in the supervisor, the child never sees
+# it. sandlock attaches it in the proxy AFTER the ACL check. Over HTTPS the value
+# is encrypted to the upstream; over cleartext HTTP sandlock warns (the secret
+# would be exposed on the wire).
+sandlock run \
+  --http-allow "POST api.openai.com/v1/*" \
+  --http-inject-ca /etc/ssl/certs/ca-certificates.crt \
+  --credential openai=env:OPENAI_API_KEY \
+  --http-auth "POST api.openai.com/* bearer openai" \
+  -r /usr -r /lib -r /etc -- python3 agent.py
+
 # Server listening on ports (Landlock --net-allow-bind, separate from --net-allow;
 # accepts comma-separated ports and lo-hi ranges, repeatable)
 sandlock run --net-allow-bind 8080,9000-9005 -r /usr -r /lib -r /etc -- python3 server.py
