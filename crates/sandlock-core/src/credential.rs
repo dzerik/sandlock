@@ -205,6 +205,18 @@ impl std::fmt::Debug for InjectRule {
     }
 }
 
+/// What [`InjectRule::apply`] did on the `Ok` path — so the caller logs a
+/// truthful audit line instead of claiming "injected" when an `add-only` rule
+/// actually left the caller's own credential in place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Applied {
+    /// The secret was rendered into the request.
+    Injected,
+    /// `add-only` and the request already carried the target header/param, so
+    /// the caller's value was kept and no secret was written.
+    Skipped,
+}
+
 impl InjectRule {
     /// True if this rule applies to the given request.
     pub fn matches(&self, method: &str, host: &str, path: &str) -> bool {
@@ -214,16 +226,17 @@ impl InjectRule {
     /// Render the secret into `parts` (header or query), honoring `on_existing`.
     /// The rendered header is marked sensitive so downstream logging redacts it.
     ///
-    /// `Err(())` means the secret could not be rendered (e.g. it contains bytes
-    /// illegal in an HTTP header value) — the caller must reject the request
-    /// rather than forward it with no (or a partial) credential. A no-op skip
-    /// under `AddOnly` (the agent already set the header) is `Ok`.
+    /// `Ok(Injected)` wrote the secret; `Ok(Skipped)` left a caller-supplied
+    /// value in place under `add-only`. `Err(())` means the secret could not be
+    /// rendered (e.g. it contains bytes illegal in an HTTP header value) — the
+    /// caller must reject the request rather than forward it with no (or a
+    /// partial) credential.
     ///
     /// Zeroing is best-effort: [`SecretString`] itself is wiped on drop, but the
     /// transient buffers built here (the `Bearer `/`Basic ` byte vecs, the base64
     /// string, the query pair) hold a copy of the secret and are dropped without
     /// volatile zeroing, so a copy briefly lives in freed heap.
-    pub fn apply(&self, parts: &mut hyper::http::request::Parts) -> Result<(), ()> {
+    pub fn apply(&self, parts: &mut hyper::http::request::Parts) -> Result<Applied, ()> {
         match &self.auth {
             AuthShape::Bearer => {
                 let mut v = b"Bearer ".to_vec();
@@ -248,18 +261,18 @@ impl InjectRule {
         parts: &mut hyper::http::request::Parts,
         name: &str,
         value: &[u8],
-    ) -> Result<(), ()> {
+    ) -> Result<Applied, ()> {
         let hn = hyper::header::HeaderName::from_bytes(name.as_bytes()).map_err(|_| ())?;
         if self.on_existing == OnExistingHeader::AddOnly && parts.headers.contains_key(&hn) {
-            return Ok(()); // agent already set it — leave it, not a failure
+            return Ok(Applied::Skipped); // agent already set it — leave it, not a failure
         }
         let mut hv = hyper::header::HeaderValue::from_bytes(value).map_err(|_| ())?;
         hv.set_sensitive(true);
         parts.headers.insert(hn, hv);
-        Ok(())
+        Ok(Applied::Injected)
     }
 
-    fn set_query(&self, parts: &mut hyper::http::request::Parts, param: &str) -> Result<(), ()> {
+    fn set_query(&self, parts: &mut hyper::http::request::Parts, param: &str) -> Result<Applied, ()> {
         let uri = &parts.uri;
         let path = uri.path();
         let existing = uri.query();
@@ -268,7 +281,7 @@ impl InjectRule {
         if self.on_existing == OnExistingHeader::AddOnly {
             if let Some(q) = existing {
                 if q.split('&').any(|kv| kv.starts_with(&prefix)) {
-                    return Ok(());
+                    return Ok(Applied::Skipped);
                 }
             }
         }
@@ -298,7 +311,7 @@ impl InjectRule {
             b = b.authority(a.clone());
         }
         parts.uri = b.path_and_query(new_pq).build().map_err(|_| ())?;
-        Ok(())
+        Ok(Applied::Injected)
     }
 }
 
@@ -408,14 +421,23 @@ pub fn resolve_inject_rules(
     // names of `env:` sources so the child can be denied them — otherwise the
     // agent would just read the value straight from its own environment.
     let mut loaded: HashMap<&str, Arc<SecretString>> = HashMap::new();
-    let mut env_strip: Vec<String> = Vec::new();
     for p in &parsed {
         if !loaded.contains_key(p.name) {
             loaded.insert(p.name, Arc::new(load_secret(p.source)?));
-            if let Some(var) = p.source.strip_prefix("env:") {
-                if !env_strip.iter().any(|v| v == var) {
-                    env_strip.push(var.to_string());
-                }
+        }
+    }
+
+    // Strip the env var of EVERY declared `env:` credential from the child —
+    // including one no `--http-auth` rule references. Declaring
+    // `--credential X=env:VAR` is the signal that VAR is a secret; stripping
+    // only the *referenced* ones would leave the child able to read the value
+    // straight from its own environment whenever the rule was omitted, typo'd,
+    // or commented out — handing it the exact secret the feature withholds.
+    let mut env_strip: Vec<String> = Vec::new();
+    for source in sources.values() {
+        if let Some(var) = source.strip_prefix("env:") {
+            if !env_strip.iter().any(|v| v == var) {
+                env_strip.push(var.to_string());
             }
         }
     }
@@ -623,6 +645,22 @@ mod tests {
         assert!(Arc::ptr_eq(&rules[0].secret, &rules[1].secret));
         assert_eq!(env_strip, vec!["SANDLOCK_TEST_RESOLVE".to_string()]);
         std::env::remove_var("SANDLOCK_TEST_RESOLVE");
+    }
+
+    #[test]
+    fn resolve_strips_declared_but_unreferenced_env_credential() {
+        // A credential declared via env: but referenced by no --http-auth rule
+        // must STILL be stripped from the child — otherwise the child reads the
+        // secret straight from its own environment. The var need not even be set
+        // (unreferenced credentials are not loaded), so this is pure config.
+        let creds = vec!["unused=env:SANDLOCK_TEST_UNREF".to_string()];
+        let (rules, env_strip) = resolve_inject_rules(&creds, &[]).unwrap();
+        assert!(rules.is_empty(), "no rule references the credential");
+        assert_eq!(
+            env_strip,
+            vec!["SANDLOCK_TEST_UNREF".to_string()],
+            "the declared env var must be stripped even though it is unused"
+        );
     }
 
     #[test]

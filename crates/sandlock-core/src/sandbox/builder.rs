@@ -742,6 +742,33 @@ impl SandboxBuilder {
                  and are sent without the credential"
             );
         }
+        // A `file:` credential is the one source with no automatic backstop:
+        // `env:` vars are stripped from the child and `fd:` is read through a
+        // dup, but a secret file sitting inside an fs-read grant is `cat`-able by
+        // the child directly. We can't safely auto-deny (the grant is often a
+        // broad dir the workload needs), so warn on the overlap, best-effort.
+        for c in &self.credentials {
+            let Some(path) = c.split_once('=').and_then(|(_, s)| s.strip_prefix("file:")) else {
+                continue;
+            };
+            let secret = std::path::Path::new(path);
+            let secret_abs = secret.canonicalize();
+            let secret_ref = secret_abs.as_deref().unwrap_or(secret);
+            for grant in &self.fs_readable {
+                let grant_abs = grant.canonicalize();
+                let grant_ref = grant_abs.as_deref().unwrap_or(grant.as_path());
+                if secret_ref.starts_with(grant_ref) {
+                    eprintln!(
+                        "sandlock: warning: credential file {} is inside the readable grant {} — \
+                         the sandboxed child can read the secret directly; keep it outside every \
+                         fs-read grant (or add an fs-deny for it)",
+                        path,
+                        grant.display()
+                    );
+                    break;
+                }
+            }
+        }
         // Resolve credentials + injection rules, loading each secret into the
         // supervisor. Wrapped in Arc so it flows to the proxy without cloning
         // the (deliberately non-Clone) secrets. `inject_env_strip` is the set of

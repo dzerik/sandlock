@@ -51,6 +51,24 @@ fn first_cleartext_warn(scheme: &str, seen: &AtomicBool) -> bool {
     scheme == "http" && !seen.swap(true, Ordering::Relaxed)
 }
 
+/// Whether a request must be rejected because its absolute-form URI authority
+/// host disagrees (case-insensitive) with its `Host` header — the split that
+/// would otherwise let ACL/verify/inject key off one host while the request is
+/// forwarded to the other. Origin-form requests (no URI host) and a missing /
+/// unparseable Host header are not rejected. Split out so the guard is
+/// unit-tested without a live `Incoming` body.
+fn split_host_rejected(uri: &hyper::Uri, headers: &hyper::HeaderMap) -> bool {
+    let Some(uri_host) = uri.host() else { return false };
+    match headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .map(|h| h.split(':').next().unwrap_or(h))
+    {
+        Some(hdr_host) => !uri_host.eq_ignore_ascii_case(hdr_host),
+        None => false,
+    }
+}
+
 impl AclService {
     pub(crate) fn new(
         allow: Vec<HttpRule>,
@@ -131,6 +149,23 @@ impl AclService {
             .unwrap_or_default();
         let path = req.uri().path().to_string();
 
+        // Fail closed on a split-host request: `host` above prefers the URI
+        // authority, but the outbound request is rebuilt from the Host header
+        // (`host_hdr` below), and the upstream client routes by that. If the two
+        // disagree, the ACL check, `verify_host`, and the credential match would
+        // all key off the URI host while the request — carrying the injected
+        // secret — is forwarded to the Host-header host. A malicious child could
+        // then send `GET https://allowed.example/… ` with `Host: attacker` and
+        // exfiltrate the credential cross-origin (and bypass the egress ACL).
+        // Requiring the two to agree collapses them to one destination; origin-
+        // form requests (no URI authority) are unaffected.
+        if split_host_rejected(req.uri(), req.headers()) {
+            return text_response(
+                StatusCode::FORBIDDEN,
+                "Blocked by sandlock: request-target host does not match the Host header",
+            );
+        }
+
         if !self.verify_host(&client_addr, &host).await {
             if let Ok(mut m) = self.orig_dest.write() {
                 m.remove(&client_addr);
@@ -174,34 +209,48 @@ impl AclService {
         // the deny path above — and only its name is recorded, never the value.
         for r in self.inject.iter() {
             if r.matches(&method, &host, &path) {
-                if r.apply(&mut parts).is_err() {
-                    // Rendering failed (e.g. the secret has bytes illegal in a
-                    // header) — fail the request rather than forward it with no
-                    // credential, which would look like an auth bug to the caller.
-                    eprintln!(
-                        "sandlock: credential {:?} could not be rendered for {} {}{} — rejecting",
-                        r.name, method, host, path
-                    );
-                    return text_response(
-                        StatusCode::BAD_GATEWAY,
-                        "Blocked by sandlock: credential could not be applied",
-                    );
+                match r.apply(&mut parts) {
+                    Err(()) => {
+                        // Rendering failed (e.g. the secret has bytes illegal in a
+                        // header) — fail the request rather than forward it with no
+                        // credential, which would look like an auth bug to the caller.
+                        eprintln!(
+                            "sandlock: credential {:?} could not be rendered for {} {}{} — rejecting",
+                            r.name, method, host, path
+                        );
+                        return text_response(
+                            StatusCode::BAD_GATEWAY,
+                            "Blocked by sandlock: credential could not be applied",
+                        );
+                    }
+                    Ok(crate::credential::Applied::Skipped) => {
+                        // add-only and the caller already set the target — keep
+                        // theirs and record it truthfully (not as an injection).
+                        eprintln!(
+                            "sandlock: kept caller-supplied credential {:?} for {} {}{} (add-only)",
+                            r.name, method, host, path
+                        );
+                    }
+                    Ok(crate::credential::Applied::Injected) => {
+                        eprintln!(
+                            "sandlock: injected credential {:?} for {} {}{}",
+                            r.name, method, host, path
+                        );
+                        // Fires for any caller (library/API, not just the CLI) since the
+                        // proxy is in core: the scheme is only known here at request time.
+                        // Once per run — over cleartext the secret is exposed on the wire.
+                        if first_cleartext_warn(scheme, &self.cleartext_warned) {
+                            eprintln!(
+                                "sandlock: warning: credential {:?} injected over cleartext HTTP (no TLS) \
+                                 to {} — the secret is exposed on the wire; prefer an HTTPS host \
+                                 (configure MITM via --http-ca / --http-inject-ca)",
+                                r.name, host
+                            );
+                        }
+                    }
                 }
-                eprintln!(
-                    "sandlock: injected credential {:?} for {} {}{}",
-                    r.name, method, host, path
-                );
-                // Fires for any caller (library/API, not just the CLI) since the
-                // proxy is in core: the scheme is only known here at request time.
-                // Once per run — over cleartext the secret is exposed on the wire.
-                if first_cleartext_warn(scheme, &self.cleartext_warned) {
-                    eprintln!(
-                        "sandlock: warning: credential {:?} injected over cleartext HTTP (no TLS) \
-                         to {} — the secret is exposed on the wire; prefer an HTTPS host \
-                         (configure MITM via --http-ca / --http-inject-ca)",
-                        r.name, host
-                    );
-                }
+                // First match wins whether it injected or deliberately kept the
+                // caller's value.
                 break;
             }
         }
@@ -224,7 +273,7 @@ fn text_response(status: StatusCode, msg: &str) -> Response<BoxBody<Bytes, BoxEr
 
 #[cfg(test)]
 mod tests {
-    use super::first_cleartext_warn;
+    use super::{first_cleartext_warn, split_host_rejected};
     use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
@@ -238,5 +287,28 @@ mod tests {
         assert!(!first_cleartext_warn("https", &fresh));
         assert!(!fresh.load(Ordering::Relaxed));
         assert!(first_cleartext_warn("http", &fresh));
+    }
+
+    fn rejected(uri: &str, host: Option<&str>) -> bool {
+        let uri: hyper::Uri = uri.parse().unwrap();
+        let mut headers = hyper::HeaderMap::new();
+        if let Some(h) = host {
+            headers.insert("host", h.parse().unwrap());
+        }
+        split_host_rejected(&uri, &headers)
+    }
+
+    #[test]
+    fn split_host_guard_rejects_only_a_real_mismatch() {
+        // The exfiltration case: absolute-form allowed host, spoofed Host header.
+        assert!(rejected("http://allowed.example/v1", Some("attacker.example")));
+        // Agreement (incl. case-insensitive, and a port on either side) is fine.
+        assert!(!rejected("http://allowed.example/v1", Some("allowed.example")));
+        assert!(!rejected("http://allowed.example/v1", Some("ALLOWED.EXAMPLE")));
+        assert!(!rejected("http://allowed.example/v1", Some("allowed.example:8080")));
+        assert!(!rejected("http://allowed.example:443/v1", Some("allowed.example")));
+        // Origin-form (no URI authority) and a missing Host header don't reject.
+        assert!(!rejected("/v1", Some("anything.example")));
+        assert!(!rejected("http://allowed.example/v1", None));
     }
 }
