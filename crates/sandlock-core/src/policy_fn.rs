@@ -106,9 +106,9 @@ pub struct SyscallEvent {
     /// Whether the supervisor denied this syscall.
     pub denied: bool,
     /// Resolved absolute path for file syscalls (openat, execve/execveat).
-    /// Read from the kernel's fd table via `/proc/<pid>/fd/<fd>` after the
-    /// supervisor's on-behalf open — not from child user memory — so it is
-    /// TOCTOU-safe. `None` for non-file syscalls or when resolution fails.
+    /// Read from child user memory, not TOCTOU-safe for enforcement but
+    /// sufficient for learn-mode observation.
+    /// `None` for non-file syscalls or when resolution fails.
     pub path: Option<std::path::PathBuf>,
     /// Open flags for openat (the `flags` argument, e.g. `O_RDONLY`,
     /// `O_WRONLY`, `O_CREAT`). `None` for non-openat syscalls.

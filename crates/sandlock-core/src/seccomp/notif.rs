@@ -1563,7 +1563,6 @@ async fn emit_policy_event(
             notif.data.args[1]
         };
         argv = read_argv_for_event(notif, argv_ptr, notif_fd);
-        // Binary path: resolved via procfs (TOCTOU-safe, not from child memory).
         path = resolve_path_for_notif(notif, notif_fd)
             .map(std::path::PathBuf::from);
     }
@@ -1603,7 +1602,6 @@ async fn emit_policy_event(
     }
 
     // openat(dirfd, pathname, flags, mode): resolved path + flags.
-    // Path is read via /proc/<pid>/fd after the on-behalf open — TOCTOU-safe.
     // openat2 uses struct open_how* for flags so flags is left None there.
     if nr == libc::SYS_openat || Some(nr) == arch::sys_open() {
         path = resolve_path_for_notif(notif, notif_fd)
