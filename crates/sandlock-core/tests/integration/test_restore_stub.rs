@@ -132,6 +132,17 @@ fn memfd_with(bytes: &[u8]) -> RawFd {
 fn restore_stub_trivial_image_runs() {
     if cfg!(not(target_arch = "x86_64")) { eprintln!("skip: x86_64 only"); return; }
     let stub = stub_binary();
+    // Skip gracefully (like the other cc-dependent tests) if build.rs could not
+    // compile the stub, e.g. no C compiler on the host.
+    if !stub.exists() {
+        eprintln!("skip: restore-stub not built ({})", stub.display());
+        return;
+    }
+    // Build the execve path BEFORE fork: CString::new allocates, and allocating
+    // between fork() and execve() in a multithreaded process (the test harness)
+    // can deadlock on the allocator lock. The child then only calls
+    // async-signal-safe dup2/execve. The pointers stay valid across fork.
+    let stub_path = std::ffi::CString::new(stub.to_str().unwrap()).unwrap();
 
     let blob = build_blob();
     let ctrl = memfd_with(&blob);
@@ -147,16 +158,17 @@ fn restore_stub_trivial_image_runs() {
     assert!(child >= 0, "fork");
     if child == 0 {
         // Child: place inherited fds at the fixed numbers, clear CLOEXEC, execve.
+        // Only async-signal-safe calls here (no allocation): stub_path is
+        // already built, and the argv/envp arrays are stack-only pointer arrays.
         unsafe {
             libc::dup2(ctrl, CTRL_FD);
             libc::dup2(ready, READY_FD);
             libc::dup2(go, GO_FD);
             libc::dup2(pipe_w, OUT_FD);
             // Ensure the fixed fds survive execve (dup2 clears CLOEXEC already).
-            let path = std::ffi::CString::new(stub.to_str().unwrap()).unwrap();
-            let argv = [path.as_ptr(), std::ptr::null()];
+            let argv = [stub_path.as_ptr(), std::ptr::null()];
             let envp = [std::ptr::null()];
-            libc::execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr());
+            libc::execve(stub_path.as_ptr(), argv.as_ptr(), envp.as_ptr());
             libc::_exit(127);
         }
     }
