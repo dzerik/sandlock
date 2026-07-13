@@ -81,7 +81,7 @@ fn copy_page(uffd: i32, image: &PageImage, addr: u64, page: usize) -> io::Result
         Some(s) => s,
         None => {
             // Nothing to serve: zero-fill so the faulting thread makes progress
-            // rather than hanging. (M1 images always cover their faults.)
+            // rather than hanging. (Restore images always cover their faults.)
             let zero = vec![0u8; page];
             let mut c = UffdioCopy {
                 dst: base, src: zero.as_ptr() as u64, len: page as u64, mode: 0, copy: 0,

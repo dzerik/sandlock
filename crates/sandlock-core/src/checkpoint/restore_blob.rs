@@ -1,9 +1,9 @@
 //! Compact binary control blob handed to the freestanding restore-stub through
 //! an inherited memfd. Carries region/fd metadata, the checkpoint's GP register
 //! file, and the anonymous page bytes; file-backed region bytes are NOT included
-//! (the stub maps those from their files in Milestone 2). Little-endian,
-//! versioned, append-only. The C stub in `tests/restore-stub.c` mirrors this
-//! layout byte-for-byte.
+//! (the stub maps those from their files in a later pass). Little-endian,
+//! versioned, append-only. The C stub in `checkpoint/restore-stub.c` mirrors
+//! this layout byte-for-byte.
 
 use crate::checkpoint::Checkpoint;
 
@@ -18,7 +18,7 @@ const NO_DATA: u64 = u64::MAX;
 pub(crate) fn serialize(cp: &Checkpoint) -> Vec<u8> {
     let ps = &cp.process_state;
 
-    // Only anonymous, captured regions carry bytes in M1. A region is "anon with
+    // Only anonymous, captured regions carry bytes. A region is "anon with
     // data" when a MemorySegment exists at its start.
     let n_regions = ps.memory_maps.len() as u32;
 
@@ -34,7 +34,7 @@ pub(crate) fn serialize(cp: &Checkpoint) -> Vec<u8> {
     out.extend_from_slice(&BLOB_MAGIC.to_le_bytes());
     out.extend_from_slice(&BLOB_VERSION.to_le_bytes());
     out.extend_from_slice(&n_regions.to_le_bytes());
-    out.extend_from_slice(&0u32.to_le_bytes()); // n_fds (M1: none)
+    out.extend_from_slice(&0u32.to_le_bytes()); // n_fds (none yet)
     out.extend_from_slice(&(regs_off as u64).to_le_bytes());
     out.extend_from_slice(&regs_len.to_le_bytes());
     out.extend_from_slice(&0u32.to_le_bytes()); // _pad
@@ -51,7 +51,7 @@ pub(crate) fn serialize(cp: &Checkpoint) -> Vec<u8> {
                 anon_blob.extend_from_slice(&s.data);
                 (0u8, off) // anon with data
             }
-            None => (1u8, NO_DATA), // file-backed / no captured data (M2 fills)
+            None => (1u8, NO_DATA), // file-backed / no captured data (filled from files later)
         };
         let prot = prot_bits(&m.perms);
         out.extend_from_slice(&m.start.to_le_bytes());
