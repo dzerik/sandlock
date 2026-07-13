@@ -1253,7 +1253,7 @@ fn maybe_patch_vdso(pid: i32, procfs: &mut super::state::ProcfsState, policy: &N
 /// Map a syscall number to a human-readable name for the policy callback.
 fn syscall_name(nr: i64) -> &'static str {
     match nr {
-        n if n == libc::SYS_openat => "openat",
+        n if n == libc::SYS_openat || n == arch::SYS_OPENAT2 => "openat",
         n if n == libc::SYS_connect => "connect",
         n if n == libc::SYS_sendto => "sendto",
         n if n == libc::SYS_sendmsg => "sendmsg",
@@ -1279,7 +1279,7 @@ fn syscall_name(nr: i64) -> &'static str {
 fn syscall_category(nr: i64) -> crate::policy_fn::SyscallCategory {
     use crate::policy_fn::SyscallCategory;
     match nr {
-        n if n == libc::SYS_openat || n == libc::SYS_unlinkat
+        n if n == libc::SYS_openat || n == arch::SYS_OPENAT2 || n == libc::SYS_unlinkat
             || n == libc::SYS_mkdirat || n == libc::SYS_renameat2
             || n == libc::SYS_symlinkat || n == libc::SYS_linkat
             || n == libc::SYS_fchmodat || n == libc::SYS_fchownat
@@ -1601,17 +1601,13 @@ async fn emit_policy_event(
         size = Some(notif.data.args[1]);
     }
 
-    // openat(dirfd, pathname, flags, mode): resolved path + flags.
-    // openat2 uses struct open_how* for flags so flags is left None there.
-    if nr == libc::SYS_openat || Some(nr) == arch::sys_open() {
-        path = resolve_path_for_notif(notif, notif_fd)
-            .map(std::path::PathBuf::from);
-        // openat: args[2] = flags; open: args[1] = flags
-        flags = Some(if nr == libc::SYS_openat {
-            notif.data.args[2]
-        } else {
-            notif.data.args[1]
-        });
+    // openat/openat2/open: resolved path + flags.
+    if nr == libc::SYS_openat || nr == arch::SYS_OPENAT2 || Some(nr) == arch::sys_open() {
+        if let Some(open_args) = decode_open_args(notif, notif_fd) {
+            path = resolve_path_for_notif(notif, notif_fd)
+                .map(std::path::PathBuf::from);
+            flags = Some(open_args.flags);
+        }
     }
 
     let event = crate::policy_fn::SyscallEvent {

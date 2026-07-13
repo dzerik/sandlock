@@ -21,6 +21,12 @@ const O_RDWR: u64 = 0o2;
 const O_CREAT: u64 = 0o100;
 
 fn is_write_open(flags: u64) -> bool {
+    // No valid open flag has bits 32+; a value that large is a pointer or
+    // garbage (e.g. from a mis-decoded syscall arg). Treat it as read-only
+    // so a misdecoded flag never puts a file in writes incorrectly.
+    if flags >> 32 != 0 {
+        return false;
+    }
     flags & (O_WRONLY | O_RDWR | O_CREAT) != 0
 }
 
