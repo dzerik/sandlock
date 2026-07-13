@@ -7,6 +7,13 @@ mod image;
 mod inject;
 mod regs;
 pub(crate) mod resume;
+pub(crate) mod restore_blob;
+
+/// Fixed inherited-fd convention for the execve restore-stub.
+pub(crate) const CTRL_FD: i32 = 3;   // control-blob memfd
+pub(crate) const READY_FD: i32 = 4;  // eventfd: stub -> supervisor ("uffd ready")
+pub(crate) const GO_FD: i32 = 5;     // eventfd: supervisor -> stub ("pager attached")
+pub(crate) const UFFD_SLOT: i32 = 6; // stub dup2's its userfaultfd here
 
 pub(crate) use capture::capture;
 
