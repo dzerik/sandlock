@@ -20,13 +20,12 @@ pub(crate) fn serialize(cp: &Checkpoint) -> Vec<u8> {
 
     // Only anonymous, captured regions carry bytes in M1. A region is "anon with
     // data" when a MemorySegment exists at its start.
-    let regions: Vec<&crate::checkpoint::MemoryMap> = ps.memory_maps.iter().collect();
-    let n_regions = regions.len() as u32;
+    let n_regions = ps.memory_maps.len() as u32;
 
     let regs_len = (ps.regs.len() * 8) as u32;
 
     // Layout: header | region table | regs | anon data
-    let region_table_len = regions.len() * REGION_ENTRY_LEN;
+    let region_table_len = ps.memory_maps.len() * REGION_ENTRY_LEN;
     let regs_off = HEADER_LEN + region_table_len;
     let anon_data_off = regs_off + regs_len as usize;
 
@@ -44,7 +43,7 @@ pub(crate) fn serialize(cp: &Checkpoint) -> Vec<u8> {
 
     // Region table. Compute each region's data_off into the anon blob as we go.
     let mut anon_blob: Vec<u8> = Vec::new();
-    for m in &regions {
+    for m in &ps.memory_maps {
         let seg = ps.memory_data.iter().find(|s| s.start == m.start);
         let (src, data_off) = match seg {
             Some(s) => {
@@ -130,6 +129,16 @@ mod tests {
         // One region, zero fds.
         assert_eq!(u32::from_le_bytes(blob[8..12].try_into().unwrap()), 1);
         assert_eq!(u32::from_le_bytes(blob[12..16].try_into().unwrap()), 0);
+
+        // Region-table entry (40 bytes at offset 40): the single region, byte-exact.
+        let r0 = 40usize;
+        assert_eq!(u64::from_le_bytes(blob[r0..r0 + 8].try_into().unwrap()), 0x4500_0000_0000, "region.start");
+        assert_eq!(u64::from_le_bytes(blob[r0 + 8..r0 + 16].try_into().unwrap()), 0x4500_0000_1000, "region.end");
+        assert_eq!(u32::from_le_bytes(blob[r0 + 16..r0 + 20].try_into().unwrap()),
+                   (libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) as u32, "region.prot");
+        assert_eq!(blob[r0 + 20], 0, "region.src = anon (has captured data)");
+        assert_eq!(u64::from_le_bytes(blob[r0 + 24..r0 + 32].try_into().unwrap()), 0, "region.file_off");
+        assert_eq!(u64::from_le_bytes(blob[r0 + 32..r0 + 40].try_into().unwrap()), 0, "region.data_off");
 
         // GP register area holds the 27 recognizable values.
         let regs_off = u64::from_le_bytes(blob[16..24].try_into().unwrap()) as usize;
