@@ -8,6 +8,7 @@ mod inject;
 mod regs;
 pub(crate) mod resume;
 pub(crate) mod restore_blob;
+pub(crate) mod pager;
 
 /// Fixed inherited-fd convention for the execve restore-stub.
 pub(crate) const CTRL_FD: i32 = 3;   // control-blob memfd
