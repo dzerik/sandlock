@@ -202,7 +202,21 @@ pub async fn run(args: LearnArgs) -> Result<()> {
 
     sampler.abort();
 
-    eprintln!("sandlock learn: done");
+    match result.exit_status {
+        sandlock_core::ExitStatus::Code(0) => eprintln!("sandlock learn: done"),
+        sandlock_core::ExitStatus::Code(n) => {
+            eprintln!("sandlock learn: process exited with code {n}, not writing profile");
+            std::process::exit(1);
+        }
+        sandlock_core::ExitStatus::Signal(sig) => {
+            eprintln!("sandlock learn: process killed by signal {sig}, not writing profile");
+            std::process::exit(1);
+        }
+        sandlock_core::ExitStatus::Killed | sandlock_core::ExitStatus::Timeout => {
+            eprintln!("sandlock learn: process terminated abnormally, not writing profile");
+            std::process::exit(1);
+        }
+    }
 
     let peak_rss_kb = peak_rss_kb_atomic.load(Ordering::Relaxed);
     let threads = max_threads.load(Ordering::Relaxed);
