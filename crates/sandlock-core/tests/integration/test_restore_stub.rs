@@ -115,7 +115,7 @@ fn eventfd() -> RawFd {
 
 fn memfd_with(bytes: &[u8]) -> RawFd {
     let name = b"restore-blob\0";
-    let fd = unsafe { libc::memfd_create(name.as_ptr() as *const i8, 0) } as i32;
+    let fd = unsafe { libc::memfd_create(name.as_ptr() as *const libc::c_char, 0) } as i32;
     assert!(fd >= 0, "memfd_create");
     let mut off = 0usize;
     while off < bytes.len() {

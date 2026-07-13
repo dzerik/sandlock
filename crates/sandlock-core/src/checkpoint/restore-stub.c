@@ -1,5 +1,5 @@
 /*
- * restore-stub — freestanding self-restore stub (x86_64).
+ * restore-stub: freestanding self-restore stub (x86_64).
  *
  * This is a core component of the checkpoint restore engine, not a test
  * fixture: the supervisor execs this stub into a fresh, fully-sandboxed process

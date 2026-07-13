@@ -13,7 +13,7 @@ fn main() {
         &repo_root.join("tests/rootfs-helper"),
         &["musl-gcc", "cc"],
         &["-static", "-O2"],
-        "cannot compile tests/rootfs-helper — chroot tests will fail. \
+        "cannot compile tests/rootfs-helper: chroot tests will fail. \
          Install musl-tools or static libc.",
     );
 
@@ -29,7 +29,7 @@ fn main() {
         &stub_bin,
         &["cc"],
         &["-static", "-nostdlib", "-no-pie", "-O2"],
-        "cannot compile restore-stub — M1 restore-stub tests will be skipped.",
+        "cannot compile restore-stub: its restore tests will be skipped.",
     );
     // Emit the path every run (rustc-env is not cached across build-script runs),
     // whether or not the binary was just (re)built.
