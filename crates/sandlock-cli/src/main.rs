@@ -210,6 +210,10 @@ struct LearnArgs {
     #[arg(short = 'o', long, value_name = "PATH")]
     output: Option<PathBuf>,
 
+    /// Kill the observed process after this many seconds and write a partial profile
+    #[arg(long, value_name = "SECS")]
+    timeout: Option<u64>,
+
     /// Command to observe (everything after --)
     #[arg(last = true, required = true)]
     cmd: Vec<String>,

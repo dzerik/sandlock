@@ -197,25 +197,64 @@ pub async fn run(args: LearnArgs) -> Result<()> {
         }
     });
 
-    let result = sandbox.wait().await
-        .map_err(|e| anyhow!("sandbox error: {e}"))?;
+    // Wait for the process, optionally with a timeout.
+    let timed_out = if let Some(secs) = args.timeout {
+        let deadline = std::time::Duration::from_secs(secs);
+        match tokio::time::timeout(deadline, sandbox.wait()).await {
+            Ok(r) => {
+                let result = r.map_err(|e| anyhow!("sandbox error: {e}"))?;
+                sampler.abort();
+                match result.exit_status {
+                    sandlock_core::ExitStatus::Code(0) => eprintln!("sandlock learn: done"),
+                    sandlock_core::ExitStatus::Code(n) => {
+                        eprintln!("sandlock learn: process exited with code {n}, not writing profile");
+                        std::process::exit(1);
+                    }
+                    sandlock_core::ExitStatus::Signal(sig) => {
+                        eprintln!("sandlock learn: process killed by signal {sig}, not writing profile");
+                        std::process::exit(1);
+                    }
+                    sandlock_core::ExitStatus::Killed | sandlock_core::ExitStatus::Timeout => {
+                        eprintln!("sandlock learn: process terminated abnormally, not writing profile");
+                        std::process::exit(1);
+                    }
+                }
+                false
+            }
+            Err(_elapsed) => {
+                // Timeout: kill the child, drain the supervisor, write a partial profile.
+                eprintln!("sandlock learn: timeout after {secs}s, killing process");
+                unsafe { libc::kill(child_pid as i32, libc::SIGKILL); }
+                // Drain without timeout so the supervisor releases its resources cleanly.
+                let _ = sandbox.wait().await;
+                sampler.abort();
+                true
+            }
+        }
+    } else {
+        let result = sandbox.wait().await
+            .map_err(|e| anyhow!("sandbox error: {e}"))?;
+        sampler.abort();
+        match result.exit_status {
+            sandlock_core::ExitStatus::Code(0) => eprintln!("sandlock learn: done"),
+            sandlock_core::ExitStatus::Code(n) => {
+                eprintln!("sandlock learn: process exited with code {n}, not writing profile");
+                std::process::exit(1);
+            }
+            sandlock_core::ExitStatus::Signal(sig) => {
+                eprintln!("sandlock learn: process killed by signal {sig}, not writing profile");
+                std::process::exit(1);
+            }
+            sandlock_core::ExitStatus::Killed | sandlock_core::ExitStatus::Timeout => {
+                eprintln!("sandlock learn: process terminated abnormally, not writing profile");
+                std::process::exit(1);
+            }
+        }
+        false
+    };
 
-    sampler.abort();
-
-    match result.exit_status {
-        sandlock_core::ExitStatus::Code(0) => eprintln!("sandlock learn: done"),
-        sandlock_core::ExitStatus::Code(n) => {
-            eprintln!("sandlock learn: process exited with code {n}, not writing profile");
-            std::process::exit(1);
-        }
-        sandlock_core::ExitStatus::Signal(sig) => {
-            eprintln!("sandlock learn: process killed by signal {sig}, not writing profile");
-            std::process::exit(1);
-        }
-        sandlock_core::ExitStatus::Killed | sandlock_core::ExitStatus::Timeout => {
-            eprintln!("sandlock learn: process terminated abnormally, not writing profile");
-            std::process::exit(1);
-        }
+    if timed_out {
+        eprintln!("sandlock learn: writing partial profile from observations before timeout");
     }
 
     let peak_rss_kb = peak_rss_kb_atomic.load(Ordering::Relaxed);
