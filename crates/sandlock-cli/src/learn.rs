@@ -89,6 +89,13 @@ impl LearnObserver {
         }
 
         match event.syscall.as_str() {
+            "execve" | "execveat" => {
+                if let Some(path) = event.path {
+                    self.reads.lock().unwrap().insert(path);
+                }
+                // Mark PID: read maps on next event after execve completes.
+                self.pending_maps.lock().unwrap().insert(event.pid);
+            }
             "openat" | "open" => {
                 if let Some(path) = event.path {
                     if let Some(fl) = event.flags {
@@ -100,12 +107,39 @@ impl LearnObserver {
                     }
                 }
             }
-            "execve" | "execveat" => {
-                if let Some(path) = event.path {
-                    self.reads.lock().unwrap().insert(path);
+            // mkdir/unlink/rmdir/symlink: Landlock MAKE_*/REMOVE_* are directory
+            // rights, so the parent dir is what sandlock run needs, not the target.
+            "mkdirat" | "unlinkat" | "symlinkat" => {
+                if let Some(p) = event.path {
+                    if let Some(parent) = p.parent() {
+                        self.writes.lock().unwrap().insert(parent.to_path_buf());
+                    }
                 }
-                // Mark PID: read maps on next event after execve completes.
-                self.pending_maps.lock().unwrap().insert(event.pid);
+            }
+            // rename: needs RENAME_OLD on parent of old path + RENAME_NEW on parent of new path.
+            "renameat2" => {
+                for p in [event.path, event.path2].into_iter().flatten() {
+                    if let Some(parent) = p.parent() {
+                        self.writes.lock().unwrap().insert(parent.to_path_buf());
+                    }
+                }
+            }
+            // link: source needs read access (ln doesn't open() it); dst parent needs MAKE_HARDLINK.
+            "linkat" => {
+                if let Some(src) = event.path {
+                    self.reads.lock().unwrap().insert(src);
+                }
+                if let Some(dst) = event.path2 {
+                    if let Some(parent) = dst.parent() {
+                        self.writes.lock().unwrap().insert(parent.to_path_buf());
+                    }
+                }
+            }
+            // truncate: LANDLOCK_ACCESS_FS_TRUNCATE applies to the file itself.
+            "truncate" => {
+                if let Some(p) = event.path {
+                    self.writes.lock().unwrap().insert(p);
+                }
             }
             // Simplified: connect is assumed TCP, sendto/sendmsg UDP.
             // Ideally we'd check SO_PROTOCOL on the socket fd (need emit_policy_event to expose that info in SyscallEvent)

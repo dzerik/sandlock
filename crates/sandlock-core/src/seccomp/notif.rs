@@ -1271,6 +1271,17 @@ fn syscall_name(nr: i64) -> &'static str {
         n if n == libc::SYS_getrandom => "getrandom",
         n if n == libc::SYS_unlinkat => "unlinkat",
         n if n == libc::SYS_mkdirat => "mkdirat",
+        n if n == libc::SYS_renameat2 => "renameat2",
+        n if n == libc::SYS_linkat => "linkat",
+        n if n == libc::SYS_symlinkat => "symlinkat",
+        n if n == libc::SYS_truncate => "truncate",
+        // Legacy single-path variants (x86_64 only).
+        n if Some(n) == arch::sys_mkdir() => "mkdirat",
+        n if Some(n) == arch::sys_rmdir() => "unlinkat",
+        n if Some(n) == arch::sys_unlink() => "unlinkat",
+        n if Some(n) == arch::sys_symlink() => "symlinkat",
+        n if Some(n) == arch::sys_link() => "linkat",
+        n if Some(n) == arch::sys_rename() => "renameat2",
         _ => "unknown",
     }
 }
@@ -1394,10 +1405,43 @@ fn resolve_path_for_notif(notif: &SeccompNotif, notif_fd: RawFd) -> Option<Strin
             let path = read_path_for_event(notif, notif.data.args[1], notif_fd)?;
             resolve_at_path_for_event(notif, notif.data.args[0] as i64, &path)
         }
-        // symlinkat/symlink intentionally omitted: creating a symlink does
-        // not access its target, so there is nothing to gate here. Any later
-        // open through the symlink resolves to the real target and is denied
-        // race-free on the open path (issue #111). See `on_behalf_open_for_deny`.
+        // mkdirat(dirfd, pathname, mode)
+        n if n == libc::SYS_mkdirat => {
+            let path = read_path_for_event(notif, notif.data.args[1], notif_fd)?;
+            resolve_at_path_for_event(notif, notif.data.args[0] as i64, &path)
+        }
+        // unlinkat(dirfd, pathname, flags)
+        n if n == libc::SYS_unlinkat => {
+            let path = read_path_for_event(notif, notif.data.args[1], notif_fd)?;
+            resolve_at_path_for_event(notif, notif.data.args[0] as i64, &path)
+        }
+        // symlinkat(target, newdirfd, linkpath): args[2] is the created symlink path.
+        // args[0] is the target string (not a filesystem path to grant rights on).
+        n if n == libc::SYS_symlinkat => {
+            let path = read_path_for_event(notif, notif.data.args[2], notif_fd)?;
+            resolve_at_path_for_event(notif, notif.data.args[1] as i64, &path)
+        }
+        // truncate(path, length): absolute path, no dirfd.
+        n if n == libc::SYS_truncate => {
+            let path = read_path_for_event(notif, notif.data.args[0], notif_fd)?;
+            resolve_at_path_for_event(notif, libc::AT_FDCWD as i64, &path)
+        }
+        // Legacy single-path variants: mkdir, rmdir, unlink share args[0]=path.
+        n if Some(n) == arch::sys_mkdir() || Some(n) == arch::sys_rmdir()
+            || Some(n) == arch::sys_unlink() =>
+        {
+            let path = read_path_for_event(notif, notif.data.args[0], notif_fd)?;
+            resolve_at_path_for_event(notif, libc::AT_FDCWD as i64, &path)
+        }
+        // symlink(target, linkpath): args[1] is the created symlink path.
+        n if Some(n) == arch::sys_symlink() => {
+            let path = read_path_for_event(notif, notif.data.args[1], notif_fd)?;
+            resolve_at_path_for_event(notif, libc::AT_FDCWD as i64, &path)
+        }
+        // symlinkat/symlink intentionally omitted from deny-path gating: creating
+        // a symlink does not access its target, so there is nothing to gate here.
+        // Any later open through the symlink resolves to the real target and is
+        // denied race-free on the open path (issue #111). See `on_behalf_open_for_deny`.
         // link(oldpath, newpath) — legacy, AT_FDCWD implied for both
         n if Some(n) == arch::sys_link() => {
             let path = read_path_for_event(notif, notif.data.args[0], notif_fd)?;
@@ -1552,6 +1596,7 @@ async fn emit_policy_event(
     let mut size = None;
     let mut argv = None;
     let mut path = None;
+    let mut path2 = None;
     let mut flags = None;
 
     if !denied && (nr == libc::SYS_execve || nr == libc::SYS_execveat) {
@@ -1610,6 +1655,19 @@ async fn emit_policy_event(
         }
     }
 
+    // mkdirat, unlinkat, symlinkat, truncate: single resolved path.
+    // renameat2, linkat (and their legacy equivalents): src path + dst path2.
+    let is_fs_mutating = nr == libc::SYS_mkdirat || nr == libc::SYS_unlinkat
+        || nr == libc::SYS_symlinkat || nr == libc::SYS_truncate
+        || nr == libc::SYS_renameat2 || nr == libc::SYS_linkat
+        || Some(nr) == arch::sys_mkdir() || Some(nr) == arch::sys_rmdir()
+        || Some(nr) == arch::sys_unlink() || Some(nr) == arch::sys_symlink()
+        || Some(nr) == arch::sys_link() || Some(nr) == arch::sys_rename();
+    if is_fs_mutating {
+        path = resolve_path_for_notif(notif, notif_fd).map(std::path::PathBuf::from);
+        path2 = resolve_second_path_for_notif(notif, notif_fd).map(std::path::PathBuf::from);
+    }
+
     let event = crate::policy_fn::SyscallEvent {
         syscall: name.to_string(),
         category,
@@ -1621,6 +1679,7 @@ async fn emit_policy_event(
         argv,
         denied,
         path,
+        path2,
         flags,
     };
 
