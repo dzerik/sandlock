@@ -431,7 +431,7 @@ async fn test_seccomp_cow_statx_created_file() {
         "buf = ctypes.create_string_buffer(256)\n",
         "AT_FDCWD = -100\n",
         "STATX_BASIC_STATS = 0x7ff\n",
-        "nr = 291 if platform.machine() == 'aarch64' else 332\n",
+        "nr = 291 if platform.machine() in ('aarch64', 'riscv64') else 332\n",
         "ret = libc.syscall(nr, AT_FDCWD, b'created.txt', 0, STATX_BASIC_STATS, buf)\n",
         "err = ctypes.get_errno()\n",
         "open('{out}', 'w').write('OK' if ret == 0 else f'FAIL:errno={{err}}')\n",
