@@ -936,12 +936,12 @@ pub(crate) async fn handle_cow_exec(
     notif_fd: RawFd,
 ) -> NotifAction {
     let nr = notif.data.nr as i64;
-    // execve(path, argv, envp):        args[0] = path
-    // execveat(dirfd, path, argv, ..): args[0]=dirfd, args[1]=path
-    let (dirfd, path_ptr, argv_ptr) = if nr == libc::SYS_execveat {
-        (notif.data.args[0] as i64, notif.data.args[1], notif.data.args[2])
+    // execve(path, argv, envp):              args[0]=path,  args[1]=argv, args[2]=envp
+    // execveat(dirfd, path, argv, envp, ..): args[1]=path, args[2]=argv, args[3]=envp
+    let (dirfd, path_ptr, argv_ptr, envp_ptr) = if nr == libc::SYS_execveat {
+        (notif.data.args[0] as i64, notif.data.args[1], notif.data.args[2], notif.data.args[3])
     } else {
-        (libc::AT_FDCWD as i64, notif.data.args[0], notif.data.args[1])
+        (libc::AT_FDCWD as i64, notif.data.args[0], notif.data.args[1], notif.data.args[2])
     };
 
     let rel_path = match read_path(notif, path_ptr, notif_fd) {
@@ -1018,7 +1018,7 @@ pub(crate) async fn handle_cow_exec(
     // address space on success, so a write past the original buffer is
     // harmless.
     if crate::seccomp::notif::rewrite_exec_path_to_fd(
-        notif_fd, notif.id, notif.pid, path_ptr, argv_ptr, child_fd,
+        notif_fd, notif.id, notif.pid, path_ptr, argv_ptr, envp_ptr, child_fd,
     )
     .is_err()
     {
