@@ -320,7 +320,8 @@ pub async fn run(args: LearnArgs) -> Result<()> {
                 if p.exists() {
                     Some(p.clone())
                 } else {
-                    p.parent().filter(|d| d.exists()).map(|d| d.to_path_buf())
+                    // Walk up to the nearest existing ancestor.
+                    p.ancestors().skip(1).find(|a| a.exists()).map(|a| a.to_path_buf())
                 }
             })
             .collect(),
