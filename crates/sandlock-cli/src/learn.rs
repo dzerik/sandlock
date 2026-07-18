@@ -14,6 +14,17 @@ use sandlock_core::profile::{FilesystemSection, ProfileInput};
 use sandlock_core::sandbox::BranchAction;
 use sandlock_core::Sandbox;
 
+/// Returns true for pid/session-specific paths that are meaningless across runs.
+fn is_junk_path(p: &std::path::Path) -> bool {
+    let b = p.as_os_str().as_bytes();
+    // /proc/self/... and /proc/<pid>/... are pid-specific;
+    let proc_pid = b.starts_with(b"/proc/self")
+        || (b.starts_with(b"/proc/") && b.get(6).map_or(false, u8::is_ascii_digit));
+    proc_pid
+        || b.starts_with(b"/dev/pts/") || b == b"/dev/pts"
+        || b.starts_with(b"/dev/tty")
+}
+
 use crate::LearnArgs;
 
 // openat flags (from fcntl.h)
@@ -307,7 +318,7 @@ pub async fn run(args: LearnArgs) -> Result<()> {
         // Filter reads by existence to drop failed PATH-probe openats.
         // Executed binaries are merged into read.
         read: observer.reads.lock().unwrap().iter()
-            .filter(|p| p.exists())
+            .filter(|p| p.exists() && !is_junk_path(p))
             .cloned()
             .collect(),
         // For writes: if the file exists on the real FS, record the specific path
@@ -316,6 +327,7 @@ pub async fn run(args: LearnArgs) -> Result<()> {
         // record the parent directory instead; Landlock requires existing paths,
         // and the program needs directory write access to create new files.
         write: observer.writes.lock().unwrap().iter()
+            .filter(|p| !is_junk_path(p))
             .filter_map(|p| {
                 if p.exists() {
                     Some(p.clone())
