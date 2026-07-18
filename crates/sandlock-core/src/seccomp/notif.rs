@@ -1629,6 +1629,8 @@ async fn emit_policy_event(
     // sendmsg/sendmmsg: sockaddr is inside struct msghdr at args[1].
     // msghdr layout: msg_name ptr (u64 @ offset 0), msg_namelen u32 (@ offset 8).
     // For sendmmsg the first mmsghdr entry's msghdr starts at offset 0, same layout.
+    // TODO: only the first of args[2] mmsghdr entries is decoded; remaining
+    // destinations are missed. Full fix requires returning Vec<SyscallEvent>.
     if nr == libc::SYS_sendmsg || nr == libc::SYS_sendmmsg {
         if let Ok(hdr) = read_child_mem(notif_fd, notif.id, notif.pid, notif.data.args[1], 12) {
             if hdr.len() >= 12 {
