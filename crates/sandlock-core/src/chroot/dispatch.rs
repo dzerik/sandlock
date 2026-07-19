@@ -420,15 +420,24 @@ pub(crate) async fn handle_chroot_open(
                     }
                     Ok(None) => {
                         // Fall through to openat2_in_root below. This keeps
-                        // directory opens and other non-COW cases confined to
-                        // the chroot instead of executing the original host
-                        // syscall.
+                        // directory opens and other non-COW / non-whiteout
+                        // cases confined to the chroot instead of executing the
+                        // original host syscall. (Whiteouts are handled by the
+                        // BranchError::Deleted arm below, not here.)
                     }
                     Err(crate::error::BranchError::QuotaExceeded) => {
                         return NotifAction::Errno(libc::ENOSPC);
                     }
                     Err(crate::error::BranchError::Exists) => {
                         return NotifAction::Errno(libc::EEXIST);
+                    }
+                    Err(crate::error::BranchError::Deleted) => {
+                        // Whiteout read-open: the lower file still physically
+                        // exists, but the branch deleted it. Return ENOENT
+                        // rather than leaking pre-delete bytes — parity with the
+                        // async cow open path (cow/dispatch.rs) and
+                        // stat/statx/access/readlink.
+                        return NotifAction::Errno(libc::ENOENT);
                     }
                     Err(_) => return NotifAction::Errno(libc::EIO),
                 }

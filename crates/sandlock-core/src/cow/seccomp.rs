@@ -386,7 +386,12 @@ impl SeccompCowBranch {
             if flags & O_CREAT != 0 {
                 return self.ensure_cow_copy(&rel).map(Some);
             }
-            return Ok(None);
+            // Whiteout: the lower file still physically exists with its
+            // pre-delete bytes. Surface the deletion so the caller returns
+            // ENOENT rather than falling through to the lower file — matching
+            // the async prepare_open (CowOpenPlan::Deleted) and the stat/access
+            // handlers.
+            return Err(BranchError::Deleted);
         }
 
         // O_EXCL: fail if file already exists (in upper or lower)
@@ -1405,6 +1410,22 @@ mod tests {
         // O_RDONLY
         let plan = branch.prepare_open(&path, 0).unwrap();
         assert!(matches!(plan, CowOpenPlan::Deleted));
+    }
+
+    #[test]
+    fn test_handle_open_read_deleted_reports_deleted() {
+        // Sync mirror of test_prepare_open_read_deleted_reports_deleted: the
+        // chroot dispatcher calls the sync handle_open, so a read-only open of a
+        // whiteout must surface BranchError::Deleted (mapped to ENOENT at the
+        // chroot call site) instead of Ok(None), which fell through to the
+        // untouched lower file and leaked its pre-delete bytes.
+        let (workdir, storage) = setup_workdir();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        branch.mark_deleted("existing.txt");
+        let path = abs(&branch, "existing.txt");
+        // O_RDONLY
+        let err = branch.handle_open(&path, 0).unwrap_err();
+        assert!(matches!(err, BranchError::Deleted));
     }
 
     #[test]
