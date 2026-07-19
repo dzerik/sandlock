@@ -96,6 +96,19 @@ fn collapse_write_paths(writes: &BTreeSet<PathBuf>) -> Vec<PathBuf> {
     out.into_iter().collect()
 }
 
+/// Remove paths that are already covered by a shorter ancestor in the same list.
+/// Landlock PATH_BENEATH grants are recursive, so if /usr/lib is in the list,
+/// /usr/lib/x86_64/libfoo.so is redundant and can be dropped.
+fn dedup_subsumed(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let set: std::collections::HashSet<PathBuf> = paths.iter().cloned().collect();
+    paths.into_iter()
+        .filter(|p| {
+            // Keep p unless one of its strict ancestors is already in the set.
+            !p.ancestors().skip(1).any(|a| set.contains(a))
+        })
+        .collect()
+}
+
 /// Returns true for pid/session-specific paths that are meaningless across runs.
 fn is_junk_path(p: &std::path::Path) -> bool {
     let b = p.as_os_str().as_encoded_bytes();
@@ -397,11 +410,13 @@ pub async fn run(args: LearnArgs) -> Result<()> {
     profile_out.filesystem = FilesystemSection {
         // Filter reads by existence to drop failed PATH-probe openats.
         // Executed binaries are merged into read.
-        read: observer.reads.lock().unwrap().iter()
-            .filter(|p| p.exists() && !is_junk_path(p))
-            .cloned()
-            .collect(),
-        write: collapse_write_paths(&observer.writes.lock().unwrap()),
+        read: dedup_subsumed(
+            observer.reads.lock().unwrap().iter()
+                .filter(|p| p.exists() && !is_junk_path(p))
+                .cloned()
+                .collect()
+        ),
+        write: dedup_subsumed(collapse_write_paths(&observer.writes.lock().unwrap())),
         ..Default::default()
     };
     profile_out.network.allow = observer.connects.lock().unwrap().iter().cloned().collect();

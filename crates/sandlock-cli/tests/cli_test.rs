@@ -895,3 +895,30 @@ fn test_write_collapse_warns_sensitive() {
         "expected observed-vs-granted diff in stderr, got: {stderr}",
     );
 }
+
+/// When a directory and a file under it both appear in the reads list,
+/// dedup must remove the file — the directory's PATH_BENEATH grant already covers it.
+#[test]
+fn test_read_dedup_removes_leaf_when_ancestor_present() {
+    // ls opens /etc as a directory read; cat opens /etc/hostname as a file read.
+    // Both end up in the observed reads set. After dedup, /etc/hostname must be gone.
+    let output = sandlock_bin()
+        .args(["learn", "--", "sh", "-c", "ls /etc > /dev/null && cat /etc/hostname"])
+        .output()
+        .expect("failed to run sandlock learn");
+    assert!(
+        output.status.success(),
+        "sandlock learn failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let read_line = stdout.lines().find(|l| l.starts_with("read = [")).unwrap_or("");
+    assert!(
+        read_line.contains("/etc"),
+        "expected /etc in reads, got: {read_line}",
+    );
+    assert!(
+        !read_line.contains("/etc/hostname"),
+        "expected /etc/hostname removed by dedup (covered by /etc), got: {read_line}",
+    );
+}
