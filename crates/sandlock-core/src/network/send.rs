@@ -21,7 +21,7 @@ use super::unix::{
     mmsg_entry_named_unix_path, sendmmsg_named_unix_on_behalf, sendto_named_unix_on_behalf,
     unix_sendmsg_gate,
 };
-use super::verdict::{check_ip_destination, path_under_any};
+use super::verdict::{check_ip_destination, classify_send_path, path_under_any, SendPath};
 use super::{query_socket_protocol, socket_is_unix, Protocol};
 
 // ============================================================
@@ -127,7 +127,54 @@ pub(super) async fn sendto_on_behalf(
                     )
                 }
             }
-            _ => NotifAction::Continue,
+            _ => {
+                // Non-IP destination with no fs-path gate: an abstract unix
+                // address, a named unix address with the fs-gate off, or a non-IP
+                // address on a non-unix socket. With NO destination policy there
+                // is nothing to bypass, so Continue (matching the connected fast
+                // path). Under a destination policy do NOT Continue: the kernel
+                // would re-read `sockfd` and the address after our decision, and a
+                // racing `dup2(inet_sock, sockfd)` + address swap could ride the
+                // Continue out to a denied IP. Pin the fd and gate on its STABLE
+                // socket domain instead. NOTE: this fails closed for non-IP sends
+                // on non-unix/non-IP datagram families (AF_PACKET/AF_VSOCK/...)
+                // under a destination policy — see the PR description.
+                if !ctx.policy.has_net_destination_policy {
+                    return NotifAction::Continue;
+                }
+                let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
+                    Ok(fd) => fd,
+                    Err(e) => return NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EBADF)),
+                };
+                // The address is non-IP here (parse_ip_from_sockaddr returned
+                // None), so classify on the pinned socket's stable domain.
+                match classify_send_path(false, None, socket_is_unix(dup_fd.as_raw_fd())) {
+                    SendPath::UnixOnBehalf => {
+                        let data =
+                            match read_child_mem(notif_fd, notif.id, notif.pid, buf_ptr, buf_len) {
+                                Ok(b) => b,
+                                Err(_) => return NotifAction::Errno(libc::EIO),
+                            };
+                        let m = MaterializedMsg {
+                            data,
+                            control: None,
+                            addr: addr_bytes,
+                            _scm_fds: Vec::new(),
+                            _pinned: None,
+                        };
+                        let blocking = wants_blocking(dup_fd.as_raw_fd(), flags);
+                        resolve_send(dup_fd, m, flags, blocking)
+                    }
+                    // Reject (non-IP address on a non-unix socket — the
+                    // address-family-swap shape) and, defensively, the
+                    // connected/IP variants that classify_send_path(false, None, _)
+                    // cannot return: fail closed with an errno (parity with the
+                    // sendmsg Reject arm) rather than panic in the seccomp-notif
+                    // supervisor — a panic on this untrusted path would unwind the
+                    // supervisor task and DoS the whole sandbox.
+                    _ => NotifAction::Errno(libc::EAFNOSUPPORT),
+                }
+            }
         }
     }
 }
