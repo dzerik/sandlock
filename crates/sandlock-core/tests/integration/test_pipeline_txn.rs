@@ -8,6 +8,7 @@
 use sandlock_core::sandbox::BranchAction;
 use sandlock_core::{Sandbox, Stage};
 use std::fs;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -68,6 +69,59 @@ async fn test_txn_pipeline_commits_on_success() {
     assert!(workdir.join("b.txt").exists(), "b.txt must be committed to workdir");
     assert_eq!(fs::read_to_string(workdir.join("a.txt")).unwrap(), "plan\n");
 
+    let _ = fs::remove_dir_all(&workdir);
+}
+
+/// First-committer-win: while another commit holds the workdir lock, a
+/// transaction that ran every stage to success still does NOT commit — it loses
+/// the race benignly (committed=false + abort_reason) instead of erroring or
+/// racing the file-by-file merge and corrupting the workdir.
+#[tokio::test]
+async fn test_txn_pipeline_loses_first_committer_win_race() {
+    if !sandbox_available().await {
+        eprintln!("first-committer-win test skipped: sandbox unavailable");
+        return;
+    }
+    let workdir = temp_dir("first-committer-win");
+    let policy = stage_policy(&workdir);
+
+    // Simulate a concurrent transaction mid-commit by holding the workdir lock.
+    let held = std::fs::File::open(&workdir).unwrap();
+    assert_eq!(
+        unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0,
+        "test setup: could not take the workdir lock"
+    );
+
+    // Every stage succeeds, so the pipeline reaches commit; the held lock makes it
+    // lose the race. run_transactional must return Ok — a lost race is not an error.
+    let pipeline = Stage::new(&policy, &["sh", "-c", "echo plan > a.txt"])
+        | Stage::new(&policy, &["sh", "-c", "cat a.txt && echo built > b.txt"]);
+    let outcome = pipeline
+        .run_transactional(None)
+        .await
+        .expect("a lost first-committer-win race is a benign outcome, not an error");
+
+    assert!(
+        !outcome.committed,
+        "must not commit while another commit holds the workdir lock"
+    );
+    assert!(
+        outcome
+            .abort_reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("first-committer-win"),
+        "abort_reason should name the lost race, got: {:?}",
+        outcome.abort_reason
+    );
+    // Nothing may have been merged into the workdir.
+    assert!(
+        !workdir.join("a.txt").exists() && !workdir.join("b.txt").exists(),
+        "no stage output may be committed when the race is lost"
+    );
+
+    drop(held);
     let _ = fs::remove_dir_all(&workdir);
 }
 

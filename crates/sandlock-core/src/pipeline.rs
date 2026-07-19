@@ -278,16 +278,47 @@ async fn run_pipeline_txn(
     // Take the branch out from under the async mutex first, then commit/abort the
     // owned value so the sync merge doesn't run while holding the guard.
     let taken = { state.lock().await.branch.take() };
-    let (all_ok, results, reason, drive_err) = match driven {
+    let (all_ok, results, mut reason, drive_err) = match driven {
         Ok((ok, res, rsn)) => (ok, res, rsn, None),
         Err(e) => (false, Vec::new(), Some(format!("{e}")), Some(e)),
     };
     let committed = match taken {
         Some(mut branch) if all_ok => {
-            branch
-                .commit()
-                .map_err(|e| child_err(format!("transactional pipeline: commit failed: {e}")))?;
-            true
+            // First-committer-win: take an exclusive, non-blocking lock on the
+            // shared workdir for the duration of the merge. commit() rewrites the
+            // workdir file-by-file, so two concurrent transactional pipelines
+            // committing into one workdir would interleave and corrupt it. A
+            // pipeline that finds the lock held LOSES the race — a benign
+            // non-commit outcome (committed=false + abort_reason), not an error,
+            // and its upper is aborted. (The lock is scoped to the transactional
+            // commit here, not the single-sandbox commit() path.)
+            let lock = std::fs::File::open(&workdir).map_err(|e| {
+                child_err(format!("transactional pipeline: open workdir for commit lock: {e}"))
+            })?;
+            if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                let err = std::io::Error::last_os_error();
+                // EWOULDBLOCK (== EAGAIN on Linux) means another commit holds the
+                // lock: lose the race benignly. Any other errno is a real failure.
+                if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                    let _ = branch.abort();
+                    reason = Some(
+                        "transactional pipeline: lost the first-committer-win race \
+                         (another commit is in progress on this workdir)"
+                            .to_string(),
+                    );
+                    false
+                } else {
+                    return Err(child_err(format!(
+                        "transactional pipeline: commit lock: {err}"
+                    )));
+                }
+            } else {
+                branch.commit().map_err(|e| {
+                    child_err(format!("transactional pipeline: commit failed: {e}"))
+                })?;
+                drop(lock); // release the workdir lock after the merge
+                true
+            }
         }
         Some(mut branch) => {
             let _ = branch.abort();
