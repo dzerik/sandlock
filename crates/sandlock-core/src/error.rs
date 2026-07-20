@@ -120,6 +120,13 @@ pub enum BranchError {
 
     #[error("file already exists")]
     Exists,
+
+    /// The path was deleted in this branch (a whiteout). The lower file still
+    /// physically exists with its pre-delete bytes, so the open call site must
+    /// return `ENOENT` instead of falling through to it. Sync mirror of the
+    /// async `CowOpenPlan::Deleted`.
+    #[error("file was deleted in this branch")]
+    Deleted,
 }
 
 /// Convenience type alias.

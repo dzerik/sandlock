@@ -516,6 +516,60 @@ async fn test_chroot_with_cow() {
     cleanup_rootfs(&rootfs);
 }
 
+/// A file deleted in the COW branch (a whiteout) must return ENOENT on a
+/// read-open under CHROOT mode — the sync `handle_open` path. Before the fix,
+/// `handle_open` returned `Ok(None)` for the whiteout and `chroot/dispatch.rs`
+/// fell through to `openat2_in_root` on the still-present lower file, leaking the
+/// pre-delete bytes. This is the chroot-mode sibling of the async
+/// `test_seccomp_cow_read_deleted_file_is_enoent`, and it exercises the real
+/// dispatch arm (not just the branch object): `cat` issues a bare
+/// `open(O_RDONLY)` with no preceding `stat` (rootfs-helper.c), so it drives the
+/// open path rather than short-circuiting on the (correct) stat ENOENT.
+#[tokio::test]
+async fn test_chroot_cow_read_deleted_file_is_enoent() {
+    let rootfs = build_test_rootfs("cow-read-deleted");
+    let tmp_dir = rootfs.join("tmp");
+    // Seed the LOWER file with sentinel content that must never leak.
+    fs::write(tmp_dir.join("secret.txt"), "PREDELETE").unwrap();
+
+    let policy = Sandbox::builder()
+        .chroot(&rootfs)
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_write("/tmp")
+        .workdir(&tmp_dir)
+        .on_exit(BranchAction::Abort)
+        .build()
+        .unwrap();
+
+    // `rm` marks the file deleted in the branch (whiteout); `cat` then
+    // bare-opens it in the same cage/branch. With the fix the open returns
+    // ENOENT and nothing is printed; without it the untouched lower "PREDELETE"
+    // bytes leak to stdout. (rootfs-helper's `sh -c` dispatches applets
+    // in-process, so `rm` and `cat` share one COW branch.)
+    let result = policy
+        .clone()
+        .with_name("test")
+        .run(&["rootfs-helper", "sh", "-c", "rm /tmp/secret.txt; cat /tmp/secret.txt"])
+        .await;
+    match result {
+        Ok(r) => {
+            let stdout = r.stdout_str().unwrap_or("").to_string();
+            assert!(
+                !stdout.contains("PREDELETE"),
+                "pre-delete lower bytes leaked through the chroot read path (stdout: {:?})",
+                stdout
+            );
+        }
+        Err(e) => eprintln!("Chroot test skipped: {}", e),
+    }
+
+    cleanup_rootfs(&rootfs);
+}
+
 /// readlink /proc/self/root returns /
 #[tokio::test]
 async fn test_chroot_proc_self_root() {
