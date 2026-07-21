@@ -21,7 +21,7 @@
 use std::os::unix::io::AsRawFd;
 use std::time::Duration;
 
-use crate::error::{SandboxRuntimeError, SandlockError};
+use crate::error::{SandboxError, SandboxRuntimeError, SandlockError};
 use crate::pipeline::Stage;
 use crate::result::{ExitStatus, RunResult};
 
@@ -84,42 +84,101 @@ impl Transaction {
     /// (its path is named in the error) so the remainder stays recoverable.
     pub async fn run(self, timeout: Option<Duration>) -> Result<TxnOutcome, SandlockError> {
         validate_txn_stages(&self.stages)?;
-        run_txn(self.stages, timeout).await
+        run_txn(self.stages, timeout, Disposition::Commit).await
     }
+
+    /// Run every stage and report what the transaction *would* change, then
+    /// discard it. Nothing is ever merged into the workdir.
+    ///
+    /// The stages really execute — this predicts the filesystem effect on the
+    /// workdir, not the effect of running the commands. Same contract as
+    /// [`Sandbox::dry_run`](crate::sandbox::Sandbox::dry_run) for one sandbox.
+    /// The outcome always has `committed == false` and
+    /// `abort_reason == Some(`[`AbortReason::DryRun`]`)` unless a stage failed
+    /// or the transaction timed out first.
+    pub async fn dry_run(self, timeout: Option<Duration>) -> Result<TxnOutcome, SandlockError> {
+        validate_txn_stages(&self.stages)?;
+        run_txn(self.stages, timeout, Disposition::DryRun).await
+    }
+}
+
+/// What to do with the shared upper once every stage has succeeded.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Disposition {
+    Commit,
+    DryRun,
 }
 
 // ============================================================
 // Outcome
 // ============================================================
 
-/// Outcome of [`Transaction::run`].
-#[derive(Debug, Clone)]
-pub struct TxnOutcome {
-    /// True if every stage exited 0 and the shared upper was committed to the
-    /// workdir. False if any stage failed (or the pipeline timed out) and the
-    /// upper was discarded, leaving the workdir byte-identical.
-    pub committed: bool,
-    /// Per-stage results in execution order. On a stage-failure abort this holds
-    /// the stages that ran, up to and including the one that failed. On a timeout
-    /// or driver-error abort it is empty: the in-flight stage-driver future is
-    /// cancelled and its accumulated results are dropped (`committed` and
-    /// `abort_reason` still report the outcome).
-    pub stages: Vec<RunResult>,
-    /// Human-readable reason the transaction aborted; `None` when committed.
-    pub abort_reason: Option<String>,
+/// Why a transaction did not commit.
+///
+/// `#[non_exhaustive]`: RFC #65 defers merge-conflict reporting to Phase 2, so
+/// at least one more variant is expected. Match with a `_` arm.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AbortReason {
+    /// Stage `index` (0-based, in declaration order) did not exit 0. Later
+    /// stages were not run.
+    StageFailed { index: usize, status: ExitStatus },
+    /// The stage phase exceeded the transaction's timeout. The in-flight stage
+    /// was killed; `TxnOutcome::stages` holds the stages that had completed.
+    TimedOut,
+    /// [`Transaction::dry_run`] completed: every stage succeeded and the upper
+    /// was discarded on purpose rather than merged.
+    DryRun,
 }
 
+impl std::fmt::Display for AbortReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AbortReason::StageFailed { index, status } => {
+                write!(f, "stage {index} did not exit cleanly: {status:?}")
+            }
+            AbortReason::TimedOut => write!(f, "the transaction timed out"),
+            AbortReason::DryRun => write!(f, "dry run: changes were reported, not committed"),
+        }
+    }
+}
+
+/// Outcome of [`Transaction::run`] / [`Transaction::dry_run`].
+#[derive(Debug, Clone)]
+#[must_use = "a transaction can finish without committing; inspect `committed`"]
+pub struct TxnOutcome {
+    /// True if every stage exited 0 and the shared upper was merged into the
+    /// workdir. False if any stage failed, the transaction timed out, or this
+    /// was a dry run — in all of which the workdir is byte-identical to before.
+    pub committed: bool,
+    /// Per-stage results in execution order, holding every stage that ran —
+    /// including on an abort, and including the partial run recorded before a
+    /// timeout cancelled the in-flight stage.
+    pub stages: Vec<RunResult>,
+    /// The filesystem changes the shared upper held at the end of the run, i.e.
+    /// what the commit merged (or, when not committed, what was discarded).
+    /// Captured from the branch before it is disposed of.
+    pub changes: Vec<crate::dry_run::Change>,
+    /// Why the transaction did not commit; `None` when it did.
+    pub abort_reason: Option<AbortReason>,
+}
+
+// ============================================================
+// Validation
+// ============================================================
+
 /// Reject stage configurations that can't participate in a transaction. The
-/// pipeline owns the single shared upper and the single commit/abort, so each
+/// transaction owns the single shared upper and the single commit/abort, so each
 /// stage must set the same workdir, keep the supervisor, and not carry its own
 /// branch action.
+///
+/// These are configuration errors, reported as [`SandboxError::Invalid`] so a
+/// misconfigured transaction is distinguishable from a child-process failure.
 fn validate_txn_stages(stages: &[Stage]) -> Result<(), SandlockError> {
     fn reject(msg: impl Into<String>) -> SandlockError {
-        SandlockError::Runtime(SandboxRuntimeError::Child(msg.into()))
+        SandlockError::Sandbox(SandboxError::Invalid(msg.into()))
     }
 
-    // `Pipeline::new` enforces >= 2, but the struct is constructible directly;
-    // check here so `run_transactional` never indexes `stages[0]` out of bounds.
     if stages.len() < 2 {
         return Err(reject("transaction requires at least 2 stages"));
     }
@@ -174,12 +233,17 @@ fn validate_txn_stages(stages: &[Stage]) -> Result<(), SandlockError> {
     Ok(())
 }
 
+// ============================================================
+// Coordinator
+// ============================================================
+
 /// Create the shared COW branch, drive the stages sequentially over it, then
 /// commit-all or abort-all. The branch lives here (outside the driven future)
 /// so a timeout that cancels the stage loop can still abort cleanly.
 async fn run_txn(
     stages: Vec<Stage>,
     timeout: Option<Duration>,
+    disposition: Disposition,
 ) -> Result<TxnOutcome, SandlockError> {
     fn child_err(msg: String) -> SandlockError {
         SandlockError::Runtime(SandboxRuntimeError::Child(msg))
@@ -201,11 +265,15 @@ async fn run_txn(
     let state = std::sync::Arc::new(tokio::sync::Mutex::new(cow_state));
     let shared = crate::sandbox::SharedCow { state: std::sync::Arc::clone(&state), upper_dir: upper_dir.clone() };
 
-    let drive = drive_txn_stages(stages, shared);
-    let driven: Result<(bool, Vec<RunResult>, Option<String>), SandlockError> = match timeout {
+    // Stage results are accumulated through a handle the coordinator also holds,
+    // so a timeout that cancels the driver future does not take the completed
+    // stages' results down with it.
+    let results = std::sync::Arc::new(std::sync::Mutex::new(Vec::<RunResult>::new()));
+    let drive = drive_txn_stages(stages, shared, std::sync::Arc::clone(&results));
+    let driven: Result<Option<AbortReason>, SandlockError> = match timeout {
         Some(dur) => match tokio::time::timeout(dur, drive).await {
             Ok(r) => r,
-            Err(_) => Ok((false, Vec::new(), Some("the transaction timed out".to_string()))),
+            Err(_) => Ok(Some(AbortReason::TimedOut)),
         },
         None => drive.await,
     };
@@ -213,51 +281,75 @@ async fn run_txn(
     // Finalize the shared upper in EVERY case — commit only on a clean full run,
     // otherwise discard — before propagating any driver error, so a mid-loop
     // failure never leaves the upper dangling. (`SeccompCowBranch`'s Drop is a
-    // further backstop for panics/cancellation; this is the deterministic path.)
+    // further backstop for a panic between here and the disposition.)
     // Take the branch out from under the async mutex first, then commit/abort the
     // owned value so the sync merge doesn't run while holding the guard.
     let taken = { state.lock().await.branch.take() };
-    let (all_ok, results, reason, drive_err) = match driven {
-        Ok((ok, res, rsn)) => (ok, res, rsn, None),
-        Err(e) => (false, Vec::new(), Some(format!("{e}")), Some(e)),
+    let (mut reason, drive_err) = match driven {
+        Ok(rsn) => (rsn, None),
+        Err(e) => (None, Some(e)),
     };
+    let all_ok = reason.is_none() && drive_err.is_none();
+
+    // The branch is about to be disposed of, so read the change set first: after
+    // a commit or an abort the upper is gone and there is nothing left to report.
+    let mut changes = Vec::new();
     let committed = match taken {
-        Some(mut branch) if all_ok => {
-            // Serialize the merge against any other transaction
-            // committing into this workdir. commit() rewrites the
-            // workdir file-by-file, so two merges interleaving would
-            // tear it. This is mutual exclusion between merges, NOT
-            // serializable isolation: a transaction that snapshotted
-            // before another one committed still merges over that
-            // result (last writer wins per file). The lock is also
-            // scoped to transactions — a plain Sandbox committing its
-            // own branch into the same workdir does not take it.
-            let lock = acquire_commit_lock(&workdir, COMMIT_LOCK_WAIT)
-                .await
-                .map_err(child_err)?;
-            branch.commit().map_err(|e| {
-                child_err(format!(
-                    "transaction: commit failed: {e}. The workdir is partially merged \
-                     and the unmerged remainder was preserved at {}",
-                    upper_dir.display()
-                ))
-            })?;
-            drop(lock); // release the workdir lock after the merge
-            true
-        }
         Some(mut branch) => {
-            let _ = branch.abort();
-            false
+            changes = branch.changes().unwrap_or_default();
+            match (all_ok, disposition) {
+                (true, Disposition::Commit) => {
+                    // Serialize the merge against any other transaction
+                    // committing into this workdir. commit() rewrites the
+                    // workdir file-by-file, so two merges interleaving would
+                    // tear it. This is mutual exclusion between merges, NOT
+                    // serializable isolation: a transaction that snapshotted
+                    // before another one committed still merges over that
+                    // result (last writer wins per file). The lock is also
+                    // scoped to transactions — a plain Sandbox committing its
+                    // own branch into the same workdir does not take it.
+                    let lock = acquire_commit_lock(&workdir, COMMIT_LOCK_WAIT)
+                        .await
+                        .map_err(child_err)?;
+                    branch.commit().map_err(|e| {
+                        child_err(format!(
+                            "transaction: commit failed: {e}. The workdir is partially merged \
+                             and the unmerged remainder was preserved at {}",
+                            upper_dir.display()
+                        ))
+                    })?;
+                    drop(lock); // release the workdir lock after the merge
+                    true
+                }
+                (true, Disposition::DryRun) => {
+                    let _ = branch.abort();
+                    reason = Some(AbortReason::DryRun);
+                    false
+                }
+                (false, _) => {
+                    let _ = branch.abort();
+                    false
+                }
+            }
         }
-        None => all_ok,
+        // Unreachable: `create` above always yields a branch and a transactional
+        // stage never takes it out of the shared state. Treat a future violation
+        // of that invariant as "nothing was committed" rather than reporting a
+        // commit that did not happen.
+        None => false,
     };
     if let Some(e) = drive_err {
         return Err(e);
     }
 
+    let stages = std::sync::Arc::try_unwrap(results)
+        .map(|m| m.into_inner().unwrap_or_default())
+        .unwrap_or_else(|arc| arc.lock().map(|g| g.clone()).unwrap_or_default());
+
     Ok(TxnOutcome {
         committed,
-        stages: results,
+        stages,
+        changes,
         abort_reason: if committed { None } else { reason },
     })
 }
@@ -299,12 +391,17 @@ async fn acquire_commit_lock(
 }
 
 /// Run each stage to completion in order over the shared upper, with no
-/// inter-stage pipes (all stdio inherited). Stops at the first non-zero exit.
+/// inter-stage pipes (all stdio inherited). Stops at the first non-zero exit:
+/// under a sequential shared-workspace model stage N+1's inputs do not exist if
+/// stage N failed, and the transaction is going to abort regardless.
+///
+/// Each result is published to `results` as soon as its stage finishes, so the
+/// coordinator still has them if this future is cancelled by a timeout.
 async fn drive_txn_stages(
     stages: Vec<Stage>,
     shared: crate::sandbox::SharedCow,
-) -> Result<(bool, Vec<RunResult>, Option<String>), SandlockError> {
-    let mut results: Vec<RunResult> = Vec::with_capacity(stages.len());
+    results: std::sync::Arc<std::sync::Mutex<Vec<RunResult>>>,
+) -> Result<Option<AbortReason>, SandlockError> {
     for (i, stage) in stages.into_iter().enumerate() {
         let cmd_refs: Vec<&str> = stage.args.iter().map(|s| s.as_str()).collect();
         let mut sb = stage.sandbox.with_name(format!("txn-stage-{i}"));
@@ -314,16 +411,14 @@ async fn drive_txn_stages(
         let result = sb.wait().await?;
 
         let status = result.exit_status.clone();
-        results.push(result);
+        if let Ok(mut guard) = results.lock() {
+            guard.push(result);
+        }
         if !matches!(status, ExitStatus::Code(0)) {
-            return Ok((
-                false,
-                results,
-                Some(format!("stage {i} did not exit cleanly: {status:?}")),
-            ));
+            return Ok(Some(AbortReason::StageFailed { index: i, status }));
         }
     }
-    Ok((true, results, None))
+    Ok(None)
 }
 
 #[cfg(test)]
