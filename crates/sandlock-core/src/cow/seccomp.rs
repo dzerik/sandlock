@@ -81,6 +81,22 @@ fn dir_size(dir: &Path) -> u64 {
     total
 }
 
+/// Disposition of a branch's private storage, which decides what `Drop` does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BranchState {
+    /// No disposition yet. The upper holds nothing the caller has asked to keep,
+    /// so dropping the branch reclaims it.
+    Open,
+    /// A merge into the workdir started and did not finish. The workdir is
+    /// partially modified and the upper still holds the unmerged remainder, so
+    /// the storage MUST survive `Drop`: it is the only copy of that remainder
+    /// and the only thing a retry or an out-of-band recovery can work from.
+    MergeInterrupted,
+    /// `commit()`, `abort()` or `keep()` completed. Nothing is left to reclaim
+    /// (commit/abort already did it, keep deliberately preserved it).
+    Finished,
+}
+
 /// Seccomp-based COW branch. Redirects writes to an upper directory
 /// and tracks deletions in memory.
 pub struct SeccompCowBranch {
@@ -90,7 +106,7 @@ pub struct SeccompCowBranch {
     storage_dir: PathBuf,
     deleted: HashSet<String>,
     has_changes: bool,
-    finished: bool,
+    state: BranchState,
     max_disk_bytes: u64,
     disk_used: u64,
 }
@@ -123,7 +139,7 @@ impl SeccompCowBranch {
             storage_dir: branch_dir,
             deleted: HashSet::new(),
             has_changes: false,
-            finished: false,
+            state: BranchState::Open,
             max_disk_bytes,
             disk_used: 0,
         })
@@ -815,8 +831,22 @@ impl SeccompCowBranch {
     }
 
     /// Commit: merge upper into workdir.
+    ///
+    /// The merge is file-by-file and not crash-atomic. If it fails partway
+    /// (`ENOSPC`, `EACCES`, an obstructing symlink, ...) the workdir is left
+    /// partially merged and this returns `Err` — but the upper is **preserved**,
+    /// still holding everything that did not make it across. Call `commit()`
+    /// again to retry the merge once the cause is cleared, `changes()` to
+    /// inspect what is outstanding, or `abort()` to deliberately discard the
+    /// remainder. Dropping the branch after a failed commit does NOT reclaim it.
     pub fn commit(&mut self) -> Result<(), BranchError> {
-        if self.finished { return Ok(()); }
+        if self.state == BranchState::Finished { return Ok(()); }
+
+        // Enter the interrupted state BEFORE the first destructive operation.
+        // Every `?` below returns with the state still set, which is what keeps
+        // `Drop` from reclaiming an upper that holds unmerged data. It is
+        // cleared only by the successful tail of this function.
+        self.state = BranchState::MergeInterrupted;
 
         // Apply deletions
         for rel_path in &self.deleted {
@@ -887,15 +917,18 @@ impl SeccompCowBranch {
         }
 
         self.cleanup();
-        self.finished = true;
+        self.state = BranchState::Finished;
         Ok(())
     }
 
     /// Abort: discard all changes.
+    ///
+    /// After a failed `commit()` this is a deliberate request to throw the
+    /// unmerged remainder away; the workdir stays as the partial merge left it.
     pub fn abort(&mut self) -> Result<(), BranchError> {
-        if self.finished { return Ok(()); }
+        if self.state == BranchState::Finished { return Ok(()); }
         self.cleanup();
-        self.finished = true;
+        self.state = BranchState::Finished;
         Ok(())
     }
 
@@ -904,7 +937,7 @@ impl SeccompCowBranch {
     /// which preserves the changes for later inspection rather than merging or
     /// discarding them.
     pub(crate) fn keep(&mut self) {
-        self.finished = true;
+        self.state = BranchState::Finished;
     }
 
     fn cleanup(&self) {
@@ -913,14 +946,24 @@ impl SeccompCowBranch {
 }
 
 impl Drop for SeccompCowBranch {
-    /// Backstop against orphaning the upper on disk. A branch dropped without an
-    /// explicit disposition — an error/timeout/panic in a transactional pipeline,
-    /// an abandoned sandbox that was never `wait()`ed — removes its own private
-    /// storage dir. `commit()`, `abort()`, and `keep()` all set `finished`, so
-    /// this is a no-op on every deliberate path (in particular it does NOT clean
-    /// a kept branch). `remove_dir_all` is idempotent and scoped to `storage_dir`.
+    /// Reclaims the branch's private storage when it was never disposed of.
+    ///
+    /// **Blast radius**: this applies to *every* holder of a `SeccompCowBranch`,
+    /// not only transactional pipelines. A `Sandbox` whose branch is abandoned
+    /// without `wait()` (or that panicked before its `Drop` ran a disposition)
+    /// no longer leaves its upper behind; scratch branches in tests likewise
+    /// vanish at end of scope. That is a behavior change, not a pure leak fix.
+    ///
+    /// It is deliberately **not** a "clean up on error" hook: `commit()` marks
+    /// the branch [`BranchState::MergeInterrupted`] before it touches the
+    /// workdir, so a failed merge keeps its upper — the unmerged remainder must
+    /// outlive the failure to stay recoverable. Only [`BranchState::Open`],
+    /// i.e. no disposition was ever attempted, reclaims here.
+    ///
+    /// `remove_dir_all` is idempotent and scoped to this branch's own uuid dir,
+    /// never to a caller-supplied `fs_storage` base.
     fn drop(&mut self) {
-        if !self.finished {
+        if self.state == BranchState::Open {
             self.cleanup();
         }
     }
@@ -955,6 +998,81 @@ mod tests {
         };
         assert!(kept.exists(), "a kept branch must survive drop");
         let _ = fs::remove_dir_all(&kept);
+    }
+
+    /// A commit that fails partway must PRESERVE the upper: the workdir is
+    /// already partially merged, so the unmerged remainder in the upper is the
+    /// only copy of the outstanding data and the only thing a retry or an
+    /// out-of-band recovery can work from. Dropping the branch after such a
+    /// failure must not reclaim it either.
+    ///
+    /// The failure is injected the way it actually happens in the field: the
+    /// workdir holds a symlink where the upper holds a regular file, so the
+    /// merge's `openat2(O_NOFOLLOW)` fails with `ELOOP`. No permission games, so
+    /// this also fails as intended when the suite runs as root.
+    #[test]
+    fn failed_commit_preserves_the_unmerged_upper() {
+        let workdir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        // The obstruction: a symlink in the workdir at the path the merge will
+        // try to write a regular file to.
+        std::os::unix::fs::symlink("/dev/null", workdir.path().join("blocked.txt")).unwrap();
+
+        let storage_dir;
+        let upper_dir;
+        {
+            let mut branch =
+                SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+            storage_dir = branch.storage_dir.clone();
+            upper_dir = branch.upper.clone();
+            fs::write(upper_dir.join("blocked.txt"), "unmerged payload").unwrap();
+
+            let err = branch.commit().expect_err("the obstructed merge must fail");
+            assert!(
+                matches!(err, BranchError::Operation(ref m) if m.starts_with("copy:")),
+                "expected the copy step to fail, got: {err:?}"
+            );
+            // Still on disk WHILE the branch is alive...
+            assert!(upper_dir.join("blocked.txt").exists());
+        }
+        // ...and still on disk AFTER the drop. This is the regression that
+        // matters: reclaiming here destroys the only copy of the remainder.
+        assert!(
+            storage_dir.exists(),
+            "a branch whose commit failed must keep its storage after drop"
+        );
+        assert_eq!(
+            fs::read_to_string(upper_dir.join("blocked.txt")).unwrap(),
+            "unmerged payload",
+            "the unmerged remainder must survive intact"
+        );
+    }
+
+    /// Because a failed commit does not latch the branch as finished, clearing
+    /// the cause and calling `commit()` again completes the merge. A guard that
+    /// simply marked the branch finished on entry would turn the retry into a
+    /// silent no-op that reports success.
+    #[test]
+    fn commit_is_retryable_after_a_failed_merge() {
+        let workdir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("/dev/null", workdir.path().join("blocked.txt")).unwrap();
+
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let storage_dir = branch.storage_dir.clone();
+        fs::write(branch.upper.join("blocked.txt"), "payload").unwrap();
+        branch.commit().expect_err("the obstructed merge must fail");
+
+        // Clear the obstruction and retry.
+        fs::remove_file(workdir.path().join("blocked.txt")).unwrap();
+        branch.commit().expect("the retry must complete the merge");
+
+        assert_eq!(
+            fs::read_to_string(workdir.path().join("blocked.txt")).unwrap(),
+            "payload",
+            "the retried commit must actually merge the remainder"
+        );
+        assert!(!storage_dir.exists(), "a completed commit reclaims its storage");
     }
 
     fn setup_workdir() -> (tempfile::TempDir, tempfile::TempDir) {
