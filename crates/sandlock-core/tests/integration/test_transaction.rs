@@ -1,12 +1,12 @@
-//! Transactional pipeline tests (RFC #65 Phase 1).
+//! Transaction tests (RFC #65 Phase 1).
 //!
 //! Sequential stages share one COW upper over a common workdir: a later stage
-//! sees an earlier stage's writes (read-committed), and the whole pipeline
+//! sees an earlier stage's writes (read-committed), and the whole transaction
 //! commits all-or-nothing. Data is exchanged through the shared workspace, not
 //! inter-stage pipes.
 
 use sandlock_core::sandbox::BranchAction;
-use sandlock_core::{Sandbox, Stage};
+use sandlock_core::{Sandbox, Stage, Transaction};
 use std::fs;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -21,7 +21,7 @@ fn temp_dir(name: &str) -> PathBuf {
 
 /// Base policy shared by every stage: read the system, write+COW the workdir,
 /// and run with the workdir as cwd so relative paths resolve into the upper.
-/// `on_exit`/`on_error` are left at their defaults (the pipeline owns commit).
+/// `on_exit`/`on_error` are left at their defaults (the transaction owns commit).
 fn stage_policy(workdir: &Path) -> Sandbox {
     Sandbox::builder()
         .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
@@ -50,7 +50,7 @@ fn branch_count(storage: &Path) -> usize {
 /// Full success: stage 1 writes `a.txt`, stage 2 reads it (proving read-committed)
 /// and writes `b.txt`, stage 3 reads both. On commit both files land in workdir.
 #[tokio::test]
-async fn test_txn_pipeline_commits_on_success() {
+async fn test_txn_commits_on_success() {
     if !sandbox_available().await {
         eprintln!("commit test skipped: sandbox unavailable");
         return;
@@ -58,12 +58,14 @@ async fn test_txn_pipeline_commits_on_success() {
     let workdir = temp_dir("commit");
     let policy = stage_policy(&workdir);
 
-    let pipeline = Stage::new(&policy, &["sh", "-c", "echo plan > a.txt"])
-        | Stage::new(&policy, &["sh", "-c", "cat a.txt && echo built > b.txt"])
-        | Stage::new(&policy, &["sh", "-c", "cat a.txt b.txt"]);
+    let txn = Transaction::new([
+        Stage::new(&policy, &["sh", "-c", "echo plan > a.txt"]),
+        Stage::new(&policy, &["sh", "-c", "cat a.txt && echo built > b.txt"]),
+        Stage::new(&policy, &["sh", "-c", "cat a.txt b.txt"]),
+    ]);
 
-    let outcome = pipeline.run_transactional(None).await.expect("transaction should run");
-    assert!(outcome.committed, "pipeline should commit; abort_reason: {:?}", outcome.abort_reason);
+    let outcome = txn.run(None).await.expect("transaction should run");
+    assert!(outcome.committed, "transaction should commit; abort_reason: {:?}", outcome.abort_reason);
     assert_eq!(outcome.stages.len(), 3, "all three stages should have run");
     assert!(workdir.join("a.txt").exists(), "a.txt must be committed to workdir");
     assert!(workdir.join("b.txt").exists(), "b.txt must be committed to workdir");
@@ -77,7 +79,7 @@ async fn test_txn_pipeline_commits_on_success() {
 /// the race benignly (committed=false + abort_reason) instead of erroring or
 /// racing the file-by-file merge and corrupting the workdir.
 #[tokio::test]
-async fn test_txn_pipeline_loses_first_committer_win_race() {
+async fn test_txn_loses_first_committer_win_race() {
     if !sandbox_available().await {
         eprintln!("first-committer-win test skipped: sandbox unavailable");
         return;
@@ -93,12 +95,14 @@ async fn test_txn_pipeline_loses_first_committer_win_race() {
         "test setup: could not take the workdir lock"
     );
 
-    // Every stage succeeds, so the pipeline reaches commit; the held lock makes it
-    // lose the race. run_transactional must return Ok — a lost race is not an error.
-    let pipeline = Stage::new(&policy, &["sh", "-c", "echo plan > a.txt"])
-        | Stage::new(&policy, &["sh", "-c", "cat a.txt && echo built > b.txt"]);
-    let outcome = pipeline
-        .run_transactional(None)
+    // Every stage succeeds, so the transaction reaches commit; the held lock makes it
+    // lose the race. run() must return Ok — a lost race is not an error.
+    let txn = Transaction::new([
+        Stage::new(&policy, &["sh", "-c", "echo plan > a.txt"]),
+        Stage::new(&policy, &["sh", "-c", "cat a.txt && echo built > b.txt"]),
+    ]);
+    let outcome = txn
+        .run(None)
         .await
         .expect("a lost first-committer-win race is a benign outcome, not an error");
 
@@ -128,7 +132,7 @@ async fn test_txn_pipeline_loses_first_committer_win_race() {
 /// Any stage failing aborts the whole transaction: earlier stages' writes are
 /// discarded and the workdir is byte-identical to before the run.
 #[tokio::test]
-async fn test_txn_pipeline_aborts_on_stage_failure() {
+async fn test_txn_aborts_on_stage_failure() {
     if !sandbox_available().await {
         eprintln!("abort test skipped: sandbox unavailable");
         return;
@@ -138,11 +142,13 @@ async fn test_txn_pipeline_aborts_on_stage_failure() {
     let policy = stage_policy(&workdir);
 
     // Stage 2 writes b.txt but the final stage exits non-zero → abort all.
-    let pipeline = Stage::new(&policy, &["sh", "-c", "echo plan > a.txt"])
-        | Stage::new(&policy, &["sh", "-c", "cat a.txt && echo built > b.txt"])
-        | Stage::new(&policy, &["sh", "-c", "exit 1"]);
+    let txn = Transaction::new([
+        Stage::new(&policy, &["sh", "-c", "echo plan > a.txt"]),
+        Stage::new(&policy, &["sh", "-c", "cat a.txt && echo built > b.txt"]),
+        Stage::new(&policy, &["sh", "-c", "exit 1"]),
+    ]);
 
-    let outcome = pipeline.run_transactional(None).await.expect("transaction should run");
+    let outcome = txn.run(None).await.expect("transaction should run");
     assert!(!outcome.committed, "a failing stage must abort the transaction");
     assert!(outcome.abort_reason.is_some(), "abort must carry a reason");
     assert!(!workdir.join("a.txt").exists(), "a.txt must NOT leak after abort");
@@ -155,7 +161,7 @@ async fn test_txn_pipeline_aborts_on_stage_failure() {
 /// The shared upper is reclaimed from disk after BOTH abort and commit — the
 /// end-to-end check that a failed/completed transaction never orphans its upper.
 #[tokio::test]
-async fn test_txn_pipeline_reclaims_upper() {
+async fn test_txn_reclaims_upper() {
     if !sandbox_available().await {
         eprintln!("reclaim test skipped: sandbox unavailable");
         return;
@@ -171,27 +177,31 @@ async fn test_txn_pipeline_reclaims_upper() {
         .unwrap();
 
     // Abort path: the upper must be gone from the storage dir.
-    let aborted = (Stage::new(&policy, &["sh", "-c", "echo x > a.txt"])
-        | Stage::new(&policy, &["sh", "-c", "exit 1"]))
-        .run_transactional(None).await.expect("transaction should run");
+    let aborted = Transaction::new([
+        Stage::new(&policy, &["sh", "-c", "echo x > a.txt"]),
+        Stage::new(&policy, &["sh", "-c", "exit 1"]),
+    ])
+        .run(None).await.expect("transaction should run");
     assert!(!aborted.committed);
-    assert_eq!(branch_count(&storage), 0, "aborted pipeline must reclaim its upper from the storage dir");
+    assert_eq!(branch_count(&storage), 0, "aborted transaction must reclaim its upper from the storage dir");
 
     // Commit path: also reclaimed after the merge.
-    let committed = (Stage::new(&policy, &["sh", "-c", "echo y > b.txt"])
-        | Stage::new(&policy, &["sh", "-c", "cat b.txt"]))
-        .run_transactional(None).await.expect("transaction should run");
+    let committed = Transaction::new([
+        Stage::new(&policy, &["sh", "-c", "echo y > b.txt"]),
+        Stage::new(&policy, &["sh", "-c", "cat b.txt"]),
+    ])
+        .run(None).await.expect("transaction should run");
     assert!(committed.committed);
-    assert_eq!(branch_count(&storage), 0, "committed pipeline must reclaim its upper from the storage dir");
+    assert_eq!(branch_count(&storage), 0, "committed transaction must reclaim its upper from the storage dir");
 
     let _ = fs::remove_dir_all(&workdir);
     let _ = fs::remove_dir_all(&storage);
 }
 
-/// A pipeline timeout aborts the whole transaction without leaking earlier
+/// A transaction timeout aborts the whole transaction without leaking earlier
 /// stages' writes into the workdir.
 #[tokio::test]
-async fn test_txn_pipeline_timeout_aborts() {
+async fn test_txn_timeout_aborts() {
     if !sandbox_available().await {
         eprintln!("timeout test skipped: sandbox unavailable");
         return;
@@ -199,14 +209,16 @@ async fn test_txn_pipeline_timeout_aborts() {
     let workdir = temp_dir("timeout");
     let policy = stage_policy(&workdir);
 
-    let pipeline = Stage::new(&policy, &["sh", "-c", "echo plan > a.txt"])
-        | Stage::new(&policy, &["sh", "-c", "sleep 30"]);
+    let txn = Transaction::new([
+        Stage::new(&policy, &["sh", "-c", "echo plan > a.txt"]),
+        Stage::new(&policy, &["sh", "-c", "sleep 30"]),
+    ]);
 
-    let outcome = pipeline
-        .run_transactional(Some(Duration::from_millis(600)))
+    let outcome = txn
+        .run(Some(Duration::from_millis(600)))
         .await
         .expect("transaction should run");
-    assert!(!outcome.committed, "a timed-out pipeline must abort");
+    assert!(!outcome.committed, "a timed-out transaction must abort");
     assert!(
         outcome.abort_reason.as_deref().unwrap_or("").contains("timed out"),
         "abort reason should mention the timeout, got: {:?}",
@@ -217,10 +229,10 @@ async fn test_txn_pipeline_timeout_aborts() {
     let _ = fs::remove_dir_all(&workdir);
 }
 
-/// Guardrail: a non-default `on_exit`/`on_error` conflicts with the pipeline
+/// Guardrail: a non-default `on_exit`/`on_error` conflicts with the transaction
 /// owning commit/abort, and is rejected before anything runs. (No sandbox needed.)
 #[tokio::test]
-async fn test_txn_pipeline_rejects_branch_action() {
+async fn test_txn_rejects_branch_action() {
     let workdir = temp_dir("guard-action");
     let plain = stage_policy(&workdir);
     let with_action = Sandbox::builder()
@@ -229,8 +241,8 @@ async fn test_txn_pipeline_rejects_branch_action() {
         .build()
         .unwrap();
 
-    let pipeline = Stage::new(&plain, &["true"]) | Stage::new(&with_action, &["true"]);
-    let err = pipeline.run_transactional(None).await.unwrap_err().to_string();
+    let txn = Transaction::new([Stage::new(&plain, &["true"]), Stage::new(&with_action, &["true"])]);
+    let err = txn.run(None).await.unwrap_err().to_string();
     assert!(err.contains("on_exit/on_error"), "expected the on_exit guardrail, got: {err}");
 
     let _ = fs::remove_dir_all(&workdir);
@@ -238,26 +250,27 @@ async fn test_txn_pipeline_rejects_branch_action() {
 
 /// Guardrail: every stage must set a workdir (the shared transaction dir).
 #[tokio::test]
-async fn test_txn_pipeline_rejects_missing_workdir() {
+async fn test_txn_rejects_missing_workdir() {
     let workdir = temp_dir("guard-workdir");
     let with_wd = stage_policy(&workdir);
     let no_wd = Sandbox::builder().fs_read("/usr").build().unwrap();
 
-    let pipeline = Stage::new(&with_wd, &["true"]) | Stage::new(&no_wd, &["true"]);
-    let err = pipeline.run_transactional(None).await.unwrap_err().to_string();
+    let txn = Transaction::new([Stage::new(&with_wd, &["true"]), Stage::new(&no_wd, &["true"])]);
+    let err = txn.run(None).await.unwrap_err().to_string();
     assert!(err.contains("no workdir"), "expected the workdir guardrail, got: {err}");
 
     let _ = fs::remove_dir_all(&workdir);
 }
 
-/// Guardrail: fewer than two stages is rejected, not a panic (the `pub stages`
-/// field bypasses `Pipeline::new`'s check).
+/// Guardrail: fewer than two stages is rejected, not a panic. `Transaction::new`
+/// accepts any stage list, so this check is the only thing between a one-stage
+/// transaction and an out-of-bounds index in the coordinator.
 #[tokio::test]
-async fn test_txn_pipeline_rejects_too_few_stages() {
+async fn test_txn_rejects_too_few_stages() {
     let workdir = temp_dir("guard-count");
     let policy = stage_policy(&workdir);
-    let single = sandlock_core::Pipeline { stages: vec![Stage::new(&policy, &["true"])] };
-    let err = single.run_transactional(None).await.unwrap_err().to_string();
+    let single = Transaction::new([Stage::new(&policy, &["true"])]);
+    let err = single.run(None).await.unwrap_err().to_string();
     assert!(err.contains("at least 2 stages"), "expected the stage-count guardrail, got: {err}");
 
     let _ = fs::remove_dir_all(&workdir);
@@ -266,13 +279,13 @@ async fn test_txn_pipeline_rejects_too_few_stages() {
 /// Guardrail: stages that each set a workdir but a DIFFERENT one are rejected —
 /// distinct from the missing-workdir case (they share one COW upper).
 #[tokio::test]
-async fn test_txn_pipeline_rejects_mismatched_workdir() {
+async fn test_txn_rejects_mismatched_workdir() {
     let wd1 = temp_dir("guard-wd-a");
     let wd2 = temp_dir("guard-wd-b");
     let s0 = stage_policy(&wd1);
     let s1 = stage_policy(&wd2); // valid workdir, but not the same one
-    let pipeline = Stage::new(&s0, &["true"]) | Stage::new(&s1, &["true"]);
-    let err = pipeline.run_transactional(None).await.unwrap_err().to_string();
+    let txn = Transaction::new([Stage::new(&s0, &["true"]), Stage::new(&s1, &["true"])]);
+    let err = txn.run(None).await.unwrap_err().to_string();
     assert!(err.contains("share one workdir"), "expected the shared-workdir guardrail, got: {err}");
 
     let _ = fs::remove_dir_all(&wd1);
@@ -282,7 +295,7 @@ async fn test_txn_pipeline_rejects_mismatched_workdir() {
 /// Guardrail: a stage running without the supervisor cannot participate in a COW
 /// transaction (no notif path to build/commit the shared upper).
 #[tokio::test]
-async fn test_txn_pipeline_rejects_no_supervisor() {
+async fn test_txn_rejects_no_supervisor() {
     let workdir = temp_dir("guard-nosup");
     let ok = stage_policy(&workdir);
     // Same workdir (so the workdir guardrail doesn't fire first) but no supervisor.
@@ -291,8 +304,8 @@ async fn test_txn_pipeline_rejects_no_supervisor() {
         .no_supervisor(true)
         .build()
         .unwrap();
-    let pipeline = Stage::new(&ok, &["true"]) | Stage::new(&nosup, &["true"]);
-    let err = pipeline.run_transactional(None).await.unwrap_err().to_string();
+    let txn = Transaction::new([Stage::new(&ok, &["true"]), Stage::new(&nosup, &["true"])]);
+    let err = txn.run(None).await.unwrap_err().to_string();
     assert!(err.contains("no_supervisor"), "expected the no_supervisor guardrail, got: {err}");
 
     let _ = fs::remove_dir_all(&workdir);
@@ -301,7 +314,7 @@ async fn test_txn_pipeline_rejects_no_supervisor() {
 /// Guardrail: chroot is unsupported with a shared COW workdir (the workdir path
 /// can't resolve the same across differing roots).
 #[tokio::test]
-async fn test_txn_pipeline_rejects_chroot() {
+async fn test_txn_rejects_chroot() {
     let workdir = temp_dir("guard-chroot");
     let rootfs = temp_dir("guard-chroot-root");
     let ok = stage_policy(&workdir);
@@ -310,8 +323,8 @@ async fn test_txn_pipeline_rejects_chroot() {
         .chroot(&rootfs)
         .build()
         .unwrap();
-    let pipeline = Stage::new(&ok, &["true"]) | Stage::new(&with_chroot, &["true"]);
-    let err = pipeline.run_transactional(None).await.unwrap_err().to_string();
+    let txn = Transaction::new([Stage::new(&ok, &["true"]), Stage::new(&with_chroot, &["true"])]);
+    let err = txn.run(None).await.unwrap_err().to_string();
     assert!(err.contains("chroot"), "expected the chroot guardrail, got: {err}");
 
     let _ = fs::remove_dir_all(&workdir);
@@ -321,7 +334,7 @@ async fn test_txn_pipeline_rejects_chroot() {
 /// Guardrail: stages must share one COW upper, so differing fs_storage/max_disk
 /// (here stage 1 sets fs_storage while stage 0 does not) is rejected.
 #[tokio::test]
-async fn test_txn_pipeline_rejects_mismatched_fs_storage() {
+async fn test_txn_rejects_mismatched_fs_storage() {
     let workdir = temp_dir("guard-store-wd");
     let storage = temp_dir("guard-store-st");
     let s0 = stage_policy(&workdir); // no fs_storage
@@ -330,19 +343,19 @@ async fn test_txn_pipeline_rejects_mismatched_fs_storage() {
         .fs_storage(&storage)
         .build()
         .unwrap();
-    let pipeline = Stage::new(&s0, &["true"]) | Stage::new(&s1, &["true"]);
-    let err = pipeline.run_transactional(None).await.unwrap_err().to_string();
+    let txn = Transaction::new([Stage::new(&s0, &["true"]), Stage::new(&s1, &["true"])]);
+    let err = txn.run(None).await.unwrap_err().to_string();
     assert!(err.contains("fs_storage/max_disk"), "expected the fs_storage guardrail, got: {err}");
 
     let _ = fs::remove_dir_all(&workdir);
     let _ = fs::remove_dir_all(&storage);
 }
 
-/// Boundary: the FIRST stage failing aborts, and the pipeline STOPS — later
+/// Boundary: the FIRST stage failing aborts, and the transaction STOPS — later
 /// stages must not run (outcome.stages holds only the failed stage). Distinct
 /// from the last-stage-failure case.
 #[tokio::test]
-async fn test_txn_pipeline_aborts_on_first_stage_failure() {
+async fn test_txn_aborts_on_first_stage_failure() {
     if !sandbox_available().await {
         eprintln!("first-fail test skipped: sandbox unavailable");
         return;
@@ -350,13 +363,15 @@ async fn test_txn_pipeline_aborts_on_first_stage_failure() {
     let workdir = temp_dir("first-fail");
     let policy = stage_policy(&workdir);
     // Stage 0 writes a.txt then exits non-zero; stages 1 and 2 must NOT run.
-    let pipeline = Stage::new(&policy, &["sh", "-c", "echo a > a.txt; exit 1"])
-        | Stage::new(&policy, &["sh", "-c", "echo b > b.txt"])
-        | Stage::new(&policy, &["sh", "-c", "echo c > c.txt"]);
+    let txn = Transaction::new([
+        Stage::new(&policy, &["sh", "-c", "echo a > a.txt; exit 1"]),
+        Stage::new(&policy, &["sh", "-c", "echo b > b.txt"]),
+        Stage::new(&policy, &["sh", "-c", "echo c > c.txt"]),
+    ]);
 
-    let outcome = pipeline.run_transactional(None).await.expect("transaction should run");
+    let outcome = txn.run(None).await.expect("transaction should run");
     assert!(!outcome.committed, "first-stage failure must abort");
-    assert_eq!(outcome.stages.len(), 1, "pipeline must stop at the failed stage — later stages must not run");
+    assert_eq!(outcome.stages.len(), 1, "transaction must stop at the failed stage — later stages must not run");
     assert!(!workdir.join("a.txt").exists(), "a.txt must NOT leak after abort");
     assert!(!workdir.join("b.txt").exists(), "stage 2 must not have run");
     assert!(!workdir.join("c.txt").exists(), "stage 3 must not have run");
@@ -367,7 +382,7 @@ async fn test_txn_pipeline_aborts_on_first_stage_failure() {
 /// Combination: a timeout aborts AND reclaims the shared upper (no orphan on the
 /// timeout path — the reclaim test only covered clean abort/commit).
 #[tokio::test]
-async fn test_txn_pipeline_timeout_reclaims_upper() {
+async fn test_txn_timeout_reclaims_upper() {
     if !sandbox_available().await {
         eprintln!("timeout-reclaim test skipped: sandbox unavailable");
         return;
@@ -382,13 +397,15 @@ async fn test_txn_pipeline_timeout_reclaims_upper() {
         .build()
         .unwrap();
 
-    let outcome = (Stage::new(&policy, &["sh", "-c", "echo x > a.txt"])
-        | Stage::new(&policy, &["sh", "-c", "sleep 30"]))
-        .run_transactional(Some(Duration::from_millis(600)))
+    let outcome = Transaction::new([
+        Stage::new(&policy, &["sh", "-c", "echo x > a.txt"]),
+        Stage::new(&policy, &["sh", "-c", "sleep 30"]),
+    ])
+        .run(Some(Duration::from_millis(600)))
         .await
         .expect("transaction should run");
-    assert!(!outcome.committed, "timed-out pipeline must abort");
-    assert_eq!(branch_count(&storage), 0, "timed-out pipeline must reclaim its upper from the storage dir");
+    assert!(!outcome.committed, "timed-out transaction must abort");
+    assert_eq!(branch_count(&storage), 0, "timed-out transaction must reclaim its upper from the storage dir");
 
     let _ = fs::remove_dir_all(&workdir);
     let _ = fs::remove_dir_all(&storage);
@@ -399,7 +416,7 @@ async fn test_txn_pipeline_timeout_reclaims_upper() {
 ///     workdir, and a later stage sees the deletion (read-committed);
 ///   - abort: the deletion is discarded — the file survives byte-identical.
 #[tokio::test]
-async fn test_txn_pipeline_deletion_commit_applies_abort_preserves() {
+async fn test_txn_deletion_commit_applies_abort_preserves() {
     if !sandbox_available().await {
         eprintln!("deletion test skipped: sandbox unavailable");
         return;
@@ -408,21 +425,25 @@ async fn test_txn_pipeline_deletion_commit_applies_abort_preserves() {
     let wd_c = temp_dir("del-commit");
     fs::write(wd_c.join("keep.txt"), "orig\n").unwrap();
     let p_c = stage_policy(&wd_c);
-    let committed = (Stage::new(&p_c, &["sh", "-c", "rm keep.txt"])
-        | Stage::new(&p_c, &["sh", "-c", "test ! -e keep.txt"]))  // stage 2 must SEE the deletion
-        .run_transactional(None)
+    let committed = Transaction::new([
+        Stage::new(&p_c, &["sh", "-c", "rm keep.txt"]),
+        Stage::new(&p_c, &["sh", "-c", "test ! -e keep.txt"]),
+    ])  // stage 2 must SEE the deletion
+        .run(None)
         .await
         .expect("transaction should run");
     assert!(committed.committed, "commit expected; abort_reason: {:?}", committed.abort_reason);
     assert!(!wd_c.join("keep.txt").exists(), "committed deletion must remove keep.txt from the workdir");
 
-    // Abort path: same deletion, but the pipeline aborts → deletion discarded.
+    // Abort path: same deletion, but the transaction aborts → deletion discarded.
     let wd_a = temp_dir("del-abort");
     fs::write(wd_a.join("keep.txt"), "orig\n").unwrap();
     let p_a = stage_policy(&wd_a);
-    let aborted = (Stage::new(&p_a, &["sh", "-c", "rm keep.txt"])
-        | Stage::new(&p_a, &["sh", "-c", "exit 1"]))
-        .run_transactional(None)
+    let aborted = Transaction::new([
+        Stage::new(&p_a, &["sh", "-c", "rm keep.txt"]),
+        Stage::new(&p_a, &["sh", "-c", "exit 1"]),
+    ])
+        .run(None)
         .await
         .expect("transaction should run");
     assert!(!aborted.committed, "abort expected");

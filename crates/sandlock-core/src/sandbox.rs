@@ -271,25 +271,27 @@ struct Runtime {
     on_bind: Option<Box<dyn Fn(&HashMap<u16, u16>) + Send + Sync>>,
     handlers: Vec<(i64, Arc<dyn crate::seccomp::dispatch::Handler>)>,
     ready_w: Option<std::os::fd::OwnedFd>,
-    /// Set when this sandbox is a stage of a transactional pipeline that shares
-    /// one COW upper across all stages. When present, `do_create_stdio` reuses
-    /// this `CowState` (instead of building its own branch), and neither `wait()`
-    /// nor `Drop` take/commit/abort the branch — the pipeline coordinator owns
-    /// the single commit/abort. See [`SharedCow`] and `Pipeline::run_transactional`.
+    /// Set when this sandbox is a stage of a [`Transaction`](crate::transaction::Transaction)
+    /// that shares one COW upper across all stages. When present, `do_create_stdio`
+    /// reuses this `CowState` (instead of building its own branch), and neither
+    /// `wait()` nor `Drop` take/commit/abort the branch — the transaction
+    /// coordinator owns the single commit/abort. See [`SharedCow`].
     shared_cow: Option<SharedCow>,
 }
 
 /// A COW branch (one `upper` over the workdir) shared by every stage of a
-/// transactional pipeline. Cloned into each stage's `Runtime` so sequential
-/// stages accumulate writes in the same upper (read-committed), while the
-/// coordinator retains the original to commit/abort once at the end.
+/// [`Transaction`](crate::transaction::Transaction). Cloned into each stage's
+/// `Runtime` so sequential stages accumulate writes in the same upper
+/// (read-committed), while the coordinator retains the original to commit/abort
+/// once at the end.
 #[derive(Clone)]
 pub(crate) struct SharedCow {
     /// The shared supervisor COW state (holds the single `SeccompCowBranch`).
     pub(crate) state: Arc<tokio::sync::Mutex<crate::seccomp::state::CowState>>,
-    /// The branch's upper dir, granted to each stage's Landlock ruleset so a
-    /// binary created inside the workdir (materialized into the upper) is
-    /// executable. Cached here to avoid locking `state` just to read it.
+    /// The branch's upper dir. Granted to each stage's Landlock ruleset for the
+    /// same reason a single sandbox grants its own upper: Landlock checks
+    /// EXECUTE against a file's real path, which for anything written inside the
+    /// workdir is the upper. Cached here to avoid locking `state` to read it.
     pub(crate) upper_dir: PathBuf,
 }
 
@@ -1454,10 +1456,10 @@ impl Sandbox {
         Ok(())
     }
 
-    /// Attach a shared transactional-pipeline COW branch to this sandbox before
-    /// `create`. The stage reuses the shared upper instead of building its own,
-    /// and leaves commit/abort to the pipeline coordinator. Internal — used only
-    /// by `Pipeline::run_transactional`.
+    /// Attach a transaction's shared COW branch to this sandbox before `create`.
+    /// The stage reuses the shared upper instead of building its own, and leaves
+    /// commit/abort to the transaction coordinator. Internal — used only by
+    /// [`Transaction`](crate::transaction::Transaction).
     pub(crate) fn set_shared_cow(&mut self, shared: SharedCow) -> Result<(), crate::error::SandlockError> {
         self.ensure_runtime()?;
         self.rt_mut().shared_cow = Some(shared);
