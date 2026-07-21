@@ -25,6 +25,15 @@ use crate::error::{SandboxRuntimeError, SandlockError};
 use crate::pipeline::Stage;
 use crate::result::{ExitStatus, RunResult};
 
+/// How long to wait for another transaction's commit merge to finish before
+/// giving up. Merges are short (a file-by-file copy of one upper), so a wait
+/// this long only expires when something is genuinely wrong.
+const COMMIT_LOCK_WAIT: Duration = Duration::from_secs(30);
+
+/// Poll interval while waiting for the commit lock. `flock` has no timed
+/// variant, so the wait is a bounded retry over the non-blocking form.
+const COMMIT_LOCK_POLL: Duration = Duration::from_millis(20);
+
 // ============================================================
 // Transaction
 // ============================================================
@@ -68,11 +77,11 @@ impl Transaction {
     /// `timeout` applies to the stage phase as a whole; on expiry the
     /// transaction aborts and the workdir is untouched.
     ///
-    /// The final commit is **not crash-atomic**: it merges the shared upper into
-    /// the workdir file-by-file, so a crash (or `ENOSPC`) *mid-commit* can leave
-    /// the workdir partially merged. The all-or-nothing guarantee holds for a
-    /// clean stage failure or timeout (nothing is written until the commit
-    /// starts); durable crash-atomic commit is a later phase.
+    /// Returns `Err` when the transaction could not be carried out at all: an
+    /// invalid stage configuration, a failure to start a stage, or a commit that
+    /// could not be performed. If the commit merge itself fails partway, the
+    /// workdir is left partially merged and the shared upper is **preserved**
+    /// (its path is named in the error) so the remainder stays recoverable.
     pub async fn run(self, timeout: Option<Duration>) -> Result<TxnOutcome, SandlockError> {
         validate_txn_stages(&self.stages)?;
         run_txn(self.stages, timeout).await
@@ -190,7 +199,7 @@ async fn run_txn(
     let mut cow_state = crate::seccomp::state::CowState::new();
     cow_state.branch = Some(branch);
     let state = std::sync::Arc::new(tokio::sync::Mutex::new(cow_state));
-    let shared = crate::sandbox::SharedCow { state: std::sync::Arc::clone(&state), upper_dir };
+    let shared = crate::sandbox::SharedCow { state: std::sync::Arc::clone(&state), upper_dir: upper_dir.clone() };
 
     let drive = drive_txn_stages(stages, shared);
     let driven: Result<(bool, Vec<RunResult>, Option<String>), SandlockError> = match timeout {
@@ -208,47 +217,33 @@ async fn run_txn(
     // Take the branch out from under the async mutex first, then commit/abort the
     // owned value so the sync merge doesn't run while holding the guard.
     let taken = { state.lock().await.branch.take() };
-    let (all_ok, results, mut reason, drive_err) = match driven {
+    let (all_ok, results, reason, drive_err) = match driven {
         Ok((ok, res, rsn)) => (ok, res, rsn, None),
         Err(e) => (false, Vec::new(), Some(format!("{e}")), Some(e)),
     };
     let committed = match taken {
         Some(mut branch) if all_ok => {
-            // First-committer-win: take an exclusive, non-blocking lock on the
-            // shared workdir for the duration of the merge. commit() rewrites the
-            // workdir file-by-file, so two concurrent transactions
-            // committing into one workdir would interleave and corrupt it. A
-            // transaction that finds the lock held LOSES the race — a benign
-            // non-commit outcome (committed=false + abort_reason), not an error,
-            // and its upper is aborted. (The lock is scoped to the transactional
-            // commit here, not the single-sandbox commit() path.)
-            let lock = std::fs::File::open(&workdir).map_err(|e| {
-                child_err(format!("transaction: open workdir for commit lock: {e}"))
+            // Serialize the merge against any other transaction
+            // committing into this workdir. commit() rewrites the
+            // workdir file-by-file, so two merges interleaving would
+            // tear it. This is mutual exclusion between merges, NOT
+            // serializable isolation: a transaction that snapshotted
+            // before another one committed still merges over that
+            // result (last writer wins per file). The lock is also
+            // scoped to transactions — a plain Sandbox committing its
+            // own branch into the same workdir does not take it.
+            let lock = acquire_commit_lock(&workdir, COMMIT_LOCK_WAIT)
+                .await
+                .map_err(child_err)?;
+            branch.commit().map_err(|e| {
+                child_err(format!(
+                    "transaction: commit failed: {e}. The workdir is partially merged \
+                     and the unmerged remainder was preserved at {}",
+                    upper_dir.display()
+                ))
             })?;
-            if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-                let err = std::io::Error::last_os_error();
-                // EWOULDBLOCK (== EAGAIN on Linux) means another commit holds the
-                // lock: lose the race benignly. Any other errno is a real failure.
-                if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
-                    let _ = branch.abort();
-                    reason = Some(
-                        "transaction: lost the first-committer-win race \
-                         (another commit is in progress on this workdir)"
-                            .to_string(),
-                    );
-                    false
-                } else {
-                    return Err(child_err(format!(
-                        "transaction: commit lock: {err}"
-                    )));
-                }
-            } else {
-                branch.commit().map_err(|e| {
-                    child_err(format!("transaction: commit failed: {e}"))
-                })?;
-                drop(lock); // release the workdir lock after the merge
-                true
-            }
+            drop(lock); // release the workdir lock after the merge
+            true
         }
         Some(mut branch) => {
             let _ = branch.abort();
@@ -265,6 +260,42 @@ async fn run_txn(
         stages: results,
         abort_reason: if committed { None } else { reason },
     })
+}
+
+/// Take an exclusive lock on the workdir, waiting up to `deadline_after` for a
+/// concurrent commit merge to release it. `flock` has no timed variant, so this
+/// is a bounded poll over the non-blocking form.
+///
+/// Waiting rather than failing fast is deliberate: a transaction that has run
+/// every stage successfully should publish its work, not discard it because
+/// another merge happened to be in flight for a few milliseconds.
+async fn acquire_commit_lock(
+    workdir: &std::path::Path,
+    deadline_after: Duration,
+) -> Result<std::fs::File, String> {
+    let lock = std::fs::File::open(workdir)
+        .map_err(|e| format!("transaction: open workdir for commit lock: {e}"))?;
+    let deadline = tokio::time::Instant::now() + deadline_after;
+    loop {
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(lock);
+        }
+        let err = std::io::Error::last_os_error();
+        // EWOULDBLOCK (== EAGAIN on Linux) means another commit holds the lock.
+        // Any other errno is a real failure and must not be retried.
+        if err.raw_os_error() != Some(libc::EWOULDBLOCK) {
+            return Err(format!("transaction: commit lock: {err}"));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "transaction: timed out after {:?} waiting for another commit to release the \
+                 workdir lock on {}",
+                deadline_after,
+                workdir.display()
+            ));
+        }
+        tokio::time::sleep(COMMIT_LOCK_POLL).await;
+    }
 }
 
 /// Run each stage to completion in order over the shared upper, with no
@@ -293,4 +324,81 @@ async fn drive_txn_stages(
         }
     }
     Ok((true, results, None))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::io::AsRawFd;
+
+    /// The commit lock WAITS for a concurrent merge instead of failing fast:
+    /// a transaction that ran every stage successfully must publish its work,
+    /// not lose it because another merge was in flight for a moment.
+    #[tokio::test]
+    async fn commit_lock_waits_for_a_held_lock_to_be_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = std::fs::File::open(dir.path()).unwrap();
+        assert_eq!(
+            unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+
+        let releaser = tokio::task::spawn_blocking(move || {
+            std::thread::sleep(Duration::from_millis(250));
+            drop(held);
+        });
+
+        let started = std::time::Instant::now();
+        let lock = acquire_commit_lock(dir.path(), Duration::from_secs(10))
+            .await
+            .expect("must acquire the lock once the holder releases it");
+        let waited = started.elapsed();
+        releaser.await.unwrap();
+        drop(lock);
+
+        assert!(
+            waited >= Duration::from_millis(200),
+            "must actually have waited for the holder, waited only {waited:?}"
+        );
+    }
+
+    /// The wait is bounded: a lock that is never released is an error naming
+    /// the workdir, not an indefinite hang.
+    #[tokio::test]
+    async fn commit_lock_wait_is_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = std::fs::File::open(dir.path()).unwrap();
+        assert_eq!(
+            unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+
+        let started = std::time::Instant::now();
+        let err = acquire_commit_lock(dir.path(), Duration::from_millis(200))
+            .await
+            .expect_err("a lock that is never released must time out");
+        let waited = started.elapsed();
+        drop(held);
+
+        assert!(err.contains("timed out"), "error should name the timeout, got: {err}");
+        assert!(
+            err.contains(&dir.path().display().to_string()),
+            "error should name the workdir, got: {err}"
+        );
+        assert!(
+            waited >= Duration::from_millis(200),
+            "must have waited out the whole deadline, waited {waited:?}"
+        );
+    }
+
+    /// An uncontended lock is taken immediately — the poll loop must not add
+    /// latency to the common case.
+    #[tokio::test]
+    async fn commit_lock_is_immediate_when_uncontended() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = std::time::Instant::now();
+        let lock = acquire_commit_lock(dir.path(), Duration::from_secs(10)).await.unwrap();
+        assert!(started.elapsed() < Duration::from_millis(100));
+        drop(lock);
+    }
 }

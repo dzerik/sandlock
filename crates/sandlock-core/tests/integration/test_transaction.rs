@@ -74,58 +74,48 @@ async fn test_txn_commits_on_success() {
     let _ = fs::remove_dir_all(&workdir);
 }
 
-/// First-committer-win: while another commit holds the workdir lock, a
-/// transaction that ran every stage to success still does NOT commit — it loses
-/// the race benignly (committed=false + abort_reason) instead of erroring or
-/// racing the file-by-file merge and corrupting the workdir.
+/// The commit merge is serialized against another transaction's merge, and a
+/// transaction that finds the workdir locked WAITS for it rather than
+/// discarding a full run's work. The lock is released mid-run, so the
+/// transaction must still commit.
 #[tokio::test]
-async fn test_txn_loses_first_committer_win_race() {
+async fn test_txn_waits_for_a_concurrent_commit_lock() {
     if !sandbox_available().await {
-        eprintln!("first-committer-win test skipped: sandbox unavailable");
+        eprintln!("commit-lock-wait test skipped: sandbox unavailable");
         return;
     }
-    let workdir = temp_dir("first-committer-win");
+    let workdir = temp_dir("commit-lock-wait");
     let policy = stage_policy(&workdir);
 
-    // Simulate a concurrent transaction mid-commit by holding the workdir lock.
+    // Stand in for another transaction mid-merge by holding the workdir lock,
+    // then releasing it while this transaction's stages are still running.
     let held = std::fs::File::open(&workdir).unwrap();
     assert_eq!(
         unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
         0,
         "test setup: could not take the workdir lock"
     );
+    let releaser = tokio::task::spawn_blocking(move || {
+        std::thread::sleep(Duration::from_millis(400));
+        drop(held);
+    });
 
-    // Every stage succeeds, so the transaction reaches commit; the held lock makes it
-    // lose the race. run() must return Ok — a lost race is not an error.
-    let txn = Transaction::new([
+    let outcome = Transaction::new([
         Stage::new(&policy, &["sh", "-c", "echo plan > a.txt"]),
         Stage::new(&policy, &["sh", "-c", "cat a.txt && echo built > b.txt"]),
-    ]);
-    let outcome = txn
-        .run(None)
-        .await
-        .expect("a lost first-committer-win race is a benign outcome, not an error");
+    ])
+    .run(None)
+    .await
+    .expect("transaction should run");
+    releaser.await.unwrap();
 
     assert!(
-        !outcome.committed,
-        "must not commit while another commit holds the workdir lock"
-    );
-    assert!(
-        outcome
-            .abort_reason
-            .as_deref()
-            .unwrap_or("")
-            .contains("first-committer-win"),
-        "abort_reason should name the lost race, got: {:?}",
+        outcome.committed,
+        "a transaction must wait out a concurrent commit, not lose its work; abort_reason: {:?}",
         outcome.abort_reason
     );
-    // Nothing may have been merged into the workdir.
-    assert!(
-        !workdir.join("a.txt").exists() && !workdir.join("b.txt").exists(),
-        "no stage output may be committed when the race is lost"
-    );
+    assert!(workdir.join("a.txt").exists() && workdir.join("b.txt").exists());
 
-    drop(held);
     let _ = fs::remove_dir_all(&workdir);
 }
 
