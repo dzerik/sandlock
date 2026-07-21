@@ -1173,16 +1173,19 @@ async fn test_named_unix_dgram_sendmsg_allowed_delivers() {
     dgram_allow_delivers("sendmsg", "msg", None).await;
 }
 
-/// Same delivery guarantee with an IP destination policy active. A non-empty
-/// `net_allow` makes `has_net_destination_policy` true, which is the switch that
-/// routes every sendto through the non-IP arm of `sendto_on_behalf` instead of
-/// letting it Continue — the arm that resolves the destination in the child's
-/// root view and pins the target inode. This is the happy path both hardening
-/// changes sit on: a named unix datagram must still be delivered, byte-for-byte,
-/// to the socket the child named. It is also the regression witness for the
-/// resolution context — a handler that hands the child's raw `sun_path` to the
-/// supervisor's `sendmsg` delivers to whatever that path names next to the
-/// supervisor, so a relative or child-relative destination silently misses.
+/// Same delivery guarantee with an IP destination policy active.
+///
+/// Scope, stated precisely: this sandbox declares fs grants, so
+/// `has_unix_fs_gate` is true and the send takes the PRE-EXISTING named-unix
+/// gate arm (`sendto_named_unix_on_behalf`), not the non-IP fall-through this
+/// PR changes. It therefore guards one thing only — that turning
+/// `has_net_destination_policy` on does not divert a named unix datagram away
+/// from that gate — and it is NOT a witness for either hardening change:
+/// mutating the abstract-address refusal, the fall-through's fd pinning, or the
+/// `/proc/<pid>/root` resolution context all leave it green. Those are covered
+/// by `test_abstract_unix_dgram_sendto_refused_under_destination_policy`,
+/// `if_nameindex_works_under_destination_policy`, and the `child_root_path`
+/// unit tests respectively.
 #[tokio::test]
 async fn test_named_unix_dgram_sendto_delivers_under_destination_policy() {
     dgram_allow_delivers("sendto", "to-netpolicy", Some("127.0.0.1:9")).await;
@@ -1637,4 +1640,136 @@ async fn test_deny_openat2_does_not_bypass() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The abstract-unix half of the sendto hardening, end to end.
+///
+/// Under a destination policy `sendto` no longer Continues on a non-IP
+/// address; it performs the send itself. For an ABSTRACT `AF_UNIX` destination
+/// that is a scope escape rather than a hardening: `LANDLOCK_SCOPE_ABSTRACT_-`
+/// `UNIX_SOCKET` is enforced against the credentials of the process performing
+/// the send, and the supervisor carries no Landlock domain — so an on-behalf
+/// abstract send reaches every abstract socket on the host, deterministically
+/// turning the child's scope off for as long as a destination policy is active.
+/// The handler must refuse it (`EAFNOSUPPORT`) instead.
+///
+/// The listener binds an abstract name OUTSIDE the sandbox, so it is exactly
+/// the host socket the child's scope is supposed to hide. Two assertions, both
+/// of which flip if the refusal is replaced by an on-behalf send: the child
+/// must see `EAFNOSUPPORT`, and the host listener must time out having received
+/// nothing.
+#[tokio::test]
+async fn test_abstract_unix_dgram_sendto_refused_under_destination_policy() {
+    if sandlock_core::landlock_abi_version().unwrap_or(0) < 6 {
+        eprintln!("Skipping: Landlock ABI v6 required");
+        return;
+    }
+
+    let abstract_name = format!("sandlock-abs-escape-{}", std::process::id());
+    let out = temp_file("abstract-dgram-child");
+    let ready_file = temp_file("abstract-dgram-ready");
+    let recv_file = temp_file("abstract-dgram-recv");
+    for f in [&out, &ready_file, &recv_file] {
+        let _ = std::fs::remove_file(f);
+    }
+
+    // Host-side listener on an ABSTRACT address, deliberately unsandboxed.
+    let listener_script = format!(
+        concat!(
+            "import socket\n",
+            "s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)\n",
+            "s.bind('\\0{name}')\n",
+            "s.settimeout(6)\n",
+            "open('{ready}', 'w').write('ready')\n",
+            "try:\n",
+            "    data, _ = s.recvfrom(64)\n",
+            "    open('{recv}', 'w').write('LEAKED:' + data.decode())\n",
+            "except socket.timeout:\n",
+            "    open('{recv}', 'w').write('NOTHING')\n",
+            "s.close()\n",
+        ),
+        name = abstract_name,
+        ready = ready_file.display(),
+        recv = recv_file.display(),
+    );
+    let mut listener_proc = std::process::Command::new("python3")
+        .args(["-c", &listener_script])
+        .spawn()
+        .unwrap();
+    for _ in 0..100 {
+        if ready_file.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(ready_file.exists(), "abstract listener should signal readiness");
+
+    let child_script = format!(
+        concat!(
+            "import socket\n",
+            "s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)\n",
+            "try:\n",
+            "    s.sendto(b'abstract-escape', '\\0{name}')\n",
+            "    result = 'SENT'\n",
+            "except OSError as e:\n",
+            "    result = 'ERRNO:%d' % e.errno\n",
+            "finally:\n",
+            "    s.close()\n",
+            "open('{out}', 'w').write(result)\n",
+        ),
+        name = abstract_name,
+        out = out.display(),
+    );
+
+    // A non-empty net_allow is the switch: it makes has_net_destination_policy
+    // true, so the send takes the supervisor's on-behalf arm instead of
+    // Continuing into the child's own (scoped) domain.
+    let policy = Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_write("/tmp")
+        .net_allow("127.0.0.1:9")
+        .build()
+        .unwrap();
+
+    policy
+        .clone()
+        .with_name("test")
+        .run_interactive(&["python3", "-c", &child_script])
+        .await
+        .unwrap();
+
+    let child_result = std::fs::read_to_string(&out).unwrap_or_default();
+
+    for _ in 0..160 {
+        if recv_file.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let _ = listener_proc.wait();
+    let delivered = std::fs::read_to_string(&recv_file).unwrap_or_default();
+
+    let _ = listener_proc.kill();
+    for f in [&out, &ready_file, &recv_file] {
+        let _ = std::fs::remove_file(f);
+    }
+
+    assert_eq!(
+        delivered, "NOTHING",
+        "the host's abstract socket must not receive the child's datagram: \
+         delivery means the supervisor sent it outside the child's \
+         LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET"
+    );
+    assert_eq!(
+        child_result,
+        format!("ERRNO:{}", libc::EAFNOSUPPORT),
+        "an abstract unix sendto must fail closed under a destination policy, \
+         not be executed by the (undomained) supervisor"
+    );
 }

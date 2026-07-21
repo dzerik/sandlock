@@ -76,13 +76,37 @@ pub(crate) fn path_under_any(path: &std::path::Path, prefixes: &[std::path::Path
     prefixes.iter().any(|p| norm.starts_with(p))
 }
 
+/// The shape of a non-IP destination sockaddr, keyed on its ADDRESS FAMILY
+/// first. Produced by `materialize::classify_dest_shape` from the copied
+/// address bytes.
+///
+/// The family is the load-bearing distinction. An abstract `AF_UNIX` address
+/// and an `AF_NETLINK` address both yield no pathname, but they are not the
+/// same case and must not share an arm: the first has to fail closed (see
+/// [`SendPath::Reject`]), the second is a legitimate message on a unix socket
+/// (see [`SendPath::RawDestOnBehalf`]).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DestShape {
+    /// `sa_family == AF_UNIX` with a pathname `sun_path` the supervisor can
+    /// re-resolve in the child's root view.
+    UnixNamed(std::path::PathBuf),
+    /// `sa_family == AF_UNIX` with no usable pathname: an ABSTRACT address
+    /// (`sun_path[0] == 0`), an unnamed one, a non-UTF-8 `sun_path`, or a
+    /// buffer too short to carry a family at all.
+    UnixNoPath,
+    /// `sa_family != AF_UNIX`. Reached here only for families
+    /// `parse_ip_from_sockaddr` does not handle: `AF_NETLINK`, `AF_PACKET`,
+    /// `AF_VSOCK`, ...
+    NotUnix,
+}
+
 /// The send path selected for one message, from the already-parsed destination
 /// shape and the *stable* socket domain. Pure: the caller supplies whether the
 /// message is connected, the parsed IP (if any), whether the pinned socket is
-/// `AF_UNIX`, and whether the destination is a NAMED (pathname) unix address, so
-/// the decision is unit-testable and cannot re-read child state.
+/// `AF_UNIX`, and the destination's [`DestShape`], so the decision is
+/// unit-testable and cannot re-read child state.
 ///
-/// The named-unix arm sends on-behalf on the pinned fd rather than returning
+/// Every non-`Reject` arm sends on-behalf on the pinned fd rather than returning
 /// `Continue`: gating on the transient address family and Continuing would let a
 /// racing `dup2(inet_sock, sockfd)` + `msg_name` swap ride out on the kernel's
 /// re-read and reach a denied IP. Sending on the pinned fd we already checked
@@ -98,10 +122,26 @@ pub(crate) enum SendPath {
     /// `/proc/self/fd/<pin>` with no IP check (the kernel constrains a unix
     /// socket to unix peers, and we never Continue).
     NamedUnixOnBehalf,
+    /// A non-`AF_UNIX` destination address on a unix-domain socket: send
+    /// on-behalf on the pinned fd with the child's address bytes verbatim.
+    ///
+    /// This is the shape sandlock's own `NETLINK_ROUTE` virtualization
+    /// produces: the child's "netlink socket" is one end of a
+    /// `socketpair(AF_UNIX, SOCK_SEQPACKET)`, and glibc addresses it with a
+    /// `sockaddr_nl`. There is no pathname to pin and none is needed — the
+    /// socket is connected, so the kernel ignores `msg_name` entirely, and the
+    /// fd was pinned before the domain was read, so no `dup2` can redirect the
+    /// send. Refusing this shape instead would take every netlink query
+    /// (`if_nameindex`, `getaddrinfo`'s `AI_ADDRCONFIG` probe, ...) offline for
+    /// any sandbox that declares a destination policy.
+    ///
+    /// For any other non-unix family on a unix socket the kernel itself
+    /// rejects the mismatch, so passing the bytes through is not a widening.
+    RawDestOnBehalf,
     /// Everything else, failed closed with `EAFNOSUPPORT`:
     ///   - a non-IP address on a non-unix socket — the address-family-swap shape;
-    ///   - a unix destination we cannot pin in the child's context: an ABSTRACT
-    ///     address, an empty one, or a non-UTF-8 `sun_path`.
+    ///   - an `AF_UNIX` destination we cannot pin in the child's context: an
+    ///     ABSTRACT address, an empty one, or a non-UTF-8 `sun_path`.
     ///
     /// Abstract addresses fail closed because an on-behalf send is executed by
     /// the supervisor, which carries no Landlock domain, and
@@ -117,25 +157,30 @@ pub(crate) enum SendPath {
 
 /// Classify a send destination into the [`SendPath`] the handler should take.
 ///
-/// `named_unix_dest` is "the destination sockaddr is a pathname `AF_UNIX`
-/// address" (i.e. `named_unix_socket_path` returned `Some`), which is precisely
-/// the set of unix destinations the supervisor can re-resolve in the child's
-/// root view and pin. It is deliberately separate from `is_unix_socket` (the
-/// socket's stable `SO_DOMAIN`): the address is attacker-controlled per message,
-/// the domain is not, and both must hold to send on-behalf.
+/// `dest` is the destination's [`DestShape`] — attacker-controlled per message.
+/// It is deliberately separate from `is_unix_socket` (the socket's stable
+/// `SO_DOMAIN`), which cannot be swapped once the fd is pinned. Only a
+/// unix-domain socket may take an on-behalf non-IP arm at all; what the
+/// destination family then selects is *which* on-behalf arm.
 pub(crate) fn classify_send_path(
     connected: bool,
     ip: Option<IpAddr>,
     is_unix_socket: bool,
-    named_unix_dest: bool,
+    dest: &DestShape,
 ) -> SendPath {
     if connected {
         return SendPath::ConnectedOnBehalf;
     }
     match ip {
         Some(ip) => SendPath::IpChecked(ip),
-        None if is_unix_socket && named_unix_dest => SendPath::NamedUnixOnBehalf,
-        None => SendPath::Reject,
+        // A non-IP address on a non-unix socket is the address-family-swap
+        // shape, whatever the address claims to be.
+        None if !is_unix_socket => SendPath::Reject,
+        None => match dest {
+            DestShape::UnixNamed(_) => SendPath::NamedUnixOnBehalf,
+            DestShape::UnixNoPath => SendPath::Reject,
+            DestShape::NotUnix => SendPath::RawDestOnBehalf,
+        },
     }
 }
 
@@ -184,17 +229,21 @@ mod tests {
         assert_eq!(destination_verdict(&p, allowed, None), Err(ECONNREFUSED));
     }
 
+    fn named(p: &str) -> DestShape {
+        DestShape::UnixNamed(std::path::PathBuf::from(p))
+    }
+
     #[test]
     fn send_path_connected_never_checks_address() {
         // A connected socket carries no per-message destination; the parsed
         // address and socket domain are irrelevant.
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
         assert_eq!(
-            classify_send_path(true, Some(ip), false, false),
+            classify_send_path(true, Some(ip), false, &DestShape::NotUnix),
             SendPath::ConnectedOnBehalf
         );
         assert_eq!(
-            classify_send_path(true, None, true, false),
+            classify_send_path(true, None, true, &DestShape::UnixNoPath),
             SendPath::ConnectedOnBehalf
         );
     }
@@ -203,12 +252,12 @@ mod tests {
     fn send_path_ip_destination_is_checked() {
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
         assert_eq!(
-            classify_send_path(false, Some(ip), false, false),
+            classify_send_path(false, Some(ip), false, &DestShape::NotUnix),
             SendPath::IpChecked(ip)
         );
         // Socket domain does not override a parsed IP destination.
         assert_eq!(
-            classify_send_path(false, Some(ip), true, false),
+            classify_send_path(false, Some(ip), true, &DestShape::NotUnix),
             SendPath::IpChecked(ip)
         );
     }
@@ -220,29 +269,55 @@ mod tests {
         // it on-behalf on the pinned fd (never Continue), so a raced fd/addr swap
         // cannot redirect it to a denied IP.
         assert_eq!(
-            classify_send_path(false, None, true, true),
+            classify_send_path(false, None, true, &named("/run/svc.dgram")),
             SendPath::NamedUnixOnBehalf
         );
     }
 
     #[test]
     fn send_path_abstract_unix_destination_is_rejected() {
-        // An abstract (or empty, or non-UTF-8) unix address has no pathname to
-        // pin: `named_unix_socket_path` returns None, so `named_unix_dest` is
-        // false. It must fail closed rather than be sent on-behalf — the
+        // An abstract (or empty, or non-UTF-8) AF_UNIX address has no pathname
+        // to pin. It must fail closed rather than be sent on-behalf — the
         // supervisor carries no Landlock domain, so an on-behalf abstract send
         // would escape the child's LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET.
-        assert_eq!(classify_send_path(false, None, true, false), SendPath::Reject);
+        assert_eq!(
+            classify_send_path(false, None, true, &DestShape::UnixNoPath),
+            SendPath::Reject
+        );
+    }
+
+    #[test]
+    fn send_path_non_unix_destination_on_unix_socket_goes_on_behalf() {
+        // A non-AF_UNIX address on a unix-domain socket is NOT the abstract
+        // case and must not share its arm: it is what sandlock's own
+        // NETLINK_ROUTE virtualization produces (child fd = one end of a
+        // socketpair(AF_UNIX, SOCK_SEQPACKET), addressed with a sockaddr_nl).
+        // Collapsing it into Reject takes every netlink query offline under a
+        // destination policy, so this assertion is the deterministic witness
+        // that the two no-pathname shapes stay apart.
+        assert_eq!(
+            classify_send_path(false, None, true, &DestShape::NotUnix),
+            SendPath::RawDestOnBehalf
+        );
     }
 
     #[test]
     fn send_path_non_ip_on_non_unix_socket_is_rejected() {
         // A non-IP address on a non-unix (IP) socket is the address-family-swap
         // shape; fail closed. Pre-fix logic returned Continue for this input, so
-        // this assertion is the deterministic fail-without-fix witness.
-        assert_eq!(classify_send_path(false, None, false, false), SendPath::Reject);
-        // A pathname address does not rescue a non-unix socket: the stable
-        // domain decides, and only both together take the on-behalf arm.
-        assert_eq!(classify_send_path(false, None, false, true), SendPath::Reject);
+        // this assertion is the deterministic fail-without-fix witness. The
+        // stable socket domain decides first: no destination shape rescues it.
+        assert_eq!(
+            classify_send_path(false, None, false, &DestShape::NotUnix),
+            SendPath::Reject
+        );
+        assert_eq!(
+            classify_send_path(false, None, false, &DestShape::UnixNoPath),
+            SendPath::Reject
+        );
+        assert_eq!(
+            classify_send_path(false, None, false, &named("/run/svc.dgram")),
+            SendPath::Reject
+        );
     }
 }

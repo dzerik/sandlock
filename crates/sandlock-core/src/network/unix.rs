@@ -20,31 +20,46 @@ use super::materialize::{
 use super::send_engine::{batch_send_step, resolve_send, wants_blocking, BatchStep};
 use super::verdict::{path_under_any, real_path_under_any};
 
-/// Pin the inode a named unix socket `sun_path` resolves to **in the child's
-/// root view** (`/proc/<pid>/root`), following the child's symlinks rather than
-/// the supervisor's. Returns an `O_PATH` fd to that exact inode; callers address
-/// it through `/proc/self/fd` so the resolved inode is the one acted on, immune
-/// to a path swap after the check (TOCTOU- and symlink-safe).
+/// Render the supervisor-side path that addresses `sun_path` **in the child's
+/// root view**, i.e. `/proc/<pid>/root` + the child's absolute `sun_path`.
+/// Pure: builds a string, touches nothing. Single source of truth for the
+/// resolution context, so a change to it is visible in one unit test rather
+/// than only in a live sandbox.
 ///
-/// A relative `sun_path` is refused instead of resolved. The supervisor cannot
-/// reproduce the child's cwd, so resolving one here would silently address a
-/// different socket — whichever one sits at that name under the *supervisor's*
-/// cwd. (The `/proc/<pid>/root` concatenation below happens to produce a bogus
-/// path for a relative input today, so the open already fails; the explicit
-/// check makes that fail-closed property intentional rather than incidental, and
-/// keeps it under a refactor to `Path::join`, which would silently drop the
-/// prefix.) `ECONNREFUSED` matches the errno an unreachable target already
-/// returns, so no caller observes a new failure mode.
+/// Returns `None` for a relative `sun_path`, which is refused instead of
+/// resolved: the supervisor cannot reproduce the child's cwd, so resolving one
+/// here would silently address a different socket — whichever one sits at that
+/// name under the *supervisor's* cwd. Concatenating a relative input onto the
+/// prefix would also produce a path that merely happens to be bogus today
+/// (`/proc/42/rootsvc.dgram`); the explicit check makes the fail-closed
+/// property intentional rather than incidental, and keeps it under a refactor
+/// to `Path::join`, which would silently drop the prefix.
+fn child_root_path(child_pid: u32, sun_path: &std::path::Path) -> Option<String> {
+    if !sun_path.is_absolute() {
+        return None;
+    }
+    Some(format!("/proc/{}/root{}", child_pid, sun_path.display()))
+}
+
+/// Pin the inode a named unix socket `sun_path` resolves to **in the child's
+/// root view** (see [`child_root_path`]), following the child's symlinks rather
+/// than the supervisor's. Returns an `O_PATH` fd to that exact inode; callers
+/// address it through `/proc/self/fd` so the resolved inode is the one acted on,
+/// immune to a path swap after the check (TOCTOU- and symlink-safe).
+///
+/// A `sun_path` [`child_root_path`] refuses gets `ECONNREFUSED`, which matches
+/// the errno an unreachable target already returns, so no caller observes a new
+/// failure mode.
 fn pin_child_unix_target(
     child_pid: u32,
     sun_path: &std::path::Path,
 ) -> Result<OwnedFd, NotifAction> {
-    if !sun_path.is_absolute() {
-        return Err(NotifAction::Errno(ECONNREFUSED));
-    }
+    let proc_path = match child_root_path(child_pid, sun_path) {
+        Some(p) => p,
+        None => return Err(NotifAction::Errno(ECONNREFUSED)),
+    };
     // `O_PATH` follows symlinks to the real socket inode and pins it without
     // performing any I/O on the socket.
-    let proc_path = format!("/proc/{}/root{}", child_pid, sun_path.display());
     let c_proc = std::ffi::CString::new(proc_path)
         .map_err(|_| NotifAction::Errno(libc::EACCES))?;
     let pinned_raw = unsafe { libc::open(c_proc.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
@@ -197,6 +212,18 @@ pub(super) fn sendto_named_unix_on_behalf(
 /// Takes the caller's already-dup'd socket — the caller pinned it to read its
 /// stable `SO_DOMAIN` — so the child's `sockfd` is sampled exactly once and
 /// cannot be swapped between the domain check and the send.
+///
+/// REACHABILITY: no configuration that can execute code reaches this today, so
+/// it carries no integration test and is defence in depth rather than a live
+/// path. `has_unix_fs_gate == false` means the sandbox declares no fs grant at
+/// all, and Landlock then denies `execve` of anything (verified: a sandbox with
+/// only `net_allow` fails with `EACCES` on exec), while `Sandbox::fork` — the
+/// one way into an already-running process — installs a deny-only seccomp
+/// filter and no notification supervisor, so no send handler runs there. The
+/// arm exists because the pre-existing alternative was to hand the child's raw
+/// `sun_path` to the supervisor's own `sendto`, which resolves against the
+/// SUPERVISOR's cwd/root; if either gap closes (an fs opt-out, or `fork` gaining
+/// notify supervision) that would become a live confused-deputy write.
 pub(super) fn sendto_pinned_unix_on_behalf(
     notif: &SeccompNotif,
     notif_fd: RawFd,
@@ -402,24 +429,40 @@ pub(super) fn sendmmsg_named_unix_on_behalf(
 mod tests {
     use super::*;
 
-    /// A relative `sun_path` must be refused outright, never resolved: the
-    /// supervisor's cwd is not the child's, so resolving it would address
-    /// whatever socket happens to sit at that name next to the supervisor.
-    /// This is the deterministic witness for the fail-closed check — the
-    /// positive case below shows the rejection is not vacuous.
+    /// The resolution context is the CHILD's root view, not the supervisor's.
+    /// Asserting on the rendered string is the only way to see that: without a
+    /// mount namespace the supervisor's `/` and `/proc/<pid>/root` name the same
+    /// inodes, so dropping the prefix is invisible to any live-sandbox test but
+    /// is exactly the bug (a chrooted or differently-mounted child would be
+    /// addressed against the supervisor's root).
     #[test]
-    fn pin_child_unix_target_refuses_relative_sun_path() {
-        let action = pin_child_unix_target(std::process::id(), std::path::Path::new("svc.dgram"));
-        assert!(
-            matches!(action, Err(NotifAction::Errno(e)) if e == ECONNREFUSED),
-            "relative sun_path must be refused, got {:?}",
-            action.map(|_| "pinned")
+    fn child_root_path_resolves_in_the_childs_root_view() {
+        assert_eq!(
+            child_root_path(4242, std::path::Path::new("/run/svc.dgram")).as_deref(),
+            Some("/proc/4242/root/run/svc.dgram")
         );
     }
 
-    /// Positive control: an absolute path is resolved through
-    /// `/proc/<pid>/root` and pinned. Uses our own pid, whose root view is the
-    /// test process's own root, so the pin is deterministic.
+    /// A relative `sun_path` must be refused outright, never resolved: the
+    /// supervisor's cwd is not the child's, so resolving it would address
+    /// whatever socket happens to sit at that name next to the supervisor.
+    /// Asserted on the builder rather than on `pin_child_unix_target`, whose
+    /// `ECONNREFUSED` is indistinguishable from "target missing" — dropping the
+    /// guard there still yields `ECONNREFUSED` because the concatenation
+    /// (`/proc/<pid>/rootsvc.dgram`) fails to open anyway, so such a test would
+    /// pass with the guard deleted.
+    #[test]
+    fn child_root_path_refuses_relative_sun_path() {
+        assert_eq!(
+            child_root_path(4242, std::path::Path::new("svc.dgram")),
+            None,
+            "a relative sun_path must be refused, not concatenated"
+        );
+    }
+
+    /// End-to-end control for the two assertions above: the builder's output is
+    /// actually what gets opened and pinned. Uses our own pid, whose root view
+    /// is the test process's own root, so the pin is deterministic.
     #[test]
     fn pin_child_unix_target_pins_absolute_path() {
         let pinned = pin_child_unix_target(std::process::id(), std::path::Path::new("/dev/null"));
