@@ -190,8 +190,11 @@ pub enum TxnError {
 
     /// Conflict: another transaction held the workdir commit lock for longer
     /// than [`Transaction::commit_lock_wait`]. Every stage had succeeded, so the
-    /// workdir is untouched and the whole change set is preserved at
-    /// `preserved_upper` — retrying is the expected response.
+    /// workdir is untouched and the whole change set is preserved — additions
+    /// and modifications under `preserved_upper`, deletions in the `PRESERVED`
+    /// marker beside it (see
+    /// [`read_preserved`](crate::cow::seccomp::read_preserved)). Retrying is the
+    /// expected response.
     #[error(
         "transaction: gave up after {waited:?} waiting for another commit to release the workdir \
          lock on {workdir}. The workdir is untouched and this transaction's changes were \
@@ -218,13 +221,15 @@ pub enum TxnError {
         source: std::io::Error,
     },
 
-    /// The commit merge failed partway. The workdir is partially merged and the
-    /// shared upper is preserved at `preserved_upper`, holding exactly the
-    /// changes that did not land; retrying the transaction is not the way to
-    /// finish it, recovering that upper is.
+    /// The commit merge failed. The workdir may be partially merged and the
+    /// change set that did not land is preserved — additions and modifications
+    /// under `preserved_upper`, deletions in the `PRESERVED` marker beside it
+    /// (see [`read_preserved`](crate::cow::seccomp::read_preserved)). Retrying
+    /// the transaction is not the way to finish it, recovering that storage is.
     #[error(
-        "transaction: the commit merge into {workdir} failed: {source}. The workdir is partially \
-         merged and what did not land was preserved at {preserved_upper}"
+        "transaction: the commit merge into {workdir} failed: {source}. The workdir may be \
+         partially merged; what did not land was preserved at {preserved_upper}, with any \
+         outstanding deletions listed in the PRESERVED marker beside it"
     )]
     Merge {
         workdir: std::path::PathBuf,

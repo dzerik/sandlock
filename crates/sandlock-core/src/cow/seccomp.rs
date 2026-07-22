@@ -88,15 +88,18 @@ const PRESERVED_MARKER: &str = "PRESERVED";
 /// Why a branch's private storage was preserved instead of reclaimed.
 ///
 /// Every preserved branch is storage that nothing in this process will free
-/// again — see [`SeccompCowBranch::preserve`].
+/// again — see [`SeccompCowBranch::preserve`]. What it holds is the upper plus
+/// the marker's deletions, together: see [`PreservedBranch`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreserveReason {
-    /// A merge into the workdir started and did not finish. The workdir is
-    /// partially modified and the upper holds the part that did not land.
+    /// A merge into the workdir was started and did not finish. The workdir may
+    /// be partially modified — the marker is written before the first
+    /// destructive step, so this is also what a merge still in flight looks
+    /// like — and the storage holds the part that had not landed.
     MergeInterrupted,
     /// The changes were complete and mergeable, but the merge never started —
     /// the commit could not take the workdir lock in time. The workdir is
-    /// untouched and the upper holds the whole change set.
+    /// untouched and the storage holds the whole change set.
     CommitDeferred,
     /// The caller asked for the changes to be kept for inspection rather than
     /// merged or discarded ([`crate::sandbox::BranchAction::Keep`]).
@@ -128,15 +131,24 @@ impl PreserveReason {
 /// This is what an out-of-band recovery works from: the process that created
 /// the branch is gone, so the only thing tying an upper on disk to the workdir
 /// it belongs to is the marker this was parsed from.
+///
+/// A change set is the upper **and** [`deleted`](Self::deleted) together.
+/// Deletions are tracked in RAM while the branch is live (there are no whiteout
+/// entries in the upper), so recovering by copying the upper over the workdir
+/// and nothing else would resurrect every file the run deleted; the marker
+/// records them for exactly that reason.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreservedBranch {
     /// The branch's private storage dir, i.e. what to remove once recovered.
     pub branch_dir: PathBuf,
-    /// The upper holding the preserved changes.
+    /// The upper holding the preserved additions and modifications.
     pub upper: PathBuf,
     /// The workdir the changes belong to, canonicalized when the branch was
     /// created.
     pub workdir: PathBuf,
+    /// Paths the run deleted, relative to `workdir`, in sorted order. The other
+    /// half of the change set: nothing in `upper` represents them.
+    pub deleted: Vec<PathBuf>,
     /// Why it was preserved, which says what state the workdir is in.
     pub reason: PreserveReason,
     /// The process that preserved it. Recorded for triage only — it may have
@@ -188,6 +200,7 @@ pub fn read_preserved(branch_dir: &Path) -> Option<PreservedBranch> {
     let mut workdir = None;
     let mut upper = None;
     let mut pid = None;
+    let mut deleted = Vec::new();
     for line in body.split(|&b| b == b'\n') {
         let sep = match line.iter().position(|&b| b == b'=') {
             Some(i) => i,
@@ -199,6 +212,8 @@ pub fn read_preserved(branch_dir: &Path) -> Option<PreservedBranch> {
             b"reason" => reason = PreserveReason::from_token(value),
             b"workdir" => workdir = Some(path()),
             b"upper" => upper = Some(path()),
+            // Repeated, one per deleted path — the only multi-valued key.
+            b"deleted" => deleted.push(path()),
             b"pid" => pid = std::str::from_utf8(value).ok().and_then(|s| s.parse().ok()),
             _ => {}
         }
@@ -207,6 +222,7 @@ pub fn read_preserved(branch_dir: &Path) -> Option<PreservedBranch> {
         branch_dir: branch_dir.to_path_buf(),
         upper: upper?,
         workdir: workdir?,
+        deleted,
         reason: reason?,
         pid: pid?,
     })
@@ -1193,13 +1209,18 @@ impl SeccompCowBranch {
     /// Hand the branch's private storage over to whoever recovers it: `Drop`
     /// will not reclaim it and no other code path frees it either.
     ///
-    /// This is a **deliberate leak** — the caller is asserting that the upper
+    /// This is a **deliberate leak** — the caller is asserting that the storage
     /// holds the only copy of changes that must survive this process. Reclaiming
     /// it is out-of-band work, so a marker naming the workdir, the upper, the
     /// reason and this pid is written alongside the upper: without it a
     /// preserved upper is indistinguishable from any orphaned one and a sweep
     /// cannot tell which workdir it belongs to. Read it back with
     /// [`read_preserved`] / [`list_preserved`].
+    ///
+    /// The marker also carries the deletions. They live only in this struct's
+    /// `deleted` set while the branch is live — nothing in the upper represents
+    /// them — so without writing them down a preserved branch would be an upper
+    /// that resurrects every file the run deleted when it is recovered.
     ///
     /// Writing the marker is best-effort. If it fails the upper is still
     /// preserved in this process — losing the data would be worse than losing
@@ -1219,6 +1240,17 @@ impl SeccompCowBranch {
         body.extend_from_slice(&marker_escape(self.workdir.as_os_str().as_bytes()));
         body.extend_from_slice(b"\nupper=");
         body.extend_from_slice(&marker_escape(self.upper.as_os_str().as_bytes()));
+        // One line per deletion, sorted so the marker is byte-stable for the
+        // same change set. This is the set as it stood when `preserve` was
+        // called — `commit()` calls it before applying any of them — so a
+        // recovery may re-apply a deletion that has since landed. That is a
+        // no-op, and it is the safe direction: the other one loses a deletion.
+        let mut deletions: Vec<&String> = self.deleted.iter().collect();
+        deletions.sort();
+        for rel in deletions {
+            body.extend_from_slice(b"\ndeleted=");
+            body.extend_from_slice(&marker_escape(rel.as_bytes()));
+        }
         body.extend_from_slice(format!("\npid={}\n", std::process::id()).as_bytes());
         fs::write(self.storage_dir.join(PRESERVED_MARKER), body)
     }
@@ -1542,6 +1574,68 @@ mod tests {
             list_preserved(storage.path()).len(),
             1,
             "an aborted branch must not show up as work awaiting recovery",
+        );
+    }
+
+    /// A preserved branch must carry the DELETIONS as well as the upper.
+    ///
+    /// Deletions live only in the branch's in-RAM `deleted` set — there are no
+    /// whiteout entries in the upper — so a recovery that reads the upper alone
+    /// resurrects every file the run deleted. That is the worst case of all,
+    /// because `TxnError::Merge` tells the operator that recovering the
+    /// preserved storage IS how the transaction gets finished.
+    #[test]
+    fn a_preserved_branch_carries_its_deletions_not_only_its_upper() {
+        let workdir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        fs::write(workdir.path().join("keep.txt"), "still here").unwrap();
+
+        // The commit-lock path: the whole change set is complete and NONE of it
+        // has been applied, so a recovery that only copies the upper over the
+        // workdir leaves keep.txt behind — a file the run deleted.
+        {
+            let mut branch =
+                SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+            fs::write(branch.upper.join("added.txt"), "payload").unwrap();
+            branch.mark_deleted("keep.txt");
+            branch.mark_deleted("sub/also gone.txt");
+            branch.preserve(PreserveReason::CommitDeferred);
+        }
+
+        let found = list_preserved(storage.path());
+        assert_eq!(found.len(), 1, "the sweep must find the preserved branch, got {found:?}");
+        assert!(
+            found[0].upper.join("added.txt").exists(),
+            "the additions are the half that lives in the upper",
+        );
+        assert_eq!(
+            found[0].deleted,
+            vec![PathBuf::from("keep.txt"), PathBuf::from("sub/also gone.txt")],
+            "recovering the preserved branch must not resurrect what the run deleted",
+        );
+    }
+
+    /// The marker is a line-based format holding paths, and a path may contain a
+    /// newline (and need not be UTF-8). Round-trip one so the format cannot be
+    /// silently broken by a legal workdir name — including a DELETED path, which
+    /// is a name the child chose and so is even less constrained.
+    #[test]
+    fn the_preserved_marker_round_trips_a_deleted_path_with_a_newline() {
+        let workdir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("/dev/null", workdir.path().join("blocked.txt")).unwrap();
+
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        fs::write(branch.upper.join("blocked.txt"), "payload").unwrap();
+        branch.mark_deleted("we\nird\\name.txt");
+        branch.commit().expect_err("the obstructed merge must fail");
+
+        let found = list_preserved(storage.path());
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].deleted,
+            vec![PathBuf::from("we\nird\\name.txt")],
+            "a deleted path with a newline and a backslash must survive the round-trip",
         );
     }
 
