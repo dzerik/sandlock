@@ -519,8 +519,10 @@ async fn run_txn(
     // otherwise discard — before propagating any driver error, so a mid-loop
     // failure never leaves the upper dangling. (`SeccompCowBranch`'s Drop is a
     // further backstop for a panic between here and the disposition.)
-    // Take the branch out from under the async mutex first, then commit/abort the
-    // owned value so the sync merge doesn't run while holding the guard.
+    // Take the branch out from under the async mutex first, then move the owned
+    // value onto a blocking thread: the merge must not run while holding the
+    // guard, must not run on an executor worker, and must not be droppable by a
+    // cancellation (see `finish_branch`).
     let taken = { state.lock().await.branch.take() };
     let (mut reason, drive_err) = match driven {
         Ok(rsn) => (rsn, None),
