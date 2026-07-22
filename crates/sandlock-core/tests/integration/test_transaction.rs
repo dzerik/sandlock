@@ -77,6 +77,45 @@ async fn test_txn_commits_on_success() {
     let _ = fs::remove_dir_all(&workdir);
 }
 
+/// A later stage must be able to EXECUTE a file an earlier stage created.
+///
+/// Landlock checks EXECUTE against the file's real path at `execve` time, and a
+/// file created in the workdir really lives in the shared upper — so unless the
+/// stage's ruleset grants read+execute on that upper, `./x.sh` fails with
+/// `EACCES` and the shell reports 126. Nothing else in the suite covers it: the
+/// shared-COW path builds no branch of its own, so it does not go through the
+/// grant that `Sandbox`'s own branch gets, and
+/// `test_cow::test_seccomp_cow_exec_packed_argv_relocation` only covers the
+/// plain-`Sandbox` half of that pair.
+#[tokio::test]
+async fn test_txn_stage_can_exec_what_an_earlier_stage_created() {
+    if !sandbox_available().await {
+        eprintln!("shared-upper exec test skipped: sandbox unavailable");
+        return;
+    }
+    let workdir = temp_dir("shared-upper-exec");
+    let policy = stage_policy(&workdir);
+
+    let outcome = Transaction::new([
+        Stage::new(&policy, &["sh", "-c", "printf '#!/bin/sh\\nexit 0\\n' > x.sh && chmod 755 x.sh"]),
+        // `exec` so the stage's own status IS the exec's outcome: 126 when the
+        // kernel refuses it, not a shell error swallowed into 1.
+        Stage::new(&policy, &["sh", "-c", "exec ./x.sh"]),
+    ])
+    .run(None)
+    .await
+    .expect("transaction should run");
+
+    assert_eq!(
+        outcome.abort_reason, None,
+        "a stage must be able to exec a file an earlier stage created in the shared upper",
+    );
+    assert!(outcome.committed, "the transaction should have committed");
+    assert!(workdir.join("x.sh").exists(), "x.sh must be committed to the workdir");
+
+    let _ = fs::remove_dir_all(&workdir);
+}
+
 /// Whether any branch under `storage` has `name` in its upper. Used to observe
 /// how far the stages have got from outside the transaction.
 fn upper_holds(storage: &Path, name: &str) -> bool {
