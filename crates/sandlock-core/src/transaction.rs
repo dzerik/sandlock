@@ -745,7 +745,649 @@ async fn drive_txn_stages(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sandbox::{BranchAction, ByteSize, Sandbox};
     use std::os::unix::io::AsRawFd;
+
+    // ------------------------------------------------------------
+    // Validation
+    // ------------------------------------------------------------
+
+    /// A stage that satisfies every cross-stage rule: it sets the shared
+    /// workdir and nothing else the transaction owns. The command is never run —
+    /// every validation test below is rejected (or accepted) before `run_txn`
+    /// touches a cage.
+    fn ok_stage(workdir: &std::path::Path) -> Stage {
+        Stage::new(&Sandbox::builder().workdir(workdir).build().unwrap(), &["true"])
+    }
+
+    /// The rejection message of a stage set, or `None` if it validates.
+    fn rejection(stages: &[Stage]) -> Option<String> {
+        match validate_txn_stages(stages) {
+            Ok(()) => None,
+            Err(TxnError::Invalid(m)) => Some(m),
+            Err(other) => panic!("validation must only ever produce Invalid, got: {other:?}"),
+        }
+    }
+
+    /// Both per-stage branch actions must be left at `Commit`, and the check is
+    /// on the VALUE, not on whether the builder was called: a stage that spells
+    /// out `on_exit = commit` — what a TOML profile writing the default looks
+    /// like — is accepted, while every other combination of the two fields is
+    /// rejected.
+    ///
+    /// This walks all nine cells because the two halves of the check are
+    /// separately deletable. Narrowing it to `on_exit` alone leaves the
+    /// pre-existing `test_txn_rejects_branch_action` green, so nothing has been
+    /// guarding `on_error` — and `on_error(Keep)` is exactly what a caller who
+    /// wants forensics on a failed stage reaches for, which would preserve the
+    /// SHARED upper behind the coordinator's back.
+    ///
+    /// The rejection message is pinned too. It says "leave them at their
+    /// defaults" without naming the default, which is `Commit`.
+    #[test]
+    fn per_stage_branch_actions_are_rejected_unless_both_are_the_default() {
+        let wd = tempfile::tempdir().unwrap();
+        let actions = [BranchAction::Commit, BranchAction::Abort, BranchAction::Keep];
+
+        for on_exit in &actions {
+            for on_error in &actions {
+                let sb = Sandbox::builder()
+                    .workdir(wd.path())
+                    .on_exit(on_exit.clone())
+                    .on_error(on_error.clone())
+                    .build()
+                    .unwrap();
+                let stages = vec![Stage::new(&sb, &["true"]), ok_stage(wd.path())];
+                let got = rejection(&stages);
+
+                if *on_exit == BranchAction::Commit && *on_error == BranchAction::Commit {
+                    assert_eq!(
+                        got, None,
+                        "the default pair must be accepted even when set explicitly, \
+                         but on_exit={on_exit:?}/on_error={on_error:?} was rejected"
+                    );
+                    continue;
+                }
+                let msg = got.unwrap_or_else(|| {
+                    panic!(
+                        "on_exit={on_exit:?}/on_error={on_error:?} is a per-stage branch action \
+                         and must be rejected, but the transaction validated"
+                    )
+                });
+                assert!(
+                    msg.contains("stage 0 sets on_exit/on_error")
+                        && msg.contains("leave them at their defaults"),
+                    "on_exit={on_exit:?}/on_error={on_error:?} must be rejected as a branch-action \
+                     conflict naming the stage, got: {msg}"
+                );
+            }
+        }
+    }
+
+    /// Every guardrail that can fire at all must fire when the offending stage
+    /// is stage 0.
+    ///
+    /// Stage 0 is the baseline the other stages are compared against, so it is
+    /// the index a refactor is most likely to special-case. Making the loop
+    /// `continue` on `i == 0` leaves every pre-existing `test_txn_rejects_*`
+    /// integration test green, because each one puts its violation on the
+    /// second stage.
+    ///
+    /// The workdir and fs_storage/max_disk rules are absent here on purpose:
+    /// they compare a stage against stage 0, so they cannot fire AT stage 0.
+    #[test]
+    fn every_guardrail_that_can_fire_at_stage_zero_does() {
+        let wd = tempfile::tempdir().unwrap();
+        let chroot = tempfile::tempdir().unwrap();
+        let cases: [(&str, Sandbox); 4] = [
+            (
+                "has no_supervisor=true",
+                Sandbox::builder().workdir(wd.path()).no_supervisor(true).build().unwrap(),
+            ),
+            (
+                "sets chroot",
+                Sandbox::builder().workdir(wd.path()).chroot(chroot.path()).build().unwrap(),
+            ),
+            (
+                "sets on_exit/on_error",
+                Sandbox::builder()
+                    .workdir(wd.path())
+                    .on_exit(BranchAction::Abort)
+                    .build()
+                    .unwrap(),
+            ),
+            (
+                "sets on_exit/on_error",
+                Sandbox::builder()
+                    .workdir(wd.path())
+                    .on_error(BranchAction::Keep)
+                    .build()
+                    .unwrap(),
+            ),
+        ];
+
+        for (fragment, offender) in cases {
+            let stages = vec![Stage::new(&offender, &["true"]), ok_stage(wd.path())];
+            let msg = rejection(&stages).unwrap_or_else(|| {
+                panic!("a stage 0 that {fragment} must be rejected, but the transaction validated")
+            });
+            assert!(
+                msg.contains(&format!("stage 0 {fragment}")),
+                "the violation is at stage 0 and must be reported there, got: {msg}"
+            );
+        }
+    }
+
+    /// A transaction whose stages set no workdir at all is an `Invalid` error,
+    /// not a panic — through both entry points.
+    ///
+    /// `run_txn` reads stage 0's workdir with `.expect("validated: stage 0 has a
+    /// workdir")`, so the validator is the only thing standing between a
+    /// misconfigured caller and a panic inside a supervisor. Both `run` and
+    /// `dry_run` must validate before anything runs.
+    #[tokio::test]
+    async fn a_transaction_with_no_workdir_is_an_error_from_both_entry_points_not_a_panic() {
+        let stageless = || {
+            let sb = Sandbox::builder().build().unwrap();
+            vec![Stage::new(&sb, &["true"]), Stage::new(&sb, &["true"])]
+        };
+
+        for (entry, err) in [
+            ("run", Transaction::new(stageless()).run(None).await.unwrap_err()),
+            ("dry_run", Transaction::new(stageless()).dry_run(None).await.unwrap_err()),
+        ] {
+            assert!(
+                matches!(&err, TxnError::Invalid(m) if m.contains("stage 0 has no workdir")),
+                "{entry} must reject a workdir-less transaction as a configuration error, got: {err:?}"
+            );
+        }
+    }
+
+    /// An unset `max_disk` and `max_disk = 0` are the SAME quota (both mean
+    /// unlimited), so mixing them across stages is accepted — while a stage that
+    /// really asks for a different quota is rejected.
+    ///
+    /// The whole quota half of that check is deletable on its own: dropping the
+    /// `max_disk` comparison and keeping only `fs_storage` leaves every other
+    /// test green, and the transaction would then silently run every stage under
+    /// stage 0's quota while a stage's own limit was ignored.
+    #[test]
+    fn an_unset_max_disk_equals_a_zero_max_disk_but_a_real_one_must_match() {
+        let wd = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let with = |disk: Option<u64>| {
+            let mut b = Sandbox::builder().workdir(wd.path()).fs_storage(storage.path());
+            if let Some(d) = disk {
+                b = b.max_disk(ByteSize(d));
+            }
+            Stage::new(&b.build().unwrap(), &["true"])
+        };
+
+        assert_eq!(
+            rejection(&[with(None), with(Some(0))]),
+            None,
+            "an unset quota and a zero quota both mean unlimited and must be interchangeable"
+        );
+        let msg = rejection(&[with(Some(4096)), with(Some(8192))])
+            .expect("two stages asking for different quotas over one shared upper must be rejected");
+        assert!(
+            msg.contains("stage 1 sets a different fs_storage/max_disk"),
+            "a differing quota must be reported as the fs_storage/max_disk conflict, got: {msg}"
+        );
+        let msg = rejection(&[with(None), with(Some(4096))])
+            .expect("a real quota does not match an unset one and must be rejected");
+        assert!(
+            msg.contains("stage 1 sets a different fs_storage/max_disk"),
+            "a quota against an unset one must be reported the same way, got: {msg}"
+        );
+    }
+
+    /// The shared workdir is compared LEXICALLY, by path components: spellings
+    /// that differ only in redundant separators or a `.` component are the same
+    /// workdir, while a `..` component or a symlink naming the same real
+    /// directory are not.
+    ///
+    /// The symlink case is the one that matters, and it is an asymmetry rather
+    /// than a bug to fix here: `SeccompCowBranch::create` canonicalizes, so the
+    /// branch would treat the two spellings as one workdir while the validator
+    /// does not. Rejecting is the safe side of that disagreement — the stages
+    /// would otherwise disagree with each other about which paths the COW layer
+    /// intercepts.
+    #[test]
+    fn the_shared_workdir_is_compared_by_path_components_not_by_target() {
+        let base = tempfile::tempdir().unwrap();
+        let real = base.path().join("wd");
+        std::fs::create_dir(&real).unwrap();
+        let alias = base.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+
+        let named = |p: std::path::PathBuf| {
+            Stage::new(&Sandbox::builder().workdir(p).build().unwrap(), &["true"])
+        };
+        let same = [
+            std::path::PathBuf::from(format!("{}/", real.display())),
+            real.join("."),
+        ];
+        for spelling in same {
+            assert_eq!(
+                rejection(&[named(real.clone()), named(spelling.clone())]),
+                None,
+                "{} names the same workdir as {} and must be accepted",
+                spelling.display(),
+                real.display()
+            );
+        }
+        for spelling in [alias.clone(), real.join("..").join("wd")] {
+            let msg = rejection(&[named(real.clone()), named(spelling.clone())]).unwrap_or_else(
+                || {
+                    panic!(
+                        "{} is not the same path as {} and must be rejected",
+                        spelling.display(),
+                        real.display()
+                    )
+                },
+            );
+            assert!(
+                msg.contains("stages must share one workdir"),
+                "a differing workdir spelling must be reported as the shared-workdir conflict, \
+                 got: {msg}"
+            );
+        }
+    }
+
+    /// `chroot` and `no_supervisor` are rejected ABSOLUTELY — even when every
+    /// stage sets them identically — while `workdir` and `fs_storage`/`max_disk`
+    /// are only required to AGREE, so a value shared by every stage is accepted.
+    ///
+    /// The two kinds of rule sit three lines apart in the same loop and either
+    /// could be "simplified" into the other without a test noticing: comparing
+    /// `chroot` against stage 0's would let a fully-chrooted transaction run,
+    /// and rejecting any `fs_storage` at all would break the ordinary case of
+    /// pointing every stage at one storage dir.
+    #[test]
+    fn chroot_and_no_supervisor_are_absolute_while_workdir_and_storage_only_have_to_agree() {
+        let wd = tempfile::tempdir().unwrap();
+        let chroot = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+
+        let chrooted =
+            Sandbox::builder().workdir(wd.path()).chroot(chroot.path()).build().unwrap();
+        let msg = rejection(&[
+            Stage::new(&chrooted, &["true"]),
+            Stage::new(&chrooted, &["true"]),
+        ])
+        .expect("chroot is unsupported with a shared COW workdir even when every stage sets it");
+        assert!(
+            msg.contains("stage 0 sets chroot"),
+            "a chroot every stage sets must still be rejected, at the first stage, got: {msg}"
+        );
+
+        let unsupervised =
+            Sandbox::builder().workdir(wd.path()).no_supervisor(true).build().unwrap();
+        let msg = rejection(&[
+            Stage::new(&unsupervised, &["true"]),
+            Stage::new(&unsupervised, &["true"]),
+        ])
+        .expect("a transaction cannot run without the COW supervisor, however many stages agree");
+        assert!(
+            msg.contains("stage 0 has no_supervisor=true"),
+            "no_supervisor must be rejected even when shared, at the first stage, got: {msg}"
+        );
+
+        let shared = Sandbox::builder()
+            .workdir(wd.path())
+            .fs_storage(storage.path())
+            .max_disk(ByteSize(4096))
+            .build()
+            .unwrap();
+        assert_eq!(
+            rejection(&[Stage::new(&shared, &["true"]), Stage::new(&shared, &["true"])]),
+            None,
+            "one storage dir and one quota named by every stage is the ordinary configuration \
+             and must be accepted"
+        );
+    }
+
+    /// Which problem a caller is told about is fixed: the LOWEST offending stage
+    /// wins across stages, and within one stage the order is workdir →
+    /// no_supervisor → chroot → fs_storage/max_disk → on_exit/on_error.
+    ///
+    /// This is user-visible: the message is what a caller shows, so reordering
+    /// the checks silently changes which of several real problems gets reported
+    /// and which stays hidden until the first one is fixed.
+    #[test]
+    fn the_first_offending_stage_and_the_first_broken_rule_within_it_are_what_get_reported() {
+        let wd = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let chroot = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+
+        // Across stages: stage 1 breaks chroot, stage 2 breaks no_supervisor.
+        // Stage 1 is reported even though the rule it breaks is checked later.
+        let s1 = Sandbox::builder().workdir(wd.path()).chroot(chroot.path()).build().unwrap();
+        let s2 = Sandbox::builder().workdir(wd.path()).no_supervisor(true).build().unwrap();
+        let msg = rejection(&[ok_stage(wd.path()), Stage::new(&s1, &["true"]), Stage::new(&s2, &["true"])])
+            .expect("two offending stages must still be rejected");
+        assert!(
+            msg.contains("stage 1 sets chroot"),
+            "the lowest offending stage index wins, got: {msg}"
+        );
+
+        // Within one stage: peel the violations off in check order and assert
+        // each successive rule is the one reported.
+        let all = Sandbox::builder()
+            .workdir(other.path())
+            .no_supervisor(true)
+            .chroot(chroot.path())
+            .fs_storage(storage.path())
+            .on_exit(BranchAction::Keep)
+            .build()
+            .unwrap();
+        let peeled = [
+            ("stages must share one workdir", all.clone()),
+            ("stage 1 has no_supervisor=true", {
+                let mut s = all.clone();
+                s.workdir = Some(wd.path().to_path_buf());
+                s
+            }),
+            ("stage 1 sets chroot", {
+                let mut s = all.clone();
+                s.workdir = Some(wd.path().to_path_buf());
+                s.no_supervisor = false;
+                s
+            }),
+            ("stage 1 sets a different fs_storage/max_disk", {
+                let mut s = all.clone();
+                s.workdir = Some(wd.path().to_path_buf());
+                s.no_supervisor = false;
+                s.chroot = None;
+                s
+            }),
+            ("stage 1 sets on_exit/on_error", {
+                let mut s = all.clone();
+                s.workdir = Some(wd.path().to_path_buf());
+                s.no_supervisor = false;
+                s.chroot = None;
+                s.fs_storage = None;
+                s
+            }),
+        ];
+        for (expected, offender) in peeled {
+            let msg = rejection(&[ok_stage(wd.path()), Stage::new(&offender, &["true"])])
+                .unwrap_or_else(|| panic!("expected a rejection naming {expected:?}"));
+            assert!(
+                msg.contains(expected),
+                "checks must run in a fixed order; expected {expected:?}, got: {msg}"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------
+    // Error channels
+    // ------------------------------------------------------------
+
+    /// Which of the RFC's channels a failure belongs to.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Channel {
+        Config,
+        StageDriver,
+        Commit,
+        Conflict,
+    }
+
+    /// Classify a failure by matching EXHAUSTIVELY, so that the table-driven
+    /// tests below cannot drift into asserting over a subset of the type.
+    ///
+    /// `#[non_exhaustive]` has no effect inside the defining crate, so adding a
+    /// `TxnError` variant stops this file compiling. `TxnError::exit_code` is
+    /// exhaustive too and would already have caught that; what this adds is the
+    /// channel itself, which `From<TxnError> for SandlockError` decides in a
+    /// catch-all `other` arm that would absorb a new variant silently.
+    fn channel_of(e: &TxnError) -> Channel {
+        match e {
+            TxnError::Invalid(_) => Channel::Config,
+            TxnError::Stage { .. } => Channel::StageDriver,
+            TxnError::Branch { .. }
+            | TxnError::CommitLock { .. }
+            | TxnError::Merge { .. }
+            | TxnError::CommitAbandoned(_) => Channel::Commit,
+            TxnError::Conflict { .. } => Channel::Conflict,
+        }
+    }
+
+    /// One of every `TxnError` variant, for table-driven tests over the whole
+    /// error type.
+    fn one_of_every_txn_error() -> Vec<TxnError> {
+        vec![
+            TxnError::Invalid("bad stages".into()),
+            TxnError::Stage {
+                index: 0,
+                source: SandlockError::Runtime(SandboxRuntimeError::NotRunning),
+            },
+            TxnError::Branch {
+                workdir: "/wd".into(),
+                source: crate::error::BranchError::Operation("create upper".into()),
+            },
+            TxnError::Conflict {
+                workdir: "/wd".into(),
+                waited: Duration::from_secs(1),
+                preserved_upper: "/st/upper".into(),
+            },
+            TxnError::CommitLock {
+                workdir: "/wd".into(),
+                preserved_upper: "/st/upper".into(),
+                source: std::io::Error::other("flock"),
+            },
+            TxnError::Merge {
+                workdir: "/wd".into(),
+                preserved_upper: "/st/upper".into(),
+                source: crate::error::BranchError::Operation("copy".into()),
+            },
+            TxnError::CommitAbandoned("runtime shutting down".into()),
+        ]
+    }
+
+    /// Every variant reports the EXACT `sysexits.h` code its channel is
+    /// documented to use: 78 config, 70 stage driver, 74 commit, 75 conflict.
+    ///
+    /// The sibling test pins the four codes apart and this one pins their
+    /// values, which is a different property: renumbering config from 78 to 64
+    /// keeps every code distinct and every existing assertion green, while a
+    /// caller's `case 78)` stops matching.
+    #[test]
+    fn every_txn_error_variant_reports_the_exact_exit_code_of_its_channel() {
+        for e in one_of_every_txn_error() {
+            let want = match channel_of(&e) {
+                Channel::Config => 78,
+                Channel::StageDriver => 70,
+                Channel::Commit => 74,
+                Channel::Conflict => 75,
+            };
+            assert_eq!(
+                e.exit_code(),
+                want,
+                "{e:?} is in channel {:?} and must report {want}",
+                channel_of(&e)
+            );
+        }
+    }
+
+    /// Flattening into `SandlockError` keeps, for every commit-channel variant,
+    /// the phrase that says what state the workdir and the change set are in.
+    ///
+    /// The rendered message is the ONLY thing that survives the flatten — the
+    /// typed fields do not — so a variant whose text is dropped or replaced
+    /// leaves a caller unable to tell "nothing ran" from "the workdir may be
+    /// half merged". The sibling flatten test asserts the preserved upper is
+    /// kept, which the two variants that have no preserved upper cannot carry.
+    #[test]
+    fn flattening_a_commit_channel_failure_keeps_the_phrase_that_names_the_workdir_state() {
+        let tokens = [
+            ("failed to create the shared COW branch over /wd", "nothing ran"),
+            ("gave up after", "contended, retry"),
+            ("could not take the commit lock on /wd", "lock broken"),
+            ("may be partially merged", "torn workdir"),
+            ("did not run to completion", "unknown"),
+        ];
+        let commit_channel: Vec<TxnError> = one_of_every_txn_error()
+            .into_iter()
+            .filter(|e| matches!(channel_of(e), Channel::Commit | Channel::Conflict))
+            .collect();
+        assert_eq!(
+            commit_channel.len(),
+            tokens.len(),
+            "every commit-channel variant needs a phrase pinned here"
+        );
+
+        for (e, (token, meaning)) in commit_channel.into_iter().zip(tokens) {
+            let debug = format!("{e:?}");
+            let flat: SandlockError = e.into();
+            let rendered = flat.to_string();
+            assert!(
+                rendered.contains(token),
+                "{debug} means {meaning:?}, so flattening must keep {token:?}, got: {rendered}"
+            );
+        }
+    }
+
+    /// A stage that exits with one of the transaction channel's own numbers has
+    /// that number reported back verbatim.
+    ///
+    /// The numbers deliberately collide — a child is free to exit 75 — and the
+    /// documented way to tell the channels apart is the `Result`, not the code.
+    /// "Fixing" the collision by remapping a child's code would make the outcome
+    /// report a number the command never produced.
+    #[test]
+    fn a_stage_exit_code_that_collides_with_the_commit_channel_is_reported_verbatim() {
+        for code in [70, 74, 75, 78] {
+            let outcome = aborted(AbortReason::StageFailed {
+                index: 0,
+                status: ExitStatus::Code(code),
+            });
+            assert_eq!(
+                outcome.exit_code(),
+                code,
+                "a stage that exited {code} must report {code}, not a remapped transaction code"
+            );
+        }
+    }
+
+    /// Each `AbortReason` renders its own sentence, and a stage failure names
+    /// the stage and its status.
+    ///
+    /// `Display` is the only human-readable form of the abort channel and
+    /// nothing else in the workspace calls it, so its arms can be reordered,
+    /// swapped or deleted without a single test noticing.
+    #[test]
+    fn abort_reason_renders_each_of_its_arms_distinctly() {
+        let stage_failed = AbortReason::StageFailed {
+            index: 2,
+            status: ExitStatus::Code(3),
+        }
+        .to_string();
+        assert!(
+            stage_failed.contains("stage 2") && stage_failed.contains("Code(3)"),
+            "a stage failure must name the stage and its status, got: {stage_failed}"
+        );
+        assert!(
+            AbortReason::TimedOut.to_string().contains("timed out"),
+            "a timeout must say so, got: {}",
+            AbortReason::TimedOut
+        );
+        let dry = AbortReason::DryRun.to_string();
+        assert!(
+            dry.contains("dry run") && dry.contains("not committed"),
+            "a dry run must say the changes were reported rather than committed, got: {dry}"
+        );
+
+        let rendered: std::collections::HashSet<String> =
+            [stage_failed, AbortReason::TimedOut.to_string(), dry].into_iter().collect();
+        assert_eq!(rendered.len(), 3, "each abort reason must render differently: {rendered:?}");
+    }
+
+    // ------------------------------------------------------------
+    // Commit lock
+    // ------------------------------------------------------------
+
+    /// A zero wait still ACQUIRES an uncontended lock. The loop attempts the
+    /// lock first and only then checks the deadline, so "no budget to wait" is
+    /// not "no budget to succeed".
+    ///
+    /// The sibling zero-wait test covers the contended half. Together they pin
+    /// the loop order: hoisting the deadline check above the `flock` attempt
+    /// keeps the contended case correct — it still reports `Contended` without
+    /// sleeping — while making every uncontended zero-wait commit fail on a
+    /// workdir nobody is touching.
+    #[test]
+    fn commit_lock_with_a_zero_wait_still_takes_an_uncontended_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut polls = 0usize;
+        let lock = acquire_commit_lock_polling(dir.path(), Duration::ZERO, |_| polls += 1)
+            .expect("a lock nobody holds must be taken even with no budget to wait for it");
+        assert_eq!(polls, 0, "taking a free lock must not sleep");
+        drop(lock);
+    }
+
+    /// A commit lock that fails for a reason OTHER than contention preserves the
+    /// upper too.
+    ///
+    /// Every stage exited 0 either way, so the change set is complete and
+    /// mergeable whether the lock was busy or the workdir had vanished — and it
+    /// is `CommitDeferred` in both cases, because in neither was the workdir
+    /// touched. The sibling test covers the contended route only, so a change
+    /// that preserved just that one — "a broken workdir means these changes are
+    /// useless" — would silently reclaim a complete change set.
+    #[test]
+    fn finish_branch_preserves_the_upper_when_the_workdir_cannot_be_locked_at_all() {
+        let (workdir, _storage, branch) = branch_holding_one_added_file();
+        let branch_dir = branch.upper_dir().parent().unwrap().to_path_buf();
+        let gone = workdir.path().join("no-such-workdir");
+
+        let finished = finish_branch(branch, &gone, Duration::from_millis(50), true);
+
+        assert!(
+            matches!(finished.commit, Some(Err(CommitFailure::Lock(LockFailure::Io(_))))),
+            "a workdir that cannot be opened is an I/O failure, not contention"
+        );
+        let survived = std::fs::read_to_string(branch_dir.join("upper").join("a.txt"))
+            .unwrap_or_else(|e| {
+                panic!("the unpublished change set must survive on disk, but reading it gave {e}")
+            });
+        assert_eq!(survived, "plan\n", "the preserved upper must still hold the stage's bytes");
+        let preserved = crate::cow::seccomp::read_preserved(&branch_dir)
+            .expect("a preserved upper must be findable through its marker");
+        assert_eq!(
+            preserved.reason,
+            crate::cow::seccomp::PreserveReason::CommitDeferred,
+            "the lock was never taken, so the workdir is untouched: that is CommitDeferred"
+        );
+    }
+
+    // ------------------------------------------------------------
+    // The type a transaction is deliberately NOT
+    // ------------------------------------------------------------
+
+    /// `Pipeline::is_empty` is documented "always false"; this is the constructor
+    /// invariant that makes that true.
+    ///
+    /// It lives here because the transaction module's docs lean on `Pipeline`
+    /// being a distinct, always-populated type — `into_stages` is the only way
+    /// to move stages between the two runners, and it is documented as handing
+    /// over a chain, not a possibly-empty list.
+    #[test]
+    fn a_pipeline_can_never_be_empty() {
+        crate::pipeline::Pipeline::new(Vec::new())
+            .err()
+            .expect("a pipeline of no stages must be rejected at construction");
+        let sb = Sandbox::builder().build().unwrap();
+        let chain = crate::pipeline::Pipeline::new(vec![
+            Stage::new(&sb, &["true"]),
+            Stage::new(&sb, &["true"]),
+        ])
+        .expect("two stages are a valid chain");
+        assert!(!chain.is_empty(), "a constructed pipeline always has stages");
+        assert_eq!(chain.len(), 2, "and reports how many");
+    }
 
     /// The commit lock WAITS for a concurrent merge instead of failing fast:
     /// a transaction that ran every stage successfully must publish its work,
