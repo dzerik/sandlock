@@ -81,19 +81,37 @@ fn dir_size(dir: &Path) -> u64 {
     total
 }
 
+/// Why a branch's private storage was preserved instead of reclaimed.
+///
+/// Every preserved branch is storage that nothing in this process will free
+/// again — see [`SeccompCowBranch::preserve`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreserveReason {
+    /// A merge into the workdir started and did not finish. The workdir is
+    /// partially modified and the upper holds the part that did not land.
+    MergeInterrupted,
+    /// The changes were complete and mergeable, but the merge never started —
+    /// the commit could not take the workdir lock in time. The workdir is
+    /// untouched and the upper holds the whole change set.
+    CommitDeferred,
+    /// The caller asked for the changes to be kept for inspection rather than
+    /// merged or discarded ([`crate::sandbox::BranchAction::Keep`]).
+    Kept,
+}
+
 /// Disposition of a branch's private storage, which decides what `Drop` does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BranchState {
     /// No disposition yet. The upper holds nothing the caller has asked to keep,
     /// so dropping the branch reclaims it.
     Open,
-    /// A merge into the workdir started and did not finish. The workdir is
-    /// partially modified and the upper still holds the unmerged remainder, so
-    /// the storage MUST survive `Drop`: it is the only copy of that remainder
-    /// and the only thing a retry or an out-of-band recovery can work from.
-    MergeInterrupted,
-    /// `commit()`, `abort()` or `keep()` completed. Nothing is left to reclaim
-    /// (commit/abort already did it, keep deliberately preserved it).
+    /// The upper holds changes that must outlive this branch, for the reason
+    /// carried here. The storage MUST survive `Drop`: it is the only copy of
+    /// those changes and the only thing a retry or an out-of-band recovery can
+    /// work from.
+    Preserved(PreserveReason),
+    /// `commit()` or `abort()` completed. Nothing is left to reclaim — both
+    /// already removed the storage.
     Finished,
 }
 
@@ -840,13 +858,13 @@ impl SeccompCowBranch {
     /// inspect what is outstanding, or `abort()` to deliberately discard the
     /// remainder. Dropping the branch after a failed commit does NOT reclaim it.
     pub fn commit(&mut self) -> Result<(), BranchError> {
-        if self.state == BranchState::Finished { return Ok(()); }
+        if self.is_disposed() { return Ok(()); }
 
         // Enter the interrupted state BEFORE the first destructive operation.
         // Every `?` below returns with the state still set, which is what keeps
         // `Drop` from reclaiming an upper that holds unmerged data. It is
         // cleared only by the successful tail of this function.
-        self.state = BranchState::MergeInterrupted;
+        self.preserve(PreserveReason::MergeInterrupted);
 
         // Apply deletions
         for rel_path in &self.deleted {
@@ -926,7 +944,7 @@ impl SeccompCowBranch {
     /// After a failed `commit()` this is a deliberate request to throw the
     /// unmerged remainder away; the workdir stays as the partial merge left it.
     pub fn abort(&mut self) -> Result<(), BranchError> {
-        if self.state == BranchState::Finished { return Ok(()); }
+        if self.is_disposed() { return Ok(()); }
         self.cleanup();
         self.state = BranchState::Finished;
         Ok(())
@@ -937,7 +955,26 @@ impl SeccompCowBranch {
     /// which preserves the changes for later inspection rather than merging or
     /// discarding them.
     pub(crate) fn keep(&mut self) {
-        self.state = BranchState::Finished;
+        self.preserve(PreserveReason::Kept);
+    }
+
+    /// Hand the branch's private storage over to whoever recovers it: `Drop`
+    /// will not reclaim it and no other code path frees it either.
+    ///
+    /// This is a **deliberate leak** — the caller is asserting that the upper
+    /// holds the only copy of changes that must survive this process. Reclaiming
+    /// it is out-of-band work.
+    pub(crate) fn preserve(&mut self, reason: PreserveReason) {
+        self.state = BranchState::Preserved(reason);
+    }
+
+    /// Whether a further `commit()`/`abort()` would be a no-op: the storage is
+    /// either already gone or deliberately handed over to the caller.
+    fn is_disposed(&self) -> bool {
+        matches!(
+            self.state,
+            BranchState::Finished | BranchState::Preserved(PreserveReason::Kept)
+        )
     }
 
     fn cleanup(&self) {
@@ -954,10 +991,9 @@ impl Drop for SeccompCowBranch {
     /// no longer leaves its upper behind; scratch branches in tests likewise
     /// vanish at end of scope. That is a behavior change, not a pure leak fix.
     ///
-    /// It is deliberately **not** a "clean up on error" hook: `commit()` marks
-    /// the branch [`BranchState::MergeInterrupted`] before it touches the
-    /// workdir, so a failed merge keeps its upper — the unmerged remainder must
-    /// outlive the failure to stay recoverable. Only [`BranchState::Open`],
+    /// It is deliberately **not** a "clean up on error" hook: anything the code
+    /// marked [`BranchState::Preserved`] holds changes that must outlive the
+    /// failure (see [`PreserveReason`]) and is kept. Only [`BranchState::Open`],
     /// i.e. no disposition was ever attempted, reclaims here.
     ///
     /// `remove_dir_all` is idempotent and scoped to this branch's own uuid dir,

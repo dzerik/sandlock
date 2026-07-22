@@ -122,6 +122,78 @@ async fn test_txn_waits_for_a_concurrent_commit_lock() {
     let _ = fs::remove_dir_all(&workdir);
 }
 
+/// The wait is bounded, and expiring it must NOT throw the run away. Every stage
+/// exited 0, so the upper holds a complete, mergeable change set; giving up on
+/// the lock leaves the workdir untouched and PRESERVES that upper with its
+/// content, naming it in the error.
+#[tokio::test]
+async fn test_txn_preserves_the_upper_when_the_commit_lock_never_frees() {
+    if !sandbox_available().await {
+        eprintln!("commit-lock-preserve test skipped: sandbox unavailable");
+        return;
+    }
+    let workdir = temp_dir("lock-preserve-wd");
+    let storage = temp_dir("lock-preserve-st");
+    let policy = Sandbox::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/proc")
+        .fs_write(&workdir).workdir(&workdir).cwd(&workdir)
+        .fs_storage(&storage)
+        .build()
+        .unwrap();
+
+    // Stand in for another transaction whose merge never finishes: the lock is
+    // held for the whole test, well past this transaction's wait.
+    let held = std::fs::File::open(&workdir).unwrap();
+    assert_eq!(
+        unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0,
+        "test setup: could not take the workdir lock"
+    );
+
+    let err = Transaction::new([
+        Stage::new(&policy, &["sh", "-c", "echo plan > a.txt"]),
+        Stage::new(&policy, &["sh", "-c", "cat a.txt && echo built > b.txt"]),
+    ])
+    .commit_lock_wait(Duration::from_millis(300))
+    .run(None)
+    .await
+    .expect_err("a commit lock that never frees must fail the commit");
+    drop(held);
+
+    // All-or-nothing still holds on the workdir side: nothing was merged.
+    assert!(!workdir.join("a.txt").exists(), "nothing may be merged when the lock was never taken");
+    assert!(!workdir.join("b.txt").exists(), "nothing may be merged when the lock was never taken");
+
+    // ...and the work itself survives, with its bytes, so it can still be
+    // published out of band.
+    let branches: Vec<PathBuf> =
+        fs::read_dir(&storage).unwrap().map(|e| e.unwrap().path()).collect();
+    assert_eq!(
+        branches.len(),
+        1,
+        "the upper of a fully successful run must be preserved, not reclaimed; found {branches:?}",
+    );
+    let upper = branches[0].join("upper");
+    assert_eq!(
+        fs::read_to_string(upper.join("a.txt")).unwrap(),
+        "plan\n",
+        "the preserved upper must still hold stage 0's write",
+    );
+    assert_eq!(
+        fs::read_to_string(upper.join("b.txt")).unwrap(),
+        "built\n",
+        "the preserved upper must still hold stage 1's write",
+    );
+    assert!(
+        err.to_string().contains(&upper.display().to_string()),
+        "the error must name the preserved upper so it can be recovered, got: {err}",
+    );
+
+    let _ = fs::remove_dir_all(&workdir);
+    let _ = fs::remove_dir_all(&storage);
+}
+
 /// Any stage failing aborts the whole transaction: earlier stages' writes are
 /// discarded and the workdir is byte-identical to before the run.
 #[tokio::test]

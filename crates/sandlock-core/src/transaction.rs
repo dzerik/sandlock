@@ -25,9 +25,10 @@ use crate::error::{SandboxError, SandboxRuntimeError, SandlockError};
 use crate::pipeline::Stage;
 use crate::result::{ExitStatus, RunResult};
 
-/// How long to wait for another transaction's commit merge to finish before
-/// giving up. Merges are short (a file-by-file copy of one upper), so a wait
-/// this long only expires when something is genuinely wrong.
+/// Default for [`Transaction::commit_lock_wait`]: how long to wait for another
+/// transaction's commit merge to finish before giving up. Merges are short (a
+/// file-by-file copy of one upper), so a wait this long only expires when
+/// something is genuinely wrong.
 const COMMIT_LOCK_WAIT: Duration = Duration::from_secs(30);
 
 /// Poll interval while waiting for the commit lock. `flock` has no timed
@@ -60,6 +61,7 @@ const COMMIT_LOCK_POLL: Duration = Duration::from_millis(20);
 /// conflict and is rejected before anything runs.
 pub struct Transaction {
     stages: Vec<Stage>,
+    commit_lock_wait: Duration,
 }
 
 impl Transaction {
@@ -69,7 +71,17 @@ impl Transaction {
     /// `|`-built chain means "connect these by pipes", which a transaction does
     /// not do.
     pub fn new(stages: impl IntoIterator<Item = Stage>) -> Self {
-        Self { stages: stages.into_iter().collect() }
+        Self { stages: stages.into_iter().collect(), commit_lock_wait: COMMIT_LOCK_WAIT }
+    }
+
+    /// How long the commit may wait for another transaction to release the
+    /// workdir lock before giving up. Defaults to 30s.
+    ///
+    /// Giving up does not discard the run: the shared upper is preserved and
+    /// named in the error (see [`Transaction::run`]).
+    pub fn commit_lock_wait(mut self, wait: Duration) -> Self {
+        self.commit_lock_wait = wait;
+        self
     }
 
     /// Run every stage, then commit the shared upper if all of them exited 0.
@@ -79,12 +91,15 @@ impl Transaction {
     ///
     /// Returns `Err` when the transaction could not be carried out at all: an
     /// invalid stage configuration, a failure to start a stage, or a commit that
-    /// could not be performed. If the commit merge itself fails partway, the
-    /// workdir is left partially merged and the shared upper is **preserved**
-    /// (its path is named in the error) so the remainder stays recoverable.
+    /// could not be performed.
+    ///
+    /// Once every stage has succeeded the run's work is never thrown away
+    /// silently. If the commit cannot take the workdir lock, or the merge itself
+    /// fails partway, the shared upper is **preserved** and its path is named in
+    /// the error.
     pub async fn run(self, timeout: Option<Duration>) -> Result<TxnOutcome, SandlockError> {
         validate_txn_stages(&self.stages)?;
-        run_txn(self.stages, timeout, Disposition::Commit).await
+        run_txn(self.stages, timeout, Disposition::Commit, self.commit_lock_wait).await
     }
 
     /// Run every stage and report what the transaction *would* change, then
@@ -98,7 +113,7 @@ impl Transaction {
     /// or the transaction timed out first.
     pub async fn dry_run(self, timeout: Option<Duration>) -> Result<TxnOutcome, SandlockError> {
         validate_txn_stages(&self.stages)?;
-        run_txn(self.stages, timeout, Disposition::DryRun).await
+        run_txn(self.stages, timeout, Disposition::DryRun, self.commit_lock_wait).await
     }
 }
 
@@ -244,6 +259,7 @@ async fn run_txn(
     stages: Vec<Stage>,
     timeout: Option<Duration>,
     disposition: Disposition,
+    commit_lock_wait: Duration,
 ) -> Result<TxnOutcome, SandlockError> {
     fn child_err(msg: String) -> SandlockError {
         SandlockError::Runtime(SandboxRuntimeError::Child(msg))
@@ -308,9 +324,23 @@ async fn run_txn(
                     // result (last writer wins per file). The lock is also
                     // scoped to transactions — a plain Sandbox committing its
                     // own branch into the same workdir does not take it.
-                    let lock = acquire_commit_lock(&workdir, COMMIT_LOCK_WAIT)
-                        .await
-                        .map_err(child_err)?;
+                    let lock = match acquire_commit_lock(&workdir, commit_lock_wait).await {
+                        Ok(l) => l,
+                        Err(e) => {
+                            // Every stage exited 0, so the upper holds a full,
+                            // mergeable change set that only failed to be
+                            // published. Returning here would otherwise drop an
+                            // `Open` branch and reclaim it — losing the work of
+                            // a run that did nothing wrong. Hand the storage
+                            // over instead and name it in the error.
+                            branch.preserve(crate::cow::seccomp::PreserveReason::CommitDeferred);
+                            return Err(child_err(format!(
+                                "{e}. The workdir is untouched and this transaction's \
+                                 changes were preserved at {}",
+                                upper_dir.display()
+                            )));
+                        }
+                    };
                     branch.commit().map_err(|e| {
                         child_err(format!(
                             "transaction: commit failed: {e}. The workdir is partially merged \
@@ -360,7 +390,8 @@ async fn run_txn(
 ///
 /// Waiting rather than failing fast is deliberate: a transaction that has run
 /// every stage successfully should publish its work, not discard it because
-/// another merge happened to be in flight for a few milliseconds.
+/// another merge happened to be in flight for a few milliseconds. Expiring the
+/// wait does not discard it either — the caller preserves the upper.
 async fn acquire_commit_lock(
     workdir: &std::path::Path,
     deadline_after: Duration,
