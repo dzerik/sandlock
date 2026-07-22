@@ -88,7 +88,10 @@ impl Transaction {
     /// workdir lock before giving up. Defaults to 30s.
     ///
     /// Giving up does not discard the run: the shared upper is preserved and
-    /// named in the error (see [`Transaction::run`]).
+    /// named in the error (see [`Transaction::run`]). Neither does dropping the
+    /// `run()` future during the wait — the commit phase runs on a blocking
+    /// thread that a cancellation detaches rather than stops, so this wait is
+    /// also the bound on how long that thread outlives an abandoned `run()`.
     pub fn commit_lock_wait(mut self, wait: Duration) -> Self {
         self.commit_lock_wait = wait;
         self
@@ -107,6 +110,17 @@ impl Transaction {
     /// silently. If the commit cannot take the workdir lock, or the merge itself
     /// fails partway, the shared upper is **preserved** and its path is named in
     /// the error.
+    ///
+    /// That holds when this future is **cancelled** too, which is the case a
+    /// caller reaches by wrapping `run()` in a `tokio::time::timeout` (the
+    /// `timeout` argument bounds the stage phase only) or by racing it in a
+    /// `select!`. Cancelling during the stage phase aborts and leaves the workdir
+    /// untouched; cancelling once the commit phase has begun does not stop it —
+    /// it runs on a blocking thread that a dropped future detaches — so the
+    /// change set still lands in the workdir or is preserved. What a cancelled
+    /// run gives up is the *report*: no `TxnOutcome`, no `TxnError`, and the
+    /// preserved upper has to be found through
+    /// [`list_preserved`](crate::cow::seccomp::list_preserved).
     pub async fn run(self, timeout: Option<Duration>) -> Result<TxnOutcome, TxnError> {
         validate_txn_stages(&self.stages)?;
         run_txn(self.stages, timeout, Disposition::Commit, self.commit_lock_wait).await
@@ -218,6 +232,13 @@ pub enum TxnError {
         #[source]
         source: crate::error::BranchError,
     },
+
+    /// The commit phase never ran to completion because the runtime was shut
+    /// down under it. Unlike every other variant this one cannot say what state
+    /// the workdir and the upper are in: the phase may not have started at all,
+    /// in which case the change set was reclaimed with the branch.
+    #[error("transaction: the commit did not run to completion: {0}")]
+    CommitAbandoned(String),
 }
 
 impl TxnError {
@@ -235,7 +256,10 @@ impl TxnError {
         match self {
             TxnError::Invalid(_) => 78,
             TxnError::Stage { .. } => 70,
-            TxnError::Branch { .. } | TxnError::CommitLock { .. } | TxnError::Merge { .. } => 74,
+            TxnError::Branch { .. }
+            | TxnError::CommitLock { .. }
+            | TxnError::Merge { .. }
+            | TxnError::CommitAbandoned(_) => 74,
             TxnError::Conflict { .. } => 75,
         }
     }
@@ -480,64 +504,41 @@ async fn run_txn(
     };
     let all_ok = reason.is_none() && drive_err.is_none();
 
-    // The branch is about to be disposed of, so read the change set first: after
-    // a commit or an abort the upper is gone and there is nothing left to report.
     let mut changes = Vec::new();
     let committed = match taken {
-        Some(mut branch) => {
-            changes = branch.changes().unwrap_or_default();
-            match (all_ok, disposition) {
-                (true, Disposition::Commit) => {
-                    // Serialize the merge against any other transaction
-                    // committing into this workdir. commit() rewrites the
-                    // workdir file-by-file, so two merges interleaving would
-                    // tear it. This is mutual exclusion between merges, NOT
-                    // serializable isolation: a transaction that snapshotted
-                    // before another one committed still merges over that
-                    // result (last writer wins per file). The lock is also
-                    // scoped to transactions — a plain Sandbox committing its
-                    // own branch into the same workdir does not take it.
-                    let lock = match acquire_commit_lock(&workdir, commit_lock_wait).await {
-                        Ok(l) => l,
-                        Err(f) => {
-                            // Every stage exited 0, so the upper holds a full,
-                            // mergeable change set that only failed to be
-                            // published. Returning here would otherwise drop an
-                            // `Open` branch and reclaim it — losing the work of
-                            // a run that did nothing wrong. Hand the storage
-                            // over instead and name it in the error.
-                            branch.preserve(crate::cow::seccomp::PreserveReason::CommitDeferred);
-                            return Err(match f {
-                                LockFailure::Contended(waited) => TxnError::Conflict {
-                                    workdir,
-                                    waited,
-                                    preserved_upper: upper_dir,
-                                },
-                                LockFailure::Io(source) => TxnError::CommitLock {
-                                    workdir,
-                                    preserved_upper: upper_dir,
-                                    source,
-                                },
-                            });
-                        }
-                    };
-                    // `commit()` preserves the upper itself when it fails
-                    // partway — it marks the branch before touching the workdir.
-                    branch.commit().map_err(|source| TxnError::Merge {
-                        workdir: workdir.clone(),
-                        preserved_upper: upper_dir.clone(),
+        Some(branch) => {
+            let want_commit = all_ok && disposition == Disposition::Commit;
+            let wd = workdir.clone();
+            let handle = tokio::task::spawn_blocking(move || {
+                finish_branch(branch, &wd, commit_lock_wait, want_commit)
+            });
+            let finished = match handle.await {
+                Ok(f) => f,
+                Err(join) if join.is_panic() => std::panic::resume_unwind(join.into_panic()),
+                Err(join) => return Err(TxnError::CommitAbandoned(join.to_string())),
+            };
+            changes = finished.changes;
+            match finished.commit {
+                Some(Ok(())) => true,
+                Some(Err(CommitFailure::Lock(LockFailure::Contended(waited)))) => {
+                    return Err(TxnError::Conflict { workdir, waited, preserved_upper: upper_dir })
+                }
+                Some(Err(CommitFailure::Lock(LockFailure::Io(source)))) => {
+                    return Err(TxnError::CommitLock {
+                        workdir,
+                        preserved_upper: upper_dir,
                         source,
-                    })?;
-                    drop(lock); // release the workdir lock after the merge
-                    true
+                    })
                 }
-                (true, Disposition::DryRun) => {
-                    let _ = branch.abort();
-                    reason = Some(AbortReason::DryRun);
-                    false
+                Some(Err(CommitFailure::Merge(source))) => {
+                    return Err(TxnError::Merge { workdir, preserved_upper: upper_dir, source })
                 }
-                (false, _) => {
-                    let _ = branch.abort();
+                // The upper was discarded rather than merged: a dry run, or a
+                // run that aborted.
+                None => {
+                    if all_ok {
+                        reason = Some(AbortReason::DryRun);
+                    }
                     false
                 }
             }
@@ -564,6 +565,80 @@ async fn run_txn(
     })
 }
 
+/// Why the commit phase could not publish the change set. Turned into a
+/// [`TxnError`] by the caller, which holds the workdir and upper paths the
+/// message names.
+enum CommitFailure {
+    Lock(LockFailure),
+    Merge(crate::error::BranchError),
+}
+
+/// What the commit phase did with the shared upper.
+struct Finished {
+    /// The change set the upper held, read before it was disposed of.
+    changes: Vec<crate::dry_run::Change>,
+    /// `None` when the upper was discarded rather than merged (a dry run, or an
+    /// aborted run); otherwise the result of the commit.
+    commit: Option<Result<(), CommitFailure>>,
+}
+
+/// Read the shared upper's change set and dispose of it — the entire blocking
+/// half of a transaction, run on a blocking thread.
+///
+/// Both halves are unbounded in the caller's data: `changes()` walks the whole
+/// upper, and `commit()` walks it again copying file-by-file and fsyncing
+/// directories. Neither may run on an executor worker, and the commit half holds
+/// a cross-process `flock` while it does.
+///
+/// The branch is **moved in**, and that is what makes the commit phase
+/// uncancellable. Dropping the `run()` future — a `tokio::time::timeout` around
+/// it, a `select!` on shutdown — drops the `JoinHandle`, which detaches this task
+/// rather than stopping it, so the owned branch is never dropped in
+/// `BranchState::Open` by a cancellation and the change set of a run whose stages
+/// all succeeded is always either published or preserved. Dropping the branch at
+/// the end of this function is right in every case: `commit()` leaves it
+/// `Finished` on success and `Preserved` on failure, and the lock path preserves
+/// it explicitly.
+fn finish_branch(
+    mut branch: crate::cow::seccomp::SeccompCowBranch,
+    workdir: &std::path::Path,
+    commit_lock_wait: Duration,
+    commit: bool,
+) -> Finished {
+    // The branch is about to be disposed of, so read the change set first: after
+    // a commit or an abort the upper is gone and there is nothing left to report.
+    let changes = branch.changes().unwrap_or_default();
+    if !commit {
+        let _ = branch.abort();
+        return Finished { changes, commit: None };
+    }
+
+    // Serialize the merge against any other transaction committing into this
+    // workdir. commit() rewrites the workdir file-by-file, so two merges
+    // interleaving would tear it. This is mutual exclusion between merges, NOT
+    // serializable isolation: a transaction that snapshotted before another one
+    // committed still merges over that result (last writer wins per file). The
+    // lock is also scoped to transactions — a plain Sandbox committing its own
+    // branch into the same workdir does not take it.
+    let lock = match acquire_commit_lock(workdir, commit_lock_wait) {
+        Ok(l) => l,
+        Err(f) => {
+            // Every stage exited 0, so the upper holds a full, mergeable change
+            // set that only failed to be published. Returning here would
+            // otherwise drop an `Open` branch and reclaim it — losing the work of
+            // a run that did nothing wrong. Hand the storage over instead, for
+            // the caller to name in the error.
+            branch.preserve(crate::cow::seccomp::PreserveReason::CommitDeferred);
+            return Finished { changes, commit: Some(Err(CommitFailure::Lock(f))) };
+        }
+    };
+    // `commit()` preserves the upper itself when it fails partway — it marks the
+    // branch before touching the workdir.
+    let merged = branch.commit().map_err(CommitFailure::Merge);
+    drop(lock); // release the workdir lock after the merge
+    Finished { changes, commit: Some(merged) }
+}
+
 /// Take an exclusive lock on the workdir, waiting up to `deadline_after` for a
 /// concurrent commit merge to release it. `flock` has no timed variant, so this
 /// is a bounded poll over the non-blocking form.
@@ -572,12 +647,26 @@ async fn run_txn(
 /// every stage successfully should publish its work, not discard it because
 /// another merge happened to be in flight for a few milliseconds. Expiring the
 /// wait does not discard it either — the caller preserves the upper.
-async fn acquire_commit_lock(
+///
+/// Blocking, and only ever called from [`finish_branch`] on a blocking thread:
+/// the merge it guards is blocking too, so making the wait cancellable would buy
+/// nothing and would put the branch back on a droppable await.
+fn acquire_commit_lock(
     workdir: &std::path::Path,
     deadline_after: Duration,
 ) -> Result<std::fs::File, LockFailure> {
+    acquire_commit_lock_polling(workdir, deadline_after, std::thread::sleep)
+}
+
+/// [`acquire_commit_lock`] with the poll sleep injected, so a test can observe
+/// how many times — if at all — the loop actually waited.
+fn acquire_commit_lock_polling(
+    workdir: &std::path::Path,
+    deadline_after: Duration,
+    mut sleep: impl FnMut(Duration),
+) -> Result<std::fs::File, LockFailure> {
     let lock = std::fs::File::open(workdir).map_err(LockFailure::Io)?;
-    let deadline = tokio::time::Instant::now() + deadline_after;
+    let deadline = std::time::Instant::now() + deadline_after;
     loop {
         if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
             return Ok(lock);
@@ -588,10 +677,10 @@ async fn acquire_commit_lock(
         if err.raw_os_error() != Some(libc::EWOULDBLOCK) {
             return Err(LockFailure::Io(err));
         }
-        if tokio::time::Instant::now() >= deadline {
+        if std::time::Instant::now() >= deadline {
             return Err(LockFailure::Contended(deadline_after));
         }
-        tokio::time::sleep(COMMIT_LOCK_POLL).await;
+        sleep(COMMIT_LOCK_POLL);
     }
 }
 
@@ -635,8 +724,8 @@ mod tests {
     /// The commit lock WAITS for a concurrent merge instead of failing fast:
     /// a transaction that ran every stage successfully must publish its work,
     /// not lose it because another merge was in flight for a moment.
-    #[tokio::test]
-    async fn commit_lock_waits_for_a_held_lock_to_be_released() {
+    #[test]
+    fn commit_lock_waits_for_a_held_lock_to_be_released() {
         let dir = tempfile::tempdir().unwrap();
         let held = std::fs::File::open(dir.path()).unwrap();
         assert_eq!(
@@ -644,30 +733,31 @@ mod tests {
             0
         );
 
-        let releaser = tokio::task::spawn_blocking(move || {
+        let releaser = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(250));
             drop(held);
         });
 
-        let started = std::time::Instant::now();
-        let lock = acquire_commit_lock(dir.path(), Duration::from_secs(10))
-            .await
-            .expect("must acquire the lock once the holder releases it");
-        let waited = started.elapsed();
-        releaser.await.unwrap();
+        let mut polls = 0usize;
+        let lock = acquire_commit_lock_polling(dir.path(), Duration::from_secs(10), |d| {
+            polls += 1;
+            std::thread::sleep(d);
+        })
+        .expect("must acquire the lock once the holder releases it");
+        releaser.join().unwrap();
         drop(lock);
 
         assert!(
-            waited >= Duration::from_millis(200),
-            "must actually have waited for the holder, waited only {waited:?}"
+            polls > 0,
+            "must actually have gone round the poll loop waiting for the holder"
         );
     }
 
     /// The wait is bounded, and expiring it is reported as CONTENTION rather
     /// than as a broken workdir: that distinction is what makes the failure a
     /// retryable `TxnError::Conflict` instead of an I/O error.
-    #[tokio::test]
-    async fn commit_lock_wait_is_bounded_and_reports_contention() {
+    #[test]
+    fn commit_lock_wait_is_bounded_and_reports_contention() {
         let dir = tempfile::tempdir().unwrap();
         let held = std::fs::File::open(dir.path()).unwrap();
         assert_eq!(
@@ -677,7 +767,6 @@ mod tests {
 
         let started = std::time::Instant::now();
         let err = acquire_commit_lock(dir.path(), Duration::from_millis(200))
-            .await
             .expect_err("a lock that is never released must time out");
         let waited = started.elapsed();
         drop(held);
@@ -694,12 +783,11 @@ mod tests {
 
     /// A workdir that cannot be opened at all is NOT contention: it must not be
     /// reported as a retryable conflict.
-    #[tokio::test]
-    async fn commit_lock_reports_a_missing_workdir_as_io() {
+    #[test]
+    fn commit_lock_reports_a_missing_workdir_as_io() {
         let dir = tempfile::tempdir().unwrap();
         let gone = dir.path().join("no-such-workdir");
         let err = acquire_commit_lock(&gone, Duration::from_millis(200))
-            .await
             .expect_err("a workdir that does not exist cannot be locked");
         assert!(
             matches!(err, LockFailure::Io(_)),
@@ -766,20 +854,19 @@ mod tests {
     /// An uncontended lock must not go through the poll loop's wait at all —
     /// the common case is every commit that is not racing another one.
     ///
-    /// Asserted on the paused test clock, which advances only when something
-    /// actually sleeps. A wall-clock bound cannot carry this property: a 100ms
-    /// budget does not notice a 20ms regression, and it flakes on a loaded
-    /// runner.
-    #[tokio::test(start_paused = true)]
-    async fn commit_lock_uncontended_does_not_wait_at_all() {
+    /// Asserted by counting the poll loop's sleeps, not by timing it. A
+    /// wall-clock bound cannot carry this property: a 100ms budget does not
+    /// notice a 20ms regression, and it flakes on a loaded runner.
+    #[test]
+    fn commit_lock_uncontended_does_not_wait_at_all() {
         let dir = tempfile::tempdir().unwrap();
-        let started = tokio::time::Instant::now();
-        let lock = acquire_commit_lock(dir.path(), Duration::from_secs(10)).await.unwrap();
-        assert_eq!(
-            tokio::time::Instant::now(),
-            started,
-            "taking an uncontended lock must not sleep",
-        );
+        let mut polls = 0usize;
+        let lock = acquire_commit_lock_polling(dir.path(), Duration::from_secs(10), |d| {
+            polls += 1;
+            std::thread::sleep(d);
+        })
+        .unwrap();
+        assert_eq!(polls, 0, "taking an uncontended lock must not sleep");
         drop(lock);
     }
 }

@@ -240,6 +240,116 @@ async fn test_txn_preserves_the_upper_when_the_commit_lock_never_frees() {
     let _ = fs::remove_dir_all(&storage);
 }
 
+/// CANCELLING the run once the commit phase has begun must not destroy the
+/// change set.
+///
+/// This is the case a caller reaches by construction, not an exotic one:
+/// `run(timeout)` bounds the stage phase only, so anything wanting a wall-clock
+/// bound on the whole thing wraps `run()` in `tokio::time::timeout`, and a
+/// shutdown `select!` does the same. Dropping the future while an owned,
+/// undisposed branch is alive across an await would reclaim its storage — every
+/// stage exited 0 and the whole run would be gone, with no error, no marker and
+/// nothing in the workdir.
+///
+/// The window is held open with the workdir lock, exactly as a concurrent merge
+/// would: the transaction is dropped while it is waiting for it.
+#[tokio::test]
+async fn test_txn_cancelled_during_the_commit_lock_wait_keeps_the_change_set() {
+    if !sandbox_available().await {
+        eprintln!("commit-cancel test skipped: sandbox unavailable");
+        return;
+    }
+    let workdir = temp_dir("cancel-commit-wd");
+    let storage = temp_dir("cancel-commit-st");
+    let policy = Sandbox::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/proc")
+        .fs_write(&workdir).workdir(&workdir).cwd(&workdir)
+        .fs_storage(&storage)
+        .build()
+        .unwrap();
+
+    // Stand in for another transaction mid-merge, so the commit blocks on the
+    // lock instead of racing through it.
+    let held = std::fs::File::open(&workdir).unwrap();
+    assert_eq!(
+        unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0,
+        "test setup: could not take the workdir lock"
+    );
+
+    {
+        let txn = Transaction::new([
+            Stage::new(&policy, &["sh", "-c", "echo plan > a.txt"]),
+            Stage::new(&policy, &["sh", "-c", "cat a.txt && echo built > b.txt"]),
+        ])
+        .commit_lock_wait(Duration::from_secs(5))
+        .run(None);
+        tokio::pin!(txn);
+
+        // Drive it until the last stage's write is in the shared upper: from
+        // there the only thing left is the commit, which cannot get past the
+        // held lock. Finishing at all would mean the window never opened.
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !upper_holds(&storage, "b.txt") {
+            tokio::select! {
+                early = &mut txn => panic!("the transaction finished while the lock was held: {early:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+            assert!(std::time::Instant::now() < deadline, "stages never reached the commit");
+        }
+        // Grace for the last stage to be reaped and the commit to be entered.
+        tokio::select! {
+            early = &mut txn => panic!("the transaction finished while the lock was held: {early:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(300)) => {}
+        }
+    } // <-- the run future is dropped here, mid-wait: the cancellation.
+
+    // The lock is still held, so the commit gives up on it and preserves. Poll
+    // for the marker rather than sleeping a fixed time.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let preserved = loop {
+        let found = sandlock_core::list_preserved(&storage);
+        if !found.is_empty() {
+            break found;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a cancelled run's change set was never preserved (storage now holds {} branches)",
+            branch_count(&storage),
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    drop(held);
+
+    assert_eq!(preserved.len(), 1, "expected exactly one preserved branch, got {preserved:?}");
+    let p = &preserved[0];
+    assert_eq!(p.workdir, workdir.canonicalize().unwrap(), "the marker must name the workdir");
+    assert_eq!(
+        p.reason,
+        sandlock_core::PreserveReason::CommitDeferred,
+        "the changes were complete and never merged: the workdir is untouched",
+    );
+    // The bytes, not just the directory: a preserved upper that lost its
+    // content is the same data loss with a marker on top.
+    assert_eq!(
+        fs::read_to_string(p.upper.join("a.txt")).unwrap(),
+        "plan\n",
+        "the cancelled run's stage 0 write must survive",
+    );
+    assert_eq!(
+        fs::read_to_string(p.upper.join("b.txt")).unwrap(),
+        "built\n",
+        "the cancelled run's stage 1 write must survive",
+    );
+    // Nothing was published: all-or-nothing still holds on the workdir side.
+    assert!(!workdir.join("a.txt").exists(), "the lock was never taken, so nothing may be merged");
+    assert!(!workdir.join("b.txt").exists(), "the lock was never taken, so nothing may be merged");
+
+    let _ = fs::remove_dir_all(&workdir);
+    let _ = fs::remove_dir_all(&storage);
+}
+
 /// Any stage failing aborts the whole transaction: earlier stages' writes are
 /// discarded and the workdir is byte-identical to before the run.
 #[tokio::test]
