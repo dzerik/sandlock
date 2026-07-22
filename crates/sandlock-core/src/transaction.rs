@@ -743,14 +743,23 @@ mod tests {
         assert_eq!(conflict.exit_code(), 75, "a conflict is EX_TEMPFAIL: retry it");
     }
 
-    /// An uncontended lock is taken immediately — the poll loop must not add
-    /// latency to the common case.
-    #[tokio::test]
-    async fn commit_lock_is_immediate_when_uncontended() {
+    /// An uncontended lock must not go through the poll loop's wait at all —
+    /// the common case is every commit that is not racing another one.
+    ///
+    /// Asserted on the paused test clock, which advances only when something
+    /// actually sleeps. A wall-clock bound cannot carry this property: a 100ms
+    /// budget does not notice a 20ms regression, and it flakes on a loaded
+    /// runner.
+    #[tokio::test(start_paused = true)]
+    async fn commit_lock_uncontended_does_not_wait_at_all() {
         let dir = tempfile::tempdir().unwrap();
-        let started = std::time::Instant::now();
+        let started = tokio::time::Instant::now();
         let lock = acquire_commit_lock(dir.path(), Duration::from_secs(10)).await.unwrap();
-        assert!(started.elapsed() < Duration::from_millis(100));
+        assert_eq!(
+            tokio::time::Instant::now(),
+            started,
+            "taking an uncontended lock must not sleep",
+        );
         drop(lock);
     }
 }
