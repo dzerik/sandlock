@@ -47,7 +47,9 @@ const COMMIT_LOCK_POLL: Duration = Duration::from_millis(20);
 /// (read-committed) while the real workdir stays untouched for the duration of
 /// the run. If every stage exits 0 the shared upper is merged into the workdir
 /// in one step; if any stage fails, or the transaction times out, the upper is
-/// discarded and the workdir is byte-identical to before the run.
+/// discarded and the workdir is byte-identical to before the run. The two cases
+/// where the upper is neither merged nor discarded — the commit could not be
+/// performed — are the `Err` contract of [`run`](Self::run).
 ///
 /// **Stages are not connected by pipes.** Each stage inherits the parent's
 /// stdin, stdout and stderr; data moves between stages through the shared
@@ -65,7 +67,15 @@ pub struct Transaction {
 }
 
 impl Transaction {
-    /// Build a transaction from an explicit list of stages (at least 2).
+    /// Build a transaction from an explicit list of stages.
+    ///
+    /// This accepts any list and validates nothing. The two-stage minimum and
+    /// every cross-stage rule (see [`Transaction`]) are checked by
+    /// [`run`](Self::run)/[`dry_run`](Self::dry_run) and reported as
+    /// [`TxnError::Invalid`], so a caller has one place to handle a
+    /// misconfigured transaction. That is deliberately unlike
+    /// [`Pipeline::new`](crate::pipeline::Pipeline::new), which returns
+    /// `Result` for the stage count alone.
     ///
     /// There is deliberately no `From<Pipeline>` and no `BitOr` impl: a
     /// `|`-built chain means "connect these by pipes", which a transaction does
@@ -259,10 +269,11 @@ enum LockFailure {
 // Outcome
 // ============================================================
 
-/// Why a transaction did not commit.
+/// Why a transaction did not commit, having run and left the workdir untouched.
+/// A transaction that could not be carried out at all is a [`TxnError`] instead.
 ///
-/// `#[non_exhaustive]`: RFC #65 defers merge-conflict reporting to Phase 2, so
-/// at least one more variant is expected. Match with a `_` arm.
+/// `#[non_exhaustive]`: these are the reasons RFC #65 Phase 1 can produce and
+/// later phases add to them. Match with a `_` arm.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AbortReason {
@@ -300,6 +311,15 @@ pub struct TxnOutcome {
     /// Per-stage results in execution order, holding every stage that ran —
     /// including on an abort, and including the partial run recorded before a
     /// timeout cancelled the in-flight stage.
+    ///
+    /// **`stdout` and `stderr` are always `None` here, by construction.** Stages
+    /// inherit the parent's stdio (see the [module docs](self)), so their output
+    /// has already gone to the parent's own fd 1/2 and there is nothing to
+    /// capture. This is asymmetric with `Pipeline::run`, which pipes the last
+    /// stage and returns its bytes. A caller that needs a failing stage's output
+    /// has to arrange for it — redirect inside the stage command, or read the
+    /// parent's stream — because [`AbortReason::StageFailed`] carries an index
+    /// and a status and nothing else.
     pub stages: Vec<RunResult>,
     /// The filesystem changes the shared upper held at the end of the run, i.e.
     /// what the commit merged (or, when not committed, what was discarded).

@@ -496,8 +496,10 @@ async fn test_txn_rejects_missing_workdir() {
 }
 
 /// Guardrail: fewer than two stages is rejected, not a panic. `Transaction::new`
-/// accepts any stage list, so this is the only thing standing between a
-/// one-stage transaction and an out-of-bounds index in the coordinator.
+/// accepts any stage list, so the check in `run` is the only one there is. A
+/// one-stage transaction would index fine but is not a transaction; the ZERO
+/// stage case is the one that would panic, because the coordinator reads
+/// `stages[0]` for the shared workdir.
 #[tokio::test]
 async fn test_txn_rejects_too_few_stages() {
     let workdir = temp_dir("guard-count");
