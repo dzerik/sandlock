@@ -272,13 +272,24 @@ impl TxnError {
 
 impl From<TxnError> for SandlockError {
     /// Flatten into the crate-wide error for callers that do not care about the
-    /// channel. A misconfigured transaction stays a `Sandbox` error rather than
-    /// masquerading as a child-process failure.
+    /// channel — but not into one that says something false. A misconfigured
+    /// transaction stays a `Sandbox` error; a stage that could not be driven
+    /// keeps its own `SandlockError` verbatim; and the commit channel becomes a
+    /// `Branch` error, because that is what it is — a disposition of the shared
+    /// COW branch that could not be carried out. `Child` would claim a child
+    /// process failed, which is the abort channel and never reaches here.
+    ///
+    /// The commit channel keeps its rendered message rather than only its
+    /// `BranchError` source (which `Conflict` does not even have): the message
+    /// names the preserved upper, and that path is the one thing a caller cannot
+    /// reconstruct from anything else.
     fn from(e: TxnError) -> Self {
         match e {
             TxnError::Invalid(m) => SandlockError::Sandbox(SandboxError::Invalid(m)),
             TxnError::Stage { source, .. } => source,
-            other => SandlockError::Runtime(SandboxRuntimeError::Child(other.to_string())),
+            other => SandlockError::Runtime(SandboxRuntimeError::Branch(
+                crate::error::BranchError::Operation(other.to_string()),
+            )),
         }
     }
 }
@@ -800,9 +811,11 @@ mod tests {
         );
     }
 
-    /// The two failure channels stay apart when flattened into the crate-wide
-    /// error: a misconfigured transaction must not masquerade as a
-    /// child-process failure.
+    /// The three failure channels stay apart, and stay honest, when flattened
+    /// into the crate-wide error. Each arm is pinned to its exact variant: a
+    /// commit failure reported as `Runtime(Child(..))` would claim a child
+    /// process failed, which is the abort channel and cannot reach here, and
+    /// `Runtime(_)` alone does not notice that.
     #[test]
     fn txn_errors_flatten_without_losing_the_channel() {
         let invalid: SandlockError = TxnError::Invalid("bad stages".into()).into();
@@ -810,20 +823,46 @@ mod tests {
             matches!(invalid, SandlockError::Sandbox(SandboxError::Invalid(_))),
             "a configuration error must stay a sandbox error, got: {invalid:?}"
         );
-        let conflict: SandlockError = TxnError::Conflict {
-            workdir: "/wd".into(),
-            waited: Duration::from_secs(1),
-            preserved_upper: "/st/upper".into(),
+
+        // A stage that could not be driven keeps its own error verbatim.
+        let stage: SandlockError = TxnError::Stage {
+            index: 0,
+            source: SandlockError::Runtime(SandboxRuntimeError::NotRunning),
         }
         .into();
         assert!(
-            matches!(conflict, SandlockError::Runtime(_)),
-            "a commit-channel failure is a runtime error, got: {conflict:?}"
+            matches!(stage, SandlockError::Runtime(SandboxRuntimeError::NotRunning)),
+            "a stage driver failure must flatten to the stage's own error, got: {stage:?}"
         );
-        assert!(
-            conflict.to_string().contains("/st/upper"),
-            "flattening must not lose the preserved upper, got: {conflict}"
-        );
+
+        for original in [
+            TxnError::Conflict {
+                workdir: "/wd".into(),
+                waited: Duration::from_secs(1),
+                preserved_upper: "/st/upper".into(),
+            },
+            TxnError::Merge {
+                workdir: "/wd".into(),
+                preserved_upper: "/st/upper".into(),
+                source: crate::error::BranchError::Operation("copy".into()),
+            },
+            TxnError::CommitLock {
+                workdir: "/wd".into(),
+                preserved_upper: "/st/upper".into(),
+                source: std::io::Error::other("flock"),
+            },
+        ] {
+            let rendered = original.to_string();
+            let flat: SandlockError = original.into();
+            assert!(
+                matches!(flat, SandlockError::Runtime(SandboxRuntimeError::Branch(_))),
+                "a commit-channel failure is a branch failure, not a child failure, got: {flat:?}"
+            );
+            assert!(
+                flat.to_string().contains("/st/upper"),
+                "flattening must not lose the preserved upper of {rendered:?}, got: {flat}"
+            );
+        }
     }
 
     /// Each commit-channel failure the RFC names gets its own exit code, and a
