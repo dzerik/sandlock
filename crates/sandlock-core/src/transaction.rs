@@ -8,7 +8,10 @@
 //! inherited from the parent**; stages exchange data by reading and writing a
 //! shared workspace, not by streaming bytes. The two are separate types
 //! precisely so a `|`-built chain cannot be handed to the sequential runner and
-//! silently lose its pipes.
+//! silently lose its pipes: there is no `From<Pipeline>` and no `BitOr` for
+//! `Transaction`, and a `Pipeline`'s stages are private. Taking them out is
+//! [`Pipeline::into_stages`](crate::pipeline::Pipeline::into_stages) — still
+//! possible, and deliberately so, but a caller has to name it.
 //!
 //! ```ignore
 //! let outcome = Transaction::new([
