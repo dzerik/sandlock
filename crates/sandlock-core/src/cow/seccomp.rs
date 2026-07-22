@@ -1681,6 +1681,240 @@ mod tests {
         );
     }
 
+    /// `matches()` is the gate on every interception (`cow::dispatch` returns
+    /// `Continue` when it says no), and it must say no to the branch's own
+    /// storage. With `fs_storage` inside the workdir the upper is itself under
+    /// the workdir prefix, so without the storage exclusion an access to
+    /// `<upper>/f` would be treated as a workdir path and copied up again into
+    /// `<upper>/.cow/<id>/upper/f`.
+    #[test]
+    fn matches_excludes_the_branch_storage_that_lives_under_the_workdir() {
+        let workdir = tempfile::tempdir().unwrap();
+        let wd = workdir.path().canonicalize().unwrap();
+        let storage = wd.join(".cow");
+        fs::create_dir(&storage).unwrap();
+
+        let branch = SeccompCowBranch::create(&wd, Some(&storage), 0).unwrap();
+
+        assert!(
+            branch.matches(&abs(&branch, "existing.txt")),
+            "a plain workdir path is what the branch is there to intercept",
+        );
+        let upper_file = branch.upper_dir().join("existing.txt");
+        assert!(
+            !branch.matches(upper_file.to_str().unwrap()),
+            "the branch's own upper must not be intercepted as a workdir path",
+        );
+        assert!(
+            !branch.matches(branch.storage_dir.to_str().unwrap()),
+            "the branch's own storage dir must not be intercepted either",
+        );
+    }
+
+    /// Nothing outside the workdir may be mapped into the upper. `safe_rel` is
+    /// the only thing standing between a host path and a COW copy of it, so it
+    /// must reject both an ordinary escape and the string-prefix trap — a
+    /// sibling directory whose name merely extends the workdir's, which a
+    /// non-component-wise prefix test would swallow whole.
+    #[test]
+    fn a_path_outside_the_workdir_is_neither_mapped_nor_intercepted() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let workdir = root.path().join("wd");
+        let sibling = root.path().join("wd-extra");
+        fs::create_dir(&workdir).unwrap();
+        fs::create_dir(&sibling).unwrap();
+        fs::write(sibling.join("secret.txt"), "host bytes").unwrap();
+
+        let mut branch = SeccompCowBranch::create(&workdir, Some(storage.path()), 0).unwrap();
+        let escape = sibling.canonicalize().unwrap().join("secret.txt");
+        let escape = escape.to_str().unwrap();
+
+        assert_eq!(
+            branch.safe_rel(escape),
+            None,
+            "a sibling that merely shares the workdir's name prefix is outside the workdir",
+        );
+        assert!(
+            !branch.matches(escape),
+            "a path outside the workdir must not be intercepted at all",
+        );
+
+        // ...and a write open of it is left to the kernel: no relative path, no
+        // copy-up, and the branch does not claim to hold a change.
+        assert!(
+            branch.handle_open(escape, O_WRONLY).unwrap().is_none(),
+            "a write outside the workdir must not be redirected into the upper",
+        );
+        assert!(!branch.has_changes(), "nothing in the workdir was changed");
+        assert!(
+            !branch.upper_dir().join("secret.txt").exists()
+                && !branch.upper_dir().join("../wd-extra/secret.txt").exists(),
+            "the outside file must not have been copied up",
+        );
+    }
+
+    /// One branch dir a sweep cannot parse must not hide the rest: a marker is
+    /// written by a process that may be killed mid-write, and a storage base
+    /// also holds the live storage of running branches, which have no marker at
+    /// all. Either one aborting the sweep would strand every preserved change
+    /// set beside it.
+    #[test]
+    fn a_branch_dir_the_sweep_cannot_parse_does_not_hide_the_ones_beside_it() {
+        let workdir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+
+        // Live storage of a running branch: no marker.
+        fs::create_dir_all(storage.path().join("live/upper")).unwrap();
+        // A marker cut short before the `upper=` line was written.
+        fs::create_dir(storage.path().join("truncated")).unwrap();
+        fs::write(
+            storage.path().join("truncated").join(PRESERVED_MARKER),
+            b"reason=kept\nworkdir=/some/workdir\npid=1\n".as_slice(),
+        )
+        .unwrap();
+        // Not a branch dir at all.
+        fs::write(storage.path().join("stray-file"), "junk").unwrap();
+
+        let preserved_dir;
+        {
+            let mut branch =
+                SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+            preserved_dir = branch.storage_dir.clone();
+            fs::write(branch.upper.join("added.txt"), "payload").unwrap();
+            branch.preserve(PreserveReason::CommitDeferred);
+        }
+
+        assert!(
+            read_preserved(&storage.path().join("truncated")).is_none(),
+            "a marker missing the upper it points at is not a recoverable branch",
+        );
+        assert!(
+            read_preserved(&storage.path().join("live")).is_none(),
+            "a branch that never marked itself is not awaiting recovery",
+        );
+
+        let found: Vec<PathBuf> = list_preserved(storage.path())
+            .into_iter()
+            .map(|p| p.branch_dir)
+            .collect();
+        assert_eq!(
+            found,
+            vec![preserved_dir],
+            "the sweep must report the parseable branch and only that one",
+        );
+    }
+
+    /// A branch kept for inspection must read back as [`PreserveReason::Kept`]:
+    /// the reason is what tells a recovery what state the workdir is in, and
+    /// `Kept` is the one that says the workdir was never touched and nothing is
+    /// owed to it. Reading it back as an interrupted merge would send an
+    /// operator looking for a half-merged workdir that does not exist.
+    #[test]
+    fn a_kept_branch_reads_back_as_kept_with_its_whole_change_set() {
+        let workdir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        fs::write(workdir.path().join("gone.txt"), "still here").unwrap();
+
+        {
+            let mut branch =
+                SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+            fs::write(branch.upper.join("added.txt"), "payload").unwrap();
+            branch.mark_deleted("gone.txt");
+            branch.keep();
+        }
+
+        let found = list_preserved(storage.path());
+        assert_eq!(found.len(), 1, "the kept branch must be findable, got {found:?}");
+        assert_eq!(
+            found[0].reason,
+            PreserveReason::Kept,
+            "the marker must say the changes were kept, not that a merge was interrupted",
+        );
+        assert_eq!(
+            fs::read_to_string(found[0].upper.join("added.txt")).unwrap(),
+            "payload",
+            "the additions must be reachable through the marker",
+        );
+        assert_eq!(
+            found[0].deleted,
+            vec![PathBuf::from("gone.txt")],
+            "the deletions are the half of the change set that lives only in the marker",
+        );
+        // Keep merges nothing: the workdir is exactly as the run found it.
+        assert!(workdir.path().join("gone.txt").exists());
+        assert!(!workdir.path().join("added.txt").exists());
+    }
+
+    /// `keep()` hands the storage to the caller, so a later `abort()` must not
+    /// throw it away. `abort()` normally means "discard the changes", and a
+    /// holder that runs one after the other — a disposition followed by a
+    /// blanket cleanup — would otherwise destroy the only copy of the change
+    /// set that was explicitly kept for inspection.
+    #[test]
+    fn abort_after_keep_does_not_destroy_the_kept_change_set() {
+        let workdir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        fs::write(branch.upper.join("added.txt"), "payload").unwrap();
+        branch.keep();
+
+        branch.abort().unwrap();
+
+        assert!(
+            branch.upper.join("added.txt").exists(),
+            "abort must not discard a change set that was already kept",
+        );
+        assert_eq!(
+            fs::read_to_string(branch.upper.join("added.txt")).unwrap(),
+            "payload",
+            "the kept change set must survive intact",
+        );
+        assert_eq!(
+            list_preserved(storage.path()).len(),
+            1,
+            "the kept branch must still be findable by a sweep after the abort",
+        );
+    }
+
+    /// The marker's reason describes the state of the WORKDIR, so a second
+    /// `preserve()` has to overwrite the first record rather than leave the
+    /// stale one on disk.
+    ///
+    /// A commit that could not take the workdir lock preserves as
+    /// `CommitDeferred` — the workdir is untouched — and the branch stays
+    /// committable. If the retry then merges part way and fails, the workdir is
+    /// half merged; a sweep still reading `commit-deferred` would recover it as
+    /// though nothing had landed.
+    #[test]
+    fn a_second_preserve_replaces_the_reason_recorded_on_disk() {
+        let workdir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        // The obstruction that fails the merge: a symlink in the workdir where
+        // the upper holds a regular file (ELOOP under O_NOFOLLOW).
+        std::os::unix::fs::symlink("/dev/null", workdir.path().join("blocked.txt")).unwrap();
+
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let storage_dir = branch.storage_dir.clone();
+        fs::write(branch.upper.join("blocked.txt"), "payload").unwrap();
+
+        branch.preserve(PreserveReason::CommitDeferred);
+        assert_eq!(
+            read_preserved(&storage_dir).unwrap().reason,
+            PreserveReason::CommitDeferred,
+            "the deferred commit left the workdir untouched",
+        );
+
+        branch.commit().expect_err("the obstructed merge must fail");
+
+        assert_eq!(
+            read_preserved(&storage_dir).unwrap().reason,
+            PreserveReason::MergeInterrupted,
+            "once the merge has run, the marker must say the workdir may be partial",
+        );
+    }
+
     fn setup_workdir() -> (tempfile::TempDir, tempfile::TempDir) {
         let workdir = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
