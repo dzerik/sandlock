@@ -97,7 +97,7 @@ impl Transaction {
     /// silently. If the commit cannot take the workdir lock, or the merge itself
     /// fails partway, the shared upper is **preserved** and its path is named in
     /// the error.
-    pub async fn run(self, timeout: Option<Duration>) -> Result<TxnOutcome, SandlockError> {
+    pub async fn run(self, timeout: Option<Duration>) -> Result<TxnOutcome, TxnError> {
         validate_txn_stages(&self.stages)?;
         run_txn(self.stages, timeout, Disposition::Commit, self.commit_lock_wait).await
     }
@@ -111,7 +111,7 @@ impl Transaction {
     /// The outcome always has `committed == false` and
     /// `abort_reason == Some(`[`AbortReason::DryRun`]`)` unless a stage failed
     /// or the transaction timed out first.
-    pub async fn dry_run(self, timeout: Option<Duration>) -> Result<TxnOutcome, SandlockError> {
+    pub async fn dry_run(self, timeout: Option<Duration>) -> Result<TxnOutcome, TxnError> {
         validate_txn_stages(&self.stages)?;
         run_txn(self.stages, timeout, Disposition::DryRun, self.commit_lock_wait).await
     }
@@ -122,6 +122,137 @@ impl Transaction {
 enum Disposition {
     Commit,
     DryRun,
+}
+
+// ============================================================
+// Errors
+// ============================================================
+
+/// Why a transaction could not be carried out at all.
+///
+/// A transaction has two failure channels and this type is the second one. The
+/// **abort** channel — a stage exited non-zero, the run timed out — is an
+/// `Ok(TxnOutcome)` with an [`AbortReason`]: the transaction did its job and
+/// the workdir is untouched. The **commit** channel is this type: the
+/// transaction could not be carried out, and each way that can happen is its
+/// own variant so a caller never has to match on a message.
+///
+/// `#[non_exhaustive]`: match with a `_` arm.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum TxnError {
+    /// The stage set is not a valid transaction. Checked before anything runs,
+    /// so nothing was executed and no branch was created.
+    #[error("invalid transaction: {0}")]
+    Invalid(String),
+
+    /// The shared COW branch could not be created. No stage ran.
+    #[error("transaction: failed to create the shared COW branch over {workdir}: {source}")]
+    Branch {
+        workdir: std::path::PathBuf,
+        #[source]
+        source: crate::error::BranchError,
+    },
+
+    /// Stage `index` could not be started or driven to completion. This is not a
+    /// stage that *failed* — that is [`AbortReason::StageFailed`] — it is a
+    /// stage that never produced an exit status.
+    #[error("transaction: stage {index} could not be run: {source}")]
+    Stage {
+        index: usize,
+        #[source]
+        source: SandlockError,
+    },
+
+    /// Conflict: another transaction held the workdir commit lock for longer
+    /// than [`Transaction::commit_lock_wait`]. Every stage had succeeded, so the
+    /// workdir is untouched and the whole change set is preserved at
+    /// `preserved_upper` — retrying is the expected response.
+    #[error(
+        "transaction: gave up after {waited:?} waiting for another commit to release the workdir \
+         lock on {workdir}. The workdir is untouched and this transaction's changes were \
+         preserved at {preserved_upper}"
+    )]
+    Conflict {
+        workdir: std::path::PathBuf,
+        waited: Duration,
+        preserved_upper: std::path::PathBuf,
+    },
+
+    /// The workdir commit lock could not be taken for a reason other than
+    /// contention (the workdir could not be opened, or `flock` failed). As with
+    /// [`Self::Conflict`] the workdir is untouched and the change set is
+    /// preserved.
+    #[error(
+        "transaction: could not take the commit lock on {workdir}: {source}. The workdir is \
+         untouched and this transaction's changes were preserved at {preserved_upper}"
+    )]
+    CommitLock {
+        workdir: std::path::PathBuf,
+        preserved_upper: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// The commit merge failed partway. The workdir is partially merged and the
+    /// shared upper is preserved at `preserved_upper` — see
+    /// [`SeccompCowBranch::commit`](crate::cow::seccomp::SeccompCowBranch::commit)
+    /// for what it holds and how to finish.
+    #[error(
+        "transaction: the commit merge into {workdir} failed: {source}. The workdir is partially \
+         merged and what did not land was preserved at {preserved_upper}"
+    )]
+    Merge {
+        workdir: std::path::PathBuf,
+        preserved_upper: std::path::PathBuf,
+        #[source]
+        source: crate::error::BranchError,
+    },
+}
+
+impl TxnError {
+    /// Process exit code for this failure, keeping the RFC's channels apart:
+    /// configuration (78), stage driver (70), commit (74), conflict (75).
+    ///
+    /// The values are the conventional `sysexits.h` names — `EX_CONFIG`,
+    /// `EX_SOFTWARE`, `EX_IOERR`, `EX_TEMPFAIL`. `EX_TEMPFAIL` for a conflict is
+    /// the one that carries meaning beyond "distinct": it says retry.
+    ///
+    /// These do NOT distinguish themselves from a stage's own exit code — a
+    /// child is free to exit 75 — so a caller that needs to tell a commit
+    /// failure from a stage failure takes it from the `Result`, not the number.
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            TxnError::Invalid(_) => 78,
+            TxnError::Stage { .. } => 70,
+            TxnError::Branch { .. } | TxnError::CommitLock { .. } | TxnError::Merge { .. } => 74,
+            TxnError::Conflict { .. } => 75,
+        }
+    }
+}
+
+impl From<TxnError> for SandlockError {
+    /// Flatten into the crate-wide error for callers that do not care about the
+    /// channel. A misconfigured transaction stays a `Sandbox` error rather than
+    /// masquerading as a child-process failure.
+    fn from(e: TxnError) -> Self {
+        match e {
+            TxnError::Invalid(m) => SandlockError::Sandbox(SandboxError::Invalid(m)),
+            TxnError::Stage { source, .. } => source,
+            other => SandlockError::Runtime(SandboxRuntimeError::Child(other.to_string())),
+        }
+    }
+}
+
+/// Why [`acquire_commit_lock`] gave up, so the caller can tell contention (a
+/// conflict, worth retrying) from a broken workdir.
+#[derive(Debug)]
+enum LockFailure {
+    /// The lock was held by someone else for the whole wait.
+    Contended(Duration),
+    /// The workdir could not be opened, or `flock` failed for a reason other
+    /// than contention.
+    Io(std::io::Error),
 }
 
 // ============================================================
@@ -178,6 +309,32 @@ pub struct TxnOutcome {
     pub abort_reason: Option<AbortReason>,
 }
 
+impl TxnOutcome {
+    /// Process exit code for this outcome, for a caller that fronts a
+    /// transaction with a command-line tool.
+    ///
+    /// A committed transaction and a completed dry run are 0 — both did what
+    /// was asked. A stage failure reports that stage's own status, under the
+    /// shell convention (a signalled child is `128 + signal`), so the code a
+    /// caller sees is the code the failing command produced. A timeout is 124,
+    /// as `timeout(1)` reports it.
+    ///
+    /// The commit channel is not represented here at all: it is
+    /// [`TxnError::exit_code`].
+    pub fn exit_code(&self) -> i32 {
+        match &self.abort_reason {
+            None | Some(AbortReason::DryRun) => 0,
+            Some(AbortReason::TimedOut) => 124,
+            Some(AbortReason::StageFailed { status, .. }) => match status {
+                ExitStatus::Code(c) => *c,
+                ExitStatus::Signal(s) => 128 + *s,
+                ExitStatus::Killed => 128 + libc::SIGKILL,
+                ExitStatus::Timeout => 124,
+            },
+        }
+    }
+}
+
 // ============================================================
 // Validation
 // ============================================================
@@ -187,11 +344,11 @@ pub struct TxnOutcome {
 /// stage must set the same workdir, keep the supervisor, and not carry its own
 /// branch action.
 ///
-/// These are configuration errors, reported as [`SandboxError::Invalid`] so a
+/// These are configuration errors, reported as [`TxnError::Invalid`] so a
 /// misconfigured transaction is distinguishable from a child-process failure.
-fn validate_txn_stages(stages: &[Stage]) -> Result<(), SandlockError> {
-    fn reject(msg: impl Into<String>) -> SandlockError {
-        SandlockError::Sandbox(SandboxError::Invalid(msg.into()))
+fn validate_txn_stages(stages: &[Stage]) -> Result<(), TxnError> {
+    fn reject(msg: impl Into<String>) -> TxnError {
+        TxnError::Invalid(msg.into())
     }
 
     if stages.len() < 2 {
@@ -260,11 +417,7 @@ async fn run_txn(
     timeout: Option<Duration>,
     disposition: Disposition,
     commit_lock_wait: Duration,
-) -> Result<TxnOutcome, SandlockError> {
-    fn child_err(msg: String) -> SandlockError {
-        SandlockError::Runtime(SandboxRuntimeError::Child(msg))
-    }
-
+) -> Result<TxnOutcome, TxnError> {
     // All stages share the validated workdir; take COW storage/quota from the
     // first stage (they overlay the same lower).
     let base = &stages[0].sandbox;
@@ -273,7 +426,7 @@ async fn run_txn(
     let max_disk = base.max_disk.map(|b| b.0).unwrap_or(0);
 
     let branch = crate::cow::seccomp::SeccompCowBranch::create(&workdir, storage.as_deref(), max_disk)
-        .map_err(|e| child_err(format!("transaction: failed to create COW branch: {e}")))?;
+        .map_err(|source| TxnError::Branch { workdir: workdir.clone(), source })?;
     let upper_dir = branch.upper_dir().to_path_buf();
 
     let mut cow_state = crate::seccomp::state::CowState::new();
@@ -286,7 +439,7 @@ async fn run_txn(
     // stages' results down with it.
     let results = std::sync::Arc::new(std::sync::Mutex::new(Vec::<RunResult>::new()));
     let drive = drive_txn_stages(stages, shared, std::sync::Arc::clone(&results));
-    let driven: Result<Option<AbortReason>, SandlockError> = match timeout {
+    let driven: Result<Option<AbortReason>, TxnError> = match timeout {
         Some(dur) => match tokio::time::timeout(dur, drive).await {
             Ok(r) => r,
             Err(_) => Ok(Some(AbortReason::TimedOut)),
@@ -326,7 +479,7 @@ async fn run_txn(
                     // own branch into the same workdir does not take it.
                     let lock = match acquire_commit_lock(&workdir, commit_lock_wait).await {
                         Ok(l) => l,
-                        Err(e) => {
+                        Err(f) => {
                             // Every stage exited 0, so the upper holds a full,
                             // mergeable change set that only failed to be
                             // published. Returning here would otherwise drop an
@@ -334,19 +487,26 @@ async fn run_txn(
                             // a run that did nothing wrong. Hand the storage
                             // over instead and name it in the error.
                             branch.preserve(crate::cow::seccomp::PreserveReason::CommitDeferred);
-                            return Err(child_err(format!(
-                                "{e}. The workdir is untouched and this transaction's \
-                                 changes were preserved at {}",
-                                upper_dir.display()
-                            )));
+                            return Err(match f {
+                                LockFailure::Contended(waited) => TxnError::Conflict {
+                                    workdir,
+                                    waited,
+                                    preserved_upper: upper_dir,
+                                },
+                                LockFailure::Io(source) => TxnError::CommitLock {
+                                    workdir,
+                                    preserved_upper: upper_dir,
+                                    source,
+                                },
+                            });
                         }
                     };
-                    branch.commit().map_err(|e| {
-                        child_err(format!(
-                            "transaction: commit failed: {e}. The workdir is partially merged \
-                             and the unmerged remainder was preserved at {}",
-                            upper_dir.display()
-                        ))
+                    // `commit()` preserves the upper itself when it fails
+                    // partway — it marks the branch before touching the workdir.
+                    branch.commit().map_err(|source| TxnError::Merge {
+                        workdir: workdir.clone(),
+                        preserved_upper: upper_dir.clone(),
+                        source,
                     })?;
                     drop(lock); // release the workdir lock after the merge
                     true
@@ -395,9 +555,8 @@ async fn run_txn(
 async fn acquire_commit_lock(
     workdir: &std::path::Path,
     deadline_after: Duration,
-) -> Result<std::fs::File, String> {
-    let lock = std::fs::File::open(workdir)
-        .map_err(|e| format!("transaction: open workdir for commit lock: {e}"))?;
+) -> Result<std::fs::File, LockFailure> {
+    let lock = std::fs::File::open(workdir).map_err(LockFailure::Io)?;
     let deadline = tokio::time::Instant::now() + deadline_after;
     loop {
         if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
@@ -407,15 +566,10 @@ async fn acquire_commit_lock(
         // EWOULDBLOCK (== EAGAIN on Linux) means another commit holds the lock.
         // Any other errno is a real failure and must not be retried.
         if err.raw_os_error() != Some(libc::EWOULDBLOCK) {
-            return Err(format!("transaction: commit lock: {err}"));
+            return Err(LockFailure::Io(err));
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err(format!(
-                "transaction: timed out after {:?} waiting for another commit to release the \
-                 workdir lock on {}",
-                deadline_after,
-                workdir.display()
-            ));
+            return Err(LockFailure::Contended(deadline_after));
         }
         tokio::time::sleep(COMMIT_LOCK_POLL).await;
     }
@@ -432,14 +586,15 @@ async fn drive_txn_stages(
     stages: Vec<Stage>,
     shared: crate::sandbox::SharedCow,
     results: std::sync::Arc<std::sync::Mutex<Vec<RunResult>>>,
-) -> Result<Option<AbortReason>, SandlockError> {
+) -> Result<Option<AbortReason>, TxnError> {
     for (i, stage) in stages.into_iter().enumerate() {
+        let at = |source: SandlockError| TxnError::Stage { index: i, source };
         let cmd_refs: Vec<&str> = stage.args.iter().map(|s| s.as_str()).collect();
         let mut sb = stage.sandbox.with_name(format!("txn-stage-{i}"));
-        sb.set_shared_cow(shared.clone())?;
-        sb.create_with_io(&cmd_refs, None, None, None).await?;
-        sb.start()?;
-        let result = sb.wait().await?;
+        sb.set_shared_cow(shared.clone()).map_err(at)?;
+        sb.create_with_io(&cmd_refs, None, None, None).await.map_err(at)?;
+        sb.start().map_err(at)?;
+        let result = sb.wait().await.map_err(at)?;
 
         let status = result.exit_status.clone();
         if let Ok(mut guard) = results.lock() {
@@ -488,10 +643,11 @@ mod tests {
         );
     }
 
-    /// The wait is bounded: a lock that is never released is an error naming
-    /// the workdir, not an indefinite hang.
+    /// The wait is bounded, and expiring it is reported as CONTENTION rather
+    /// than as a broken workdir: that distinction is what makes the failure a
+    /// retryable `TxnError::Conflict` instead of an I/O error.
     #[tokio::test]
-    async fn commit_lock_wait_is_bounded() {
+    async fn commit_lock_wait_is_bounded_and_reports_contention() {
         let dir = tempfile::tempdir().unwrap();
         let held = std::fs::File::open(dir.path()).unwrap();
         assert_eq!(
@@ -506,15 +662,85 @@ mod tests {
         let waited = started.elapsed();
         drop(held);
 
-        assert!(err.contains("timed out"), "error should name the timeout, got: {err}");
         assert!(
-            err.contains(&dir.path().display().to_string()),
-            "error should name the workdir, got: {err}"
+            matches!(err, LockFailure::Contended(d) if d == Duration::from_millis(200)),
+            "a held lock must be reported as contention carrying the wait, got: {err:?}"
         );
         assert!(
             waited >= Duration::from_millis(200),
             "must have waited out the whole deadline, waited {waited:?}"
         );
+    }
+
+    /// A workdir that cannot be opened at all is NOT contention: it must not be
+    /// reported as a retryable conflict.
+    #[tokio::test]
+    async fn commit_lock_reports_a_missing_workdir_as_io() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("no-such-workdir");
+        let err = acquire_commit_lock(&gone, Duration::from_millis(200))
+            .await
+            .expect_err("a workdir that does not exist cannot be locked");
+        assert!(
+            matches!(err, LockFailure::Io(_)),
+            "a missing workdir is an I/O failure, not contention, got: {err:?}"
+        );
+    }
+
+    /// The two failure channels stay apart when flattened into the crate-wide
+    /// error: a misconfigured transaction must not masquerade as a
+    /// child-process failure.
+    #[test]
+    fn txn_errors_flatten_without_losing_the_channel() {
+        let invalid: SandlockError = TxnError::Invalid("bad stages".into()).into();
+        assert!(
+            matches!(invalid, SandlockError::Sandbox(SandboxError::Invalid(_))),
+            "a configuration error must stay a sandbox error, got: {invalid:?}"
+        );
+        let conflict: SandlockError = TxnError::Conflict {
+            workdir: "/wd".into(),
+            waited: Duration::from_secs(1),
+            preserved_upper: "/st/upper".into(),
+        }
+        .into();
+        assert!(
+            matches!(conflict, SandlockError::Runtime(_)),
+            "a commit-channel failure is a runtime error, got: {conflict:?}"
+        );
+        assert!(
+            conflict.to_string().contains("/st/upper"),
+            "flattening must not lose the preserved upper, got: {conflict}"
+        );
+    }
+
+    /// Each commit-channel failure the RFC names gets its own exit code, and a
+    /// conflict specifically reports EX_TEMPFAIL: "retry me".
+    #[test]
+    fn commit_channel_failures_have_distinct_exit_codes() {
+        let stage = TxnError::Stage {
+            index: 0,
+            source: SandlockError::Runtime(SandboxRuntimeError::NotRunning),
+        };
+        let merge = TxnError::Merge {
+            workdir: "/wd".into(),
+            preserved_upper: "/st/upper".into(),
+            source: crate::error::BranchError::Operation("copy".into()),
+        };
+        let conflict = TxnError::Conflict {
+            workdir: "/wd".into(),
+            waited: Duration::from_secs(1),
+            preserved_upper: "/st/upper".into(),
+        };
+        let invalid = TxnError::Invalid("bad stages".into());
+
+        let codes = [stage.exit_code(), merge.exit_code(), conflict.exit_code(), invalid.exit_code()];
+        let unique: std::collections::HashSet<i32> = codes.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            codes.len(),
+            "stage/commit/conflict/config must not share an exit code, got {codes:?}"
+        );
+        assert_eq!(conflict.exit_code(), 75, "a conflict is EX_TEMPFAIL: retry it");
     }
 
     /// An uncontended lock is taken immediately — the poll loop must not add

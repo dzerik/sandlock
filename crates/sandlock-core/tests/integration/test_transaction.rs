@@ -6,7 +6,7 @@
 //! inter-stage pipes.
 
 use sandlock_core::sandbox::BranchAction;
-use sandlock_core::{AbortReason, ChangeKind, Sandbox, Stage, Transaction};
+use sandlock_core::{AbortReason, ChangeKind, Sandbox, Stage, Transaction, TxnError};
 use std::fs;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -185,10 +185,16 @@ async fn test_txn_preserves_the_upper_when_the_commit_lock_never_frees() {
         "built\n",
         "the preserved upper must still hold stage 1's write",
     );
-    assert!(
-        err.to_string().contains(&upper.display().to_string()),
-        "the error must name the preserved upper so it can be recovered, got: {err}",
-    );
+    // The failure is typed as a CONFLICT — the retryable channel — not as a
+    // stage or configuration failure, and it names the preserved upper.
+    match &err {
+        TxnError::Conflict { workdir: wd, preserved_upper, .. } => {
+            assert_eq!(wd, &workdir, "the conflict must name the contended workdir");
+            assert_eq!(preserved_upper, &upper, "the conflict must name the preserved upper");
+        }
+        other => panic!("expected a commit-lock conflict, got: {other:?}"),
+    }
+    assert_eq!(err.exit_code(), 75, "a conflict reports EX_TEMPFAIL: retry it");
 
     let _ = fs::remove_dir_all(&workdir);
     let _ = fs::remove_dir_all(&storage);
@@ -226,6 +232,10 @@ async fn test_txn_aborts_on_stage_failure() {
             status: sandlock_core::ExitStatus::Code(1),
         }),
         "abort must name the failing stage and its status",
+    );
+    assert_eq!(
+        outcome.exit_code(), 1,
+        "the outcome reports the failing stage's own exit code",
     );
     assert!(!workdir.join("a.txt").exists(), "a.txt must NOT leak after abort");
     assert!(!workdir.join("b.txt").exists(), "b.txt must NOT leak after abort");
@@ -403,8 +413,9 @@ async fn test_txn_dry_run_reports_without_committing() {
 /// Guardrail: a non-default `on_exit`/`on_error` conflicts with the transaction
 /// owning commit/abort, and is rejected before anything runs. (No sandbox needed.)
 ///
-/// Misconfiguration is reported as a `Sandbox` error, NOT as a child-process
-/// error, so a caller can tell a bad transaction from a failed command.
+/// Misconfiguration is its own typed variant, NOT a stage or commit failure, so
+/// a caller can tell a bad transaction from a failed command without reading the
+/// message.
 #[tokio::test]
 async fn test_txn_rejects_branch_action() {
     let workdir = temp_dir("guard-action");
@@ -421,9 +432,10 @@ async fn test_txn_rejects_branch_action() {
     ])
     .run(None).await.unwrap_err();
     assert!(
-        matches!(err, sandlock_core::SandlockError::Sandbox(_)),
-        "a misconfigured transaction must not masquerade as a child error, got: {err:?}"
+        matches!(err, TxnError::Invalid(_)),
+        "a misconfigured transaction must not masquerade as a stage or commit failure, got: {err:?}"
     );
+    assert_eq!(err.exit_code(), 78, "a configuration error reports EX_CONFIG");
     assert!(err.to_string().contains("on_exit/on_error"), "expected the on_exit guardrail, got: {err}");
 
     let _ = fs::remove_dir_all(&workdir);
