@@ -611,3 +611,106 @@ async fn test_seccomp_cow_exec_packed_argv_relocation() {
 
     let _ = fs::remove_dir_all(&workdir);
 }
+
+// ============================================================
+// Deletion-model regressions (issues #159/#160/#161)
+// ============================================================
+
+/// A directory the child removed stays removed after commit, including its
+/// contents (issue #159: whiteouts cover the subtree).
+#[tokio::test]
+async fn test_cow_child_rm_r_directory_stays_deleted() {
+    let workdir = temp_dir("seccomp-rm-r");
+    fs::create_dir_all(workdir.join("d")).unwrap();
+    fs::write(workdir.join("d/secret.txt"), "SECRET").unwrap();
+
+    let policy = Sandbox::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/proc")
+        .fs_write(&workdir)
+        .workdir(&workdir)
+        .on_exit(BranchAction::Commit)
+        .build()
+        .unwrap();
+
+    let cmd = format!("rm -r {}/d", workdir.display());
+    let result = policy.clone().with_name("test").run(&["sh", "-c", &cmd]).await;
+    match result {
+        Ok(r) => {
+            assert!(r.success(), "rm -r should succeed, stderr: {}", r.stderr_str().unwrap_or(""));
+            assert!(!workdir.join("d").exists(), "d should be gone after commit");
+            assert!(!workdir.join("d/secret.txt").exists());
+        }
+        Err(e) => eprintln!("Seccomp COW test skipped: {}", e),
+    }
+
+    let _ = fs::remove_dir_all(&workdir);
+}
+
+/// Renaming a directory preserves its contents through the commit
+/// (issue #160: the rename is staged with a recursive copy-up).
+#[tokio::test]
+async fn test_cow_child_mv_directory_preserves_contents() {
+    let workdir = temp_dir("seccomp-mv-dir");
+    fs::create_dir_all(workdir.join("d")).unwrap();
+    fs::write(workdir.join("d/inner.txt"), "PRECIOUS").unwrap();
+
+    let policy = Sandbox::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/proc")
+        .fs_write(&workdir)
+        .workdir(&workdir)
+        .on_exit(BranchAction::Commit)
+        .build()
+        .unwrap();
+
+    let cmd = format!("mv {}/d {}/d2", workdir.display(), workdir.display());
+    let result = policy.clone().with_name("test").run(&["sh", "-c", &cmd]).await;
+    match result {
+        Ok(r) => {
+            assert!(r.success(), "mv should succeed, stderr: {}", r.stderr_str().unwrap_or(""));
+            assert!(!workdir.join("d").exists(), "d should be gone after commit");
+            assert_eq!(
+                fs::read_to_string(workdir.join("d2/inner.txt")).unwrap(),
+                "PRECIOUS",
+                "d2/inner.txt must survive the rename"
+            );
+        }
+        Err(e) => eprintln!("Seccomp COW test skipped: {}", e),
+    }
+
+    let _ = fs::remove_dir_all(&workdir);
+}
+
+/// rmdir on a non-empty directory fails inside the sandbox and the contents
+/// survive the commit (issue #161: ENOTEMPTY from the merged view).
+#[tokio::test]
+async fn test_cow_child_rmdir_nonempty_fails() {
+    let workdir = temp_dir("seccomp-rmdir-nonempty");
+    fs::create_dir_all(workdir.join("d")).unwrap();
+    fs::write(workdir.join("d/inner.txt"), "DATA").unwrap();
+
+    let policy = Sandbox::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/proc")
+        .fs_write(&workdir)
+        .workdir(&workdir)
+        .on_exit(BranchAction::Commit)
+        .build()
+        .unwrap();
+
+    let cmd = format!("rmdir {}/d", workdir.display());
+    let result = policy.clone().with_name("test").run(&["sh", "-c", &cmd]).await;
+    match result {
+        Ok(r) => {
+            assert!(!r.success(), "rmdir of a non-empty directory must fail");
+            assert!(
+                workdir.join("d/inner.txt").exists(),
+                "contents must survive the failed rmdir and the commit"
+            );
+        }
+        Err(e) => eprintln!("Seccomp COW test skipped: {}", e),
+    }
+
+    let _ = fs::remove_dir_all(&workdir);
+}

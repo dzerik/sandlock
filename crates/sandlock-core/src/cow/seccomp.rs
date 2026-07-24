@@ -2153,6 +2153,84 @@ mod tests {
         assert_eq!(fs::read(upper_root.join("race")).unwrap(), b"");
     }
 
+    /// Recursively snapshot the merged view as (rel path -> Option<bytes>),
+    /// None for directories. This is what the child observes during the run.
+    fn merged_snapshot(
+        branch: &SeccompCowBranch,
+        rel: &str,
+        out: &mut std::collections::BTreeMap<String, Option<Vec<u8>>>,
+    ) {
+        for name in branch.list_merged_dir(rel) {
+            let child = if rel == "." { name.clone() } else { format!("{}/{}", rel, name) };
+            let resolved = branch.resolve_read(&child);
+            if resolved.is_dir() {
+                out.insert(child.clone(), None);
+                merged_snapshot(branch, &child, out);
+            } else if resolved.is_file() {
+                out.insert(child.clone(), Some(fs::read(&resolved).unwrap()));
+            }
+        }
+    }
+
+    /// Snapshot a real directory tree in the same shape.
+    fn dir_snapshot(
+        root: &std::path::Path,
+        rel: &str,
+        out: &mut std::collections::BTreeMap<String, Option<Vec<u8>>>,
+    ) {
+        let dir = if rel == "." { root.to_path_buf() } else { root.join(rel) };
+        for e in fs::read_dir(dir).unwrap().flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let child = if rel == "." { name } else { format!("{}/{}", rel, name) };
+            let p = e.path();
+            if p.is_dir() {
+                out.insert(child.clone(), None);
+                dir_snapshot(root, &child, out);
+            } else if p.is_file() {
+                out.insert(child.clone(), Some(fs::read(&p).unwrap()));
+            }
+        }
+    }
+
+    #[test]
+    fn commit_reproduces_merged_view() {
+        // The invariant behind #159/#160/#161: what the child observed during
+        // the run is exactly what commit() publishes.
+        let (workdir, storage) = setup_workdir();
+        let wd = workdir.path().canonicalize().unwrap();
+        fs::create_dir(wd.join("d")).unwrap();
+        fs::write(wd.join("d/a.txt"), "A").unwrap();
+        fs::write(wd.join("d/b.txt"), "B").unwrap();
+        fs::create_dir(wd.join("e")).unwrap();
+        fs::write(wd.join("e/keep.txt"), "K").unwrap();
+
+        let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 0).unwrap();
+        let w = |r: &str| format!("{}/{}", wd.display(), r);
+
+        // A mix of the operations the four issues cover.
+        let up = branch
+            .handle_open(&w("new.txt"), (libc::O_WRONLY | libc::O_CREAT) as u64)
+            .unwrap()
+            .unwrap();
+        fs::write(&up, "NEW").unwrap();
+        let up = branch
+            .handle_open(&w("existing.txt"), libc::O_WRONLY as u64)
+            .unwrap()
+            .unwrap();
+        fs::write(&up, "MODIFIED").unwrap();
+        assert_eq!(branch.handle_unlink(&w("d/a.txt"), false), Ok(true));
+        assert!(branch.handle_rename(&w("d"), &w("moved")).unwrap());
+        assert_eq!(branch.handle_unlink(&w("subdir/nested.txt"), false), Ok(true));
+        assert_eq!(branch.handle_unlink(&w("subdir"), true), Ok(true));
+
+        let mut merged = std::collections::BTreeMap::new();
+        merged_snapshot(&branch, ".", &mut merged);
+        branch.commit().unwrap();
+        let mut committed = std::collections::BTreeMap::new();
+        dir_snapshot(&wd, ".", &mut committed);
+        assert_eq!(merged, committed);
+    }
+
     #[test]
     fn deletion_log_written_beside_upper() {
         let (workdir, storage) = setup_workdir();
