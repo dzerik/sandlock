@@ -39,6 +39,10 @@ pub enum CowCopyPlan {
         lower: PathBuf,
         file_size: u64,
     },
+    /// Not COW-managed (FIFO, socket, device node): I/O through it does not
+    /// change the tree, and copying it can block forever (issue #158). The
+    /// kernel handles the syscall against the real workdir entry.
+    Passthrough,
 }
 
 /// Plan returned by `prepare_open` — describes what I/O to do after releasing the lock.
@@ -285,6 +289,10 @@ impl SeccompCowBranch {
             return Ok(CowCopyPlan::Ready(upper_file));
         }
 
+        if kind != libc::S_IFREG {
+            return Ok(CowCopyPlan::Passthrough);
+        }
+
         // Regular file — defer the potentially expensive copy. Size comes from
         // the confined lstat, so the quota reservation matches the file
         // execute_copy will actually read.
@@ -321,7 +329,7 @@ impl SeccompCowBranch {
         let src_fd = match crate::sys::fs::openat2_in_root(
             workdir_root,
             rel,
-            libc::O_RDONLY | libc::O_CLOEXEC,
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
             0,
         ) {
             Ok(fd) => fd,
@@ -339,6 +347,15 @@ impl SeccompCowBranch {
         };
 
         let mut src = unsafe { fs::File::from_raw_fd(src_fd) };
+        // prepare_copy classified this entry as a regular file, but it can
+        // change type between that lstat and this open. Never stream a
+        // non-regular source: a FIFO read blocks or steals pipe data (issue
+        // #158). O_NONBLOCK above makes the FIFO open itself return instead
+        // of waiting for a writer; on a regular file it is a no-op for reads.
+        if !src.metadata()?.file_type().is_file() {
+            create_dest()?;
+            return Ok(());
+        }
         let mut dst = create_dest()?;
         std::io::copy(&mut src, &mut dst)?;
         if let Ok(meta) = src.metadata() {
@@ -347,14 +364,16 @@ impl SeccompCowBranch {
         Ok(())
     }
 
-    /// Ensure a COW copy exists in upper (synchronous). Returns the upper path.
+    /// Ensure a COW copy exists in upper (synchronous). Returns the upper
+    /// path, or `None` when the entry is not COW-managed (passthrough).
     /// For callers that don't need async two-phase behavior.
-    pub fn ensure_cow_copy(&mut self, rel_path: &str) -> Result<PathBuf, BranchError> {
+    pub fn ensure_cow_copy(&mut self, rel_path: &str) -> Result<Option<PathBuf>, BranchError> {
         match self.prepare_copy(rel_path)? {
-            CowCopyPlan::Ready(upper) => Ok(upper),
+            CowCopyPlan::Ready(upper) => Ok(Some(upper)),
+            CowCopyPlan::Passthrough => Ok(None),
             CowCopyPlan::NeedsCopy { upper, lower: _lower, file_size } => {
                 match Self::execute_copy(&self.workdir, &self.upper, rel_path) {
-                    Ok(()) => Ok(upper),
+                    Ok(()) => Ok(Some(upper)),
                     Err(e) => {
                         self.rollback_copy(file_size);
                         Err(BranchError::Operation(format!("copy: {}", e)))
@@ -436,7 +455,7 @@ impl SeccompCowBranch {
 
         if self.is_deleted(&rel) {
             if flags & O_CREAT != 0 {
-                return self.ensure_cow_copy(&rel).map(Some);
+                return self.ensure_cow_copy(&rel);
             }
             // Whiteout: the lower file still physically exists with its
             // pre-delete bytes. Surface the deletion so the caller returns
@@ -457,11 +476,11 @@ impl SeccompCowBranch {
                 return Err(BranchError::Exists);
             }
             // File truly doesn't exist — create in upper
-            return self.ensure_cow_copy(&rel).map(Some);
+            return self.ensure_cow_copy(&rel);
         }
 
         if is_write {
-            self.ensure_cow_copy(&rel).map(Some)
+            self.ensure_cow_copy(&rel)
         } else {
             let resolved = self.resolve_read(&rel);
             if resolved.exists() || resolved.is_symlink() {
@@ -544,6 +563,7 @@ impl SeccompCowBranch {
     fn prepare_cow_copy(&mut self, rel_path: &str) -> Result<CowOpenPlan, BranchError> {
         match self.prepare_copy(rel_path)? {
             CowCopyPlan::Ready(upper) => Ok(CowOpenPlan::UpperReady { upper }),
+            CowCopyPlan::Passthrough => Ok(CowOpenPlan::Skip),
             CowCopyPlan::NeedsCopy { upper, lower, file_size } => {
                 Ok(CowOpenPlan::NeedsCopy {
                     upper,
@@ -730,7 +750,9 @@ impl SeccompCowBranch {
         if src_is_dir {
             return Ok(false);
         }
-        let _ = self.ensure_cow_copy(&old_rel)?;
+        if self.ensure_cow_copy(&old_rel)?.is_none() {
+            return Ok(false);
+        }
         if let Some(p) = parent_rel(&new_rel) {
             let _ = crate::sys::fs::mkdirp_in_root(&self.upper, p, 0o755);
         }
@@ -745,7 +767,9 @@ impl SeccompCowBranch {
             Some(r) => r,
             None => return Ok(false),
         };
-        let _ = self.ensure_cow_copy(&rel)?;
+        if self.ensure_cow_copy(&rel)?.is_none() {
+            return Ok(false);
+        }
         Ok(crate::sys::fs::chmod_in_root(&self.upper, &rel, mode).is_ok())
     }
 
@@ -757,7 +781,9 @@ impl SeccompCowBranch {
             Some(r) => r,
             None => return Ok(false),
         };
-        let _ = self.ensure_cow_copy(&rel)?;
+        if self.ensure_cow_copy(&rel)?.is_none() {
+            return Ok(false);
+        }
         // Best-effort: try the real chown but succeed either way — the
         // supervisor typically lacks CAP_CHOWN so this will fail, but
         // in COW/dry-run mode the ownership doesn't matter.
@@ -774,7 +800,9 @@ impl SeccompCowBranch {
             None => return Ok(false),
         };
         let new_len = length as u64;
-        let _ = self.ensure_cow_copy(&rel)?;
+        if self.ensure_cow_copy(&rel)?.is_none() {
+            return Ok(false);
+        }
         let old_len = crate::sys::fs::statat_in_root(&self.upper, &rel, true)
             .map(|st| st.st_size as u64)
             .unwrap_or(0);
@@ -807,8 +835,7 @@ impl SeccompCowBranch {
             Some(r) => r,
             None => return Ok(None),
         };
-        let upper = self.ensure_cow_copy(&rel)?;
-        Ok(Some(upper))
+        Ok(self.ensure_cow_copy(&rel)?)
     }
 
     /// Handle readlink.
@@ -1033,7 +1060,7 @@ mod tests {
     fn test_ensure_cow_copy() {
         let (workdir, storage) = setup_workdir();
         let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
-        let upper = branch.ensure_cow_copy("existing.txt").unwrap();
+        let upper = branch.ensure_cow_copy("existing.txt").unwrap().unwrap();
         assert!(upper.exists());
         assert_eq!(fs::read_to_string(&upper).unwrap(), "hello");
         assert!(branch.has_changes());
@@ -1043,7 +1070,7 @@ mod tests {
     fn test_resolve_read_prefers_upper() {
         let (workdir, storage) = setup_workdir();
         let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
-        let upper = branch.ensure_cow_copy("existing.txt").unwrap();
+        let upper = branch.ensure_cow_copy("existing.txt").unwrap().unwrap();
         fs::write(&upper, "modified").unwrap();
         let resolved = branch.resolve_read("existing.txt");
         assert_eq!(fs::read_to_string(&resolved).unwrap(), "modified");
@@ -1063,7 +1090,7 @@ mod tests {
         let (workdir, storage) = setup_workdir();
         let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
         // Write a new file via COW
-        let upper = branch.ensure_cow_copy("new.txt").unwrap();
+        let upper = branch.ensure_cow_copy("new.txt").unwrap().unwrap();
         fs::write(&upper, "new content").unwrap();
         branch.commit().unwrap();
         assert_eq!(fs::read_to_string(workdir.path().join("new.txt")).unwrap(), "new content");
@@ -1082,7 +1109,7 @@ mod tests {
     fn test_abort_discards_changes() {
         let (workdir, storage) = setup_workdir();
         let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
-        let upper = branch.ensure_cow_copy("new.txt").unwrap();
+        let upper = branch.ensure_cow_copy("new.txt").unwrap().unwrap();
         fs::write(&upper, "should be discarded").unwrap();
         branch.abort().unwrap();
         assert!(!workdir.path().join("new.txt").exists());
@@ -1092,7 +1119,7 @@ mod tests {
     fn test_changes_added_file() {
         let (workdir, storage) = setup_workdir();
         let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
-        let upper = branch.ensure_cow_copy("brand_new.txt").unwrap();
+        let upper = branch.ensure_cow_copy("brand_new.txt").unwrap().unwrap();
         fs::write(&upper, "new content").unwrap();
         let changes = branch.changes().unwrap();
         assert_eq!(changes.len(), 1);
@@ -1104,7 +1131,7 @@ mod tests {
     fn test_changes_modified_file() {
         let (workdir, storage) = setup_workdir();
         let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
-        let upper = branch.ensure_cow_copy("existing.txt").unwrap();
+        let upper = branch.ensure_cow_copy("existing.txt").unwrap().unwrap();
         fs::write(&upper, "modified content").unwrap();
         let changes = branch.changes().unwrap();
         assert_eq!(changes.len(), 1);
@@ -1135,9 +1162,9 @@ mod tests {
     fn test_changes_mixed() {
         let (workdir, storage) = setup_workdir();
         let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
-        let upper = branch.ensure_cow_copy("new.txt").unwrap();
+        let upper = branch.ensure_cow_copy("new.txt").unwrap().unwrap();
         fs::write(&upper, "new").unwrap();
-        let upper2 = branch.ensure_cow_copy("existing.txt").unwrap();
+        let upper2 = branch.ensure_cow_copy("existing.txt").unwrap().unwrap();
         fs::write(&upper2, "changed").unwrap();
         branch.mark_deleted("subdir/nested.txt");
 
@@ -1471,7 +1498,7 @@ mod tests {
         let (workdir, storage) = setup_workdir();
         let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
         // Create a file only in upper (brand new file)
-        let upper = branch.ensure_cow_copy("brand_new.txt").unwrap();
+        let upper = branch.ensure_cow_copy("brand_new.txt").unwrap().unwrap();
         std::fs::write(&upper, "content").unwrap();
         let path = abs(&branch, "brand_new.txt");
         // O_WRONLY | O_CREAT | O_EXCL — file exists in upper
@@ -1686,7 +1713,7 @@ mod tests {
             SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
 
         // ensure_cow_copy on a path reached through the symlinked parent.
-        let upper = branch.ensure_cow_copy("evil/group").unwrap();
+        let upper = branch.ensure_cow_copy("evil/group").unwrap().unwrap();
 
         // The upper file must NOT contain the host /etc/group contents.
         let host = std::fs::read_to_string("/etc/group").unwrap_or_default();
@@ -1702,7 +1729,7 @@ mod tests {
         let (workdir, storage) = setup_workdir();
         let mut branch =
             SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
-        let upper = branch.ensure_cow_copy("existing.txt").unwrap();
+        let upper = branch.ensure_cow_copy("existing.txt").unwrap().unwrap();
         assert_eq!(std::fs::read_to_string(&upper).unwrap(), "hello");
     }
 
@@ -1716,7 +1743,7 @@ mod tests {
         let mut branch =
             SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
         // Trigger copy-up of the symlink into upper.
-        let upper = branch.ensure_cow_copy("secret").unwrap();
+        let upper = branch.ensure_cow_copy("secret").unwrap().unwrap();
         assert!(upper.is_symlink(), "precondition: upper holds a verbatim symlink");
 
         branch.commit().unwrap();
@@ -1740,7 +1767,7 @@ mod tests {
         std::os::unix::fs::symlink("existing.txt", workdir.path().join("link")).unwrap();
         let mut branch =
             SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
-        let upper = branch.ensure_cow_copy("link").unwrap();
+        let upper = branch.ensure_cow_copy("link").unwrap().unwrap();
         assert!(upper.is_symlink(), "in-tree symlink was not preserved");
         assert_eq!(
             std::fs::read_link(&upper).unwrap(),
@@ -1858,7 +1885,7 @@ mod tests {
         let (workdir, storage) = setup_workdir();
         let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
         branch.mark_deleted("existing.txt");
-        let upper = branch.ensure_cow_copy("existing.txt").unwrap();
+        let upper = branch.ensure_cow_copy("existing.txt").unwrap().unwrap();
         assert!(!upper.exists() || fs::read(&upper).unwrap().is_empty());
     }
 
@@ -1887,7 +1914,7 @@ mod tests {
         let (workdir, storage) = setup_workdir();
         let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
         branch.mark_deleted("existing.txt");
-        let upper = branch.ensure_cow_copy("existing.txt").unwrap();
+        let upper = branch.ensure_cow_copy("existing.txt").unwrap().unwrap();
         fs::write(&upper, "recreated").unwrap();
         let changes = branch.changes().unwrap();
         // The recreated file is a single Added entry, not Deleted + Modified.
@@ -2059,6 +2086,71 @@ mod tests {
             false
         );
         assert!(!branch.upper_dir().join("d").exists());
+    }
+
+    #[test]
+    fn copy_up_of_fifo_does_not_block() {
+        // Issue #158: opening a FIFO O_RDONLY blocks until a writer appears,
+        // so the copy-up path must never stream a non-regular file. The probe
+        // runs on a thread with a timeout so a regression hangs the test, not
+        // the suite.
+        let (workdir, storage) = setup_workdir();
+        let fifo = workdir.path().join("pipe");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+
+        let wd = workdir.path().to_path_buf();
+        let sd = storage.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut b = SeccompCowBranch::create(&wd, Some(&sd), 0).unwrap();
+            let _ = tx.send(b.ensure_cow_copy("pipe").map(|p| p.is_none()));
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(Ok(true)) => {}
+            Ok(other) => panic!("expected passthrough for a FIFO, got {:?}", other),
+            Err(_) => panic!("copy-up of a FIFO hung"),
+        }
+    }
+
+    #[test]
+    fn write_open_of_fifo_is_not_intercepted() {
+        let (workdir, storage) = setup_workdir();
+        let fifo = workdir.path().join("pipe");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let wd = branch.workdir_str().to_string();
+        let flags = libc::O_WRONLY as u64;
+        assert_eq!(branch.handle_open(&format!("{}/pipe", wd), flags).unwrap(), None);
+        assert!(!branch.upper_dir().join("pipe").exists());
+    }
+
+    #[test]
+    fn chmod_of_fifo_falls_through() {
+        let (workdir, storage) = setup_workdir();
+        let fifo = workdir.path().join("pipe");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let wd = branch.workdir_str().to_string();
+        assert_eq!(branch.handle_chmod(&format!("{}/pipe", wd), 0o600).unwrap(), false);
+    }
+
+    #[test]
+    fn execute_copy_guards_against_type_race() {
+        // Defense in depth: if the entry changes type between prepare_copy's
+        // lstat and execute_copy's open, the O_NONBLOCK+fstat guard must
+        // catch it and produce an empty destination instead of streaming.
+        let (workdir, storage) = setup_workdir();
+        let fifo = workdir.path().join("race");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+        let branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let workdir_root = branch.workdir().to_path_buf();
+        let upper_root = branch.upper_dir().to_path_buf();
+        SeccompCowBranch::execute_copy(&workdir_root, &upper_root, "race").unwrap();
+        assert_eq!(fs::read(upper_root.join("race")).unwrap(), b"");
     }
 
     #[test]
