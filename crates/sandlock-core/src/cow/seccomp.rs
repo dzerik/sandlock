@@ -539,6 +539,9 @@ impl SeccompCowBranch {
             Some(r) => r,
             None => return Ok(false),
         };
+        if self.is_deleted(&rel) {
+            return Err(libc::ENOENT);
+        }
         let upper_file = self.upper.join(&rel);
         let lower_file = self.workdir.join(&rel);
 
@@ -562,6 +565,14 @@ impl SeccompCowBranch {
                 // unlink() on a directory → EISDIR
                 return Err(libc::EISDIR);
             }
+        }
+
+        // rmdir semantics come from the merged view: entries in either layer
+        // that the child can still see make the directory non-empty (issue
+        // #161). The path-based whiteout would otherwise delete a subtree the
+        // child never emptied, and would do it while reporting success.
+        if is_dir && !self.list_merged_dir(&rel).is_empty() {
+            return Err(libc::ENOTEMPTY);
         }
 
         if upper_file.exists() || upper_file.is_symlink() {
@@ -1840,6 +1851,70 @@ mod tests {
             .collect();
         assert_eq!(for_path.len(), 1);
         assert_eq!(for_path[0].kind, crate::dry_run::ChangeKind::Added);
+    }
+
+    #[test]
+    fn rmdir_nonempty_gives_enotempty() {
+        // Issue #161: rmdir must consult the merged view, as the kernel would.
+        let (workdir, storage) = setup_workdir();
+        fs::create_dir(workdir.path().join("d")).unwrap();
+        fs::write(workdir.path().join("d/inner.txt"), "DATA").unwrap();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let wd = branch.workdir_str().to_string();
+
+        assert_eq!(
+            branch.handle_unlink(&format!("{}/d", wd), true),
+            Err(libc::ENOTEMPTY)
+        );
+        assert!(workdir.path().join("d/inner.txt").exists());
+        branch.commit().unwrap();
+        assert!(workdir.path().join("d/inner.txt").exists());
+    }
+
+    #[test]
+    fn rmdir_succeeds_after_draining_merged_view() {
+        let (workdir, storage) = setup_workdir();
+        fs::create_dir(workdir.path().join("d")).unwrap();
+        fs::write(workdir.path().join("d/inner.txt"), "DATA").unwrap();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let wd = branch.workdir_str().to_string();
+
+        assert_eq!(
+            branch.handle_unlink(&format!("{}/d/inner.txt", wd), false),
+            Ok(true)
+        );
+        assert_eq!(branch.handle_unlink(&format!("{}/d", wd), true), Ok(true));
+        branch.commit().unwrap();
+        assert!(!workdir.path().join("d").exists());
+    }
+
+    #[test]
+    fn rmdir_nonempty_in_upper_only_gives_enotempty() {
+        // Emptiness is about the merged view: content that exists only in
+        // the upper still blocks the rmdir.
+        let (workdir, storage) = setup_workdir();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        let wd = branch.workdir_str().to_string();
+        assert!(branch.handle_mkdir(&format!("{}/newdir", wd)).unwrap());
+        fs::write(branch.upper_dir().join("newdir/f.txt"), "x").unwrap();
+        assert_eq!(
+            branch.handle_unlink(&format!("{}/newdir", wd), true),
+            Err(libc::ENOTEMPTY)
+        );
+    }
+
+    #[test]
+    fn unlink_hidden_path_gives_enoent() {
+        let (workdir, storage) = setup_workdir();
+        fs::create_dir(workdir.path().join("d")).unwrap();
+        fs::write(workdir.path().join("d/inner.txt"), "DATA").unwrap();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        branch.mark_deleted("d");
+        let wd = branch.workdir_str().to_string();
+        assert_eq!(
+            branch.handle_unlink(&format!("{}/d/inner.txt", wd), false),
+            Err(libc::ENOENT)
+        );
     }
 
     #[test]
