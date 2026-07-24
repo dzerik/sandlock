@@ -82,13 +82,14 @@ fn dir_size(dir: &Path) -> u64 {
 }
 
 /// Seccomp-based COW branch. Redirects writes to an upper directory
-/// and tracks deletions in memory.
+/// and tracks deletions in a subtree-aware whiteout set, mirrored to an
+/// append-only log beside the upper.
 pub struct SeccompCowBranch {
     workdir: PathBuf,
     workdir_str: String,
     upper: PathBuf,
     storage_dir: PathBuf,
-    deleted: HashSet<String>,
+    deleted: crate::cow::deletions::DeletionSet,
     has_changes: bool,
     finished: bool,
     max_disk_bytes: u64,
@@ -113,12 +114,15 @@ impl SeccompCowBranch {
         let workdir = workdir.canonicalize()
             .map_err(|e| BranchError::Operation(format!("canonicalize workdir: {}", e)))?;
 
+        let deleted =
+            crate::cow::deletions::DeletionSet::create(Some(&branch_dir.join("deleted.log")));
+
         Ok(Self {
             workdir_str: workdir.to_string_lossy().into_owned(),
             workdir,
             upper,
             storage_dir: branch_dir,
-            deleted: HashSet::new(),
+            deleted,
             has_changes: false,
             finished: false,
             max_disk_bytes,
@@ -153,10 +157,12 @@ impl SeccompCowBranch {
     }
 
     /// Check if a path has been modified or deleted in the COW layer.
-    /// Used to skip read-only opens for unmodified files.
+    /// Used to skip read-only opens for unmodified files. A path covered by
+    /// a whiteout needs interception even when re-created in the upper: the
+    /// read must be redirected there, never fall through to the lower file.
     pub fn needs_read_intercept(&self, path: &str) -> bool {
         if let Some(rel) = self.safe_rel(path) {
-            self.is_deleted(&rel) || self.upper.join(&rel).exists()
+            self.deleted.covers(&rel) || self.upper.join(&rel).exists()
         } else {
             false
         }
@@ -172,14 +178,21 @@ impl SeccompCowBranch {
         Some(rel_str)
     }
 
-    /// Check if a relative path has been deleted.
-    pub fn is_deleted(&self, rel_path: &str) -> bool {
-        self.deleted.contains(rel_path)
+    /// Confined lstat: does the upper hold an entry (any type) at `rel`?
+    fn upper_has(&self, rel: &str) -> bool {
+        crate::sys::fs::statat_in_root(&self.upper, rel, false).is_ok()
     }
 
-    /// Mark a relative path as deleted.
+    /// Check if a relative path is hidden by a whiteout in the merged view.
+    /// A whiteout covers its whole subtree; an entry re-created in the upper
+    /// shadows the whiteout and is visible again.
+    pub fn is_deleted(&self, rel_path: &str) -> bool {
+        self.deleted.covers(rel_path) && !self.upper_has(rel_path)
+    }
+
+    /// Mark a relative path as deleted (whiteout over it and its subtree).
     pub fn mark_deleted(&mut self, rel_path: &str) {
-        self.deleted.insert(rel_path.to_string());
+        self.deleted.insert(rel_path);
         self.has_changes = true;
     }
 
@@ -212,7 +225,6 @@ impl SeccompCowBranch {
     /// file copies to the caller. This is the shared core used by both
     /// `ensure_cow_copy` (synchronous) and the async two-phase dispatch.
     pub fn prepare_copy(&mut self, rel_path: &str) -> Result<CowCopyPlan, BranchError> {
-        self.deleted.remove(rel_path);
         self.has_changes = true;
 
         let upper_file = self.upper.join(rel_path);
@@ -226,6 +238,15 @@ impl SeccompCowBranch {
 
         if let Some(p) = parent_rel(rel_path) {
             let _ = crate::sys::fs::mkdirp_in_root(&self.upper, p, 0o755);
+        }
+
+        // A whiteout covers this path: the lower entry is logically gone, so
+        // there is nothing to copy up. Creating over the whiteout starts
+        // fresh, and the entry appearing in the upper is what re-exposes it
+        // in the merged view (and what makes a re-created directory opaque).
+        if self.deleted.covers(rel_path) {
+            self.check_quota(0)?;
+            return Ok(CowCopyPlan::Ready(upper_file));
         }
 
         // Classify the lower entry confined to the workdir root, so a symlinked
@@ -569,7 +590,6 @@ impl SeccompCowBranch {
             None => return Ok(false),
         };
         self.check_quota(4096)?; // directory metadata
-        self.deleted.remove(&rel);
         self.has_changes = true;
         let ok = crate::sys::fs::mkdirp_in_root(&self.upper, &rel, 0o755).is_ok();
         if ok {
@@ -630,7 +650,6 @@ impl SeccompCowBranch {
             return Ok(false);
         }
         self.check_quota(256)?;
-        self.deleted.remove(&rel);
         self.has_changes = true;
         if let Some(p) = parent_rel(&rel) {
             let _ = crate::sys::fs::mkdirp_in_root(&self.upper, p, 0o755);
@@ -742,8 +761,15 @@ impl SeccompCowBranch {
             return None;
         }
         // Read the link confined to each layer root so a symlinked parent
-        // component cannot escape the tree (issue #112).
-        for root in [&self.upper, &self.workdir] {
+        // component cannot escape the tree (issue #112). A covered path only
+        // consults the upper: falling through to the lower link would leak
+        // the pre-delete target of a whiteouted-then-recreated entry.
+        let roots: &[&PathBuf] = if self.deleted.covers(&rel) {
+            &[&self.upper]
+        } else {
+            &[&self.upper, &self.workdir]
+        };
+        for root in roots {
             if let Ok(target) = crate::sys::fs::readlink_in_root(root, &rel) {
                 return Some(String::from_utf8_lossy(&target).into_owned());
             }
@@ -765,7 +791,11 @@ impl SeccompCowBranch {
             }
             let rel = entry.path().strip_prefix(&self.upper).unwrap();
             let lower = self.workdir.join(rel);
-            let kind = if lower.exists() {
+            // A covered path's lower entry is logically gone, so a re-created
+            // upper entry is an addition even though lower bytes still exist.
+            let kind = if self.deleted.covers(&rel.to_string_lossy()) {
+                ChangeKind::Added
+            } else if lower.exists() {
                 ChangeKind::Modified
             } else {
                 ChangeKind::Added
@@ -773,8 +803,12 @@ impl SeccompCowBranch {
             result.push(Change { kind, path: rel.to_path_buf() });
         }
 
-        // Deletions from tracked set
-        for rel_path in &self.deleted {
+        // Deletions from the whiteout set; an entry re-created in the upper
+        // is reported by the upper walk instead.
+        for rel_path in self.deleted.iter() {
+            if self.upper_has(rel_path) {
+                continue;
+            }
             result.push(Change {
                 kind: ChangeKind::Deleted,
                 path: std::path::PathBuf::from(rel_path),
@@ -803,7 +837,9 @@ impl SeccompCowBranch {
                 } else {
                     format!("{}/{}", rel_path, name)
                 };
-                if !self.is_deleted(&child_rel) {
+                // covers, not is_deleted: a covered child re-created in the
+                // upper was already inserted by the upper loop above.
+                if !self.deleted.covers(&child_rel) {
                     entries.insert(name);
                 }
             }
@@ -815,8 +851,9 @@ impl SeccompCowBranch {
     pub fn commit(&mut self) -> Result<(), BranchError> {
         if self.finished { return Ok(()); }
 
-        // Apply deletions
-        for rel_path in &self.deleted {
+        // Apply deletions first; the upper overlay below re-creates anything
+        // shadowed, which is exactly the opaque-directory merge order.
+        for rel_path in self.deleted.iter() {
             let dest = self.workdir.join(rel_path);
             if dest.is_dir() {
                 let _ = crate::sys::fs::remove_dir_all_in_root(&self.workdir, rel_path);
@@ -1130,11 +1167,10 @@ mod tests {
     #[test]
     fn test_quota_handle_open_create_denied() {
         let (workdir, storage) = setup_workdir();
-        // O_CREAT on a deleted file triggers ensure_cow_copy.
+        // O_CREAT on an existing (not deleted) file triggers the copy-up,
+        // which must fail when the 5-byte file exceeds the 4-byte quota.
         let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 4).unwrap();
         let path = abs(&branch, "existing.txt");
-        branch.mark_deleted("existing.txt");
-        // O_CREAT on a deleted path — tries to COW-copy the 5-byte file, should fail.
         let err = branch.handle_open(&path, O_CREAT).unwrap_err();
         assert!(matches!(err, BranchError::QuotaExceeded));
     }
@@ -1704,5 +1740,115 @@ mod tests {
             !outside.path().join("sandlock_escape_dir").exists(),
             "upper write escaped through symlinked parent into the outside dir"
         );
+    }
+
+    // ---- Subtree whiteout semantics (issues #159/#160/#161 family) ----
+
+    #[test]
+    fn deleted_dir_hides_children() {
+        // Issue #159: a whiteout must cover the subtree, not just the path.
+        let (workdir, storage) = setup_workdir();
+        fs::create_dir(workdir.path().join("d")).unwrap();
+        fs::write(workdir.path().join("d/secret.txt"), "SECRET").unwrap();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        branch.mark_deleted("d");
+
+        assert!(branch.is_deleted("d"));
+        assert!(branch.is_deleted("d/secret.txt"));
+        assert!(branch.list_merged_dir("d").is_empty());
+        assert!(matches!(
+            branch.handle_open(&format!("{}/d/secret.txt", branch.workdir_str()), 0),
+            Err(BranchError::Deleted)
+        ));
+        assert!(branch
+            .handle_stat(&format!("{}/d/secret.txt", branch.workdir_str()))
+            .is_none());
+        // Sibling boundary: d2 is not covered by the d whiteout.
+        fs::write(workdir.path().join("d2"), "kept").unwrap();
+        assert!(!branch.is_deleted("d2"));
+    }
+
+    #[test]
+    fn write_under_deleted_dir_does_not_republish_on_commit() {
+        // Issue #159 integrity half: a write-open under the deleted directory
+        // must not resurrect the deleted file's bytes into the commit.
+        let (workdir, storage) = setup_workdir();
+        fs::create_dir(workdir.path().join("d")).unwrap();
+        fs::write(workdir.path().join("d/secret.txt"), "SECRET").unwrap();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        branch.mark_deleted("d");
+
+        let flags = (libc::O_WRONLY | libc::O_CREAT) as u64;
+        let upper = branch
+            .handle_open(&format!("{}/d/secret.txt", branch.workdir_str()), flags)
+            .unwrap()
+            .expect("create over whiteout resolves into upper");
+        // The plan points at the upper path; the child's O_CREAT would create
+        // it empty. Simulate that create with fresh bytes.
+        fs::write(&upper, "NEW").unwrap();
+
+        branch.commit().unwrap();
+        assert_eq!(
+            fs::read_to_string(workdir.path().join("d/secret.txt")).unwrap(),
+            "NEW"
+        );
+    }
+
+    #[test]
+    fn create_over_deleted_file_starts_empty() {
+        // Same failure class as #159: O_CREAT on a whiteouted file used to
+        // copy the pre-delete lower bytes up. It must start fresh.
+        let (workdir, storage) = setup_workdir();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        branch.mark_deleted("existing.txt");
+        let upper = branch.ensure_cow_copy("existing.txt").unwrap();
+        assert!(!upper.exists() || fs::read(&upper).unwrap().is_empty());
+    }
+
+    #[test]
+    fn mkdir_over_deleted_dir_is_opaque() {
+        // rmdir d; mkdir d must yield an EMPTY d: the old contents stay hidden.
+        let (workdir, storage) = setup_workdir();
+        fs::create_dir(workdir.path().join("d")).unwrap();
+        fs::write(workdir.path().join("d/old.txt"), "old").unwrap();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        branch.mark_deleted("d");
+        let wd = branch.workdir_str().to_string();
+        assert!(branch.handle_mkdir(&format!("{}/d", wd)).unwrap());
+
+        assert!(!branch.is_deleted("d"));
+        assert!(branch.is_deleted("d/old.txt"));
+        assert!(branch.list_merged_dir("d").is_empty());
+
+        branch.commit().unwrap();
+        assert!(workdir.path().join("d").is_dir());
+        assert!(!workdir.path().join("d/old.txt").exists());
+    }
+
+    #[test]
+    fn changes_skips_shadowed_whiteouts() {
+        let (workdir, storage) = setup_workdir();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        branch.mark_deleted("existing.txt");
+        let upper = branch.ensure_cow_copy("existing.txt").unwrap();
+        fs::write(&upper, "recreated").unwrap();
+        let changes = branch.changes().unwrap();
+        // The recreated file is a single Added entry, not Deleted + Modified.
+        let for_path: Vec<_> = changes
+            .iter()
+            .filter(|c| c.path == std::path::Path::new("existing.txt"))
+            .collect();
+        assert_eq!(for_path.len(), 1);
+        assert_eq!(for_path[0].kind, crate::dry_run::ChangeKind::Added);
+    }
+
+    #[test]
+    fn deletion_log_written_beside_upper() {
+        let (workdir, storage) = setup_workdir();
+        let mut branch = SeccompCowBranch::create(workdir.path(), Some(storage.path()), 0).unwrap();
+        branch.mark_deleted("existing.txt");
+        let log = branch.upper_dir().parent().unwrap().join("deleted.log");
+        let replayed = crate::cow::deletions::DeletionSet::load(&log);
+        assert!(replayed.covers("existing.txt"));
     }
 }
