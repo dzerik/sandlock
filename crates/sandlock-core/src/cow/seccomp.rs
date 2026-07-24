@@ -364,6 +364,37 @@ impl SeccompCowBranch {
         }
     }
 
+    /// Copy a lower tree into the upper, entry by entry, so a directory
+    /// rename can be staged in the branch without losing the contents
+    /// (issue #160). Each entry goes through the same confined,
+    /// quota-accounted single-entry copy-up, so symlinks are copied verbatim
+    /// and never followed (issue #112).
+    fn copy_up_tree(&mut self, rel: &str) -> Result<(), BranchError> {
+        self.ensure_cow_copy(rel)?;
+        let st = match crate::sys::fs::statat_in_root(&self.workdir, rel, false) {
+            Ok(st) => st,
+            Err(_) => return Ok(()),
+        };
+        if st.st_mode & libc::S_IFMT != libc::S_IFDIR {
+            return Ok(());
+        }
+        let names: Vec<String> = match fs::read_dir(self.workdir.join(rel)) {
+            Ok(rd) => rd
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect(),
+            Err(_) => return Ok(()),
+        };
+        for name in names {
+            let child = format!("{}/{}", rel, name);
+            if self.deleted.covers(&child) && !self.upper_has(&child) {
+                continue;
+            }
+            self.copy_up_tree(&child)?;
+        }
+        Ok(())
+    }
+
     /// Resolve a read path: upper if modified, else lower.
     pub fn resolve_read(&self, rel_path: &str) -> PathBuf {
         let upper_file = self.upper.join(rel_path);
@@ -621,7 +652,10 @@ impl SeccompCowBranch {
             Some(r) => r,
             None => return Ok(false),
         };
-        let _old_upper = self.ensure_cow_copy(&old_rel)?;
+        if self.is_deleted(&old_rel) {
+            return Err(BranchError::Deleted);
+        }
+        self.copy_up_tree(&old_rel)?;
         if let Some(p) = parent_rel(&new_rel) {
             let _ = crate::sys::fs::mkdirp_in_root(&self.upper, p, 0o755);
         }
@@ -684,6 +718,18 @@ impl SeccompCowBranch {
             Some(r) => r,
             None => return Ok(false),
         };
+        if self.is_deleted(&old_rel) {
+            return Err(BranchError::Deleted);
+        }
+        // linkat on a directory is the kernel's EPERM to give; staging a
+        // copy for it would leave a meaningless empty dir in the upper.
+        let src_is_dir = crate::sys::fs::statat_in_root(&self.upper, &old_rel, false)
+            .or_else(|_| crate::sys::fs::statat_in_root(&self.workdir, &old_rel, false))
+            .map(|st| st.st_mode & libc::S_IFMT == libc::S_IFDIR)
+            .unwrap_or(false);
+        if src_is_dir {
+            return Ok(false);
+        }
         let _ = self.ensure_cow_copy(&old_rel)?;
         if let Some(p) = parent_rel(&new_rel) {
             let _ = crate::sys::fs::mkdirp_in_root(&self.upper, p, 0o755);
@@ -1915,6 +1961,104 @@ mod tests {
             branch.handle_unlink(&format!("{}/d/inner.txt", wd), false),
             Err(libc::ENOENT)
         );
+    }
+
+    #[test]
+    fn rename_lower_dir_preserves_contents() {
+        // Issue #160: renaming a lower-only directory must not destroy it.
+        let (workdir, storage) = setup_workdir();
+        let wd = workdir.path().canonicalize().unwrap();
+        fs::create_dir(wd.join("d")).unwrap();
+        fs::write(wd.join("d/inner.txt"), "PRECIOUS").unwrap();
+        fs::create_dir(wd.join("d/sub")).unwrap();
+        fs::write(wd.join("d/sub/deep.txt"), "DEEP").unwrap();
+
+        let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 0).unwrap();
+        assert!(branch
+            .handle_rename(&format!("{}/d", wd.display()), &format!("{}/d2", wd.display()))
+            .unwrap());
+
+        // Merged view before commit: d hidden, d2 holds the tree.
+        assert!(branch.is_deleted("d"));
+        assert_eq!(
+            branch.list_merged_dir("d2"),
+            vec!["inner.txt".to_string(), "sub".to_string()]
+        );
+
+        branch.commit().unwrap();
+        assert!(!wd.join("d").exists());
+        assert_eq!(fs::read_to_string(wd.join("d2/inner.txt")).unwrap(), "PRECIOUS");
+        assert_eq!(fs::read_to_string(wd.join("d2/sub/deep.txt")).unwrap(), "DEEP");
+    }
+
+    #[test]
+    fn rename_dir_skips_deleted_children() {
+        // A child already whiteouted must not reappear under the new name.
+        let (workdir, storage) = setup_workdir();
+        let wd = workdir.path().canonicalize().unwrap();
+        fs::create_dir(wd.join("d")).unwrap();
+        fs::write(wd.join("d/keep.txt"), "keep").unwrap();
+        fs::write(wd.join("d/gone.txt"), "gone").unwrap();
+
+        let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 0).unwrap();
+        assert_eq!(
+            branch.handle_unlink(&format!("{}/d/gone.txt", wd.display()), false),
+            Ok(true)
+        );
+        assert!(branch
+            .handle_rename(&format!("{}/d", wd.display()), &format!("{}/d2", wd.display()))
+            .unwrap());
+        branch.commit().unwrap();
+        assert!(wd.join("d2/keep.txt").exists());
+        assert!(!wd.join("d2/gone.txt").exists());
+    }
+
+    #[test]
+    fn rename_hidden_source_gives_deleted() {
+        let (workdir, storage) = setup_workdir();
+        let wd = workdir.path().canonicalize().unwrap();
+        let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 0).unwrap();
+        branch.mark_deleted("existing.txt");
+        assert!(matches!(
+            branch.handle_rename(
+                &format!("{}/existing.txt", wd.display()),
+                &format!("{}/moved.txt", wd.display())
+            ),
+            Err(BranchError::Deleted)
+        ));
+    }
+
+    #[test]
+    fn rename_file_still_works() {
+        let (workdir, storage) = setup_workdir();
+        let wd = workdir.path().canonicalize().unwrap();
+        let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 0).unwrap();
+        assert!(branch
+            .handle_rename(
+                &format!("{}/existing.txt", wd.display()),
+                &format!("{}/renamed.txt", wd.display())
+            )
+            .unwrap());
+        branch.commit().unwrap();
+        assert!(!wd.join("existing.txt").exists());
+        assert_eq!(fs::read_to_string(wd.join("renamed.txt")).unwrap(), "hello");
+    }
+
+    #[test]
+    fn link_on_directory_falls_through() {
+        // linkat on a directory is the kernel's EPERM to give; the branch
+        // must not stage an empty-dir copy for it.
+        let (workdir, storage) = setup_workdir();
+        let wd = workdir.path().canonicalize().unwrap();
+        fs::create_dir(wd.join("d")).unwrap();
+        let mut branch = SeccompCowBranch::create(&wd, Some(storage.path()), 0).unwrap();
+        assert_eq!(
+            branch
+                .handle_link(&format!("{}/d", wd.display()), &format!("{}/d2", wd.display()))
+                .unwrap(),
+            false
+        );
+        assert!(!branch.upper_dir().join("d").exists());
     }
 
     #[test]
