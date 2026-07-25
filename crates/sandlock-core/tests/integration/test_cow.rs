@@ -714,3 +714,361 @@ async fn test_cow_child_rmdir_nonempty_fails() {
 
     let _ = fs::remove_dir_all(&workdir);
 }
+
+// ============================================================
+// BUG HUNT — PR #162 review (fns prefixed `hunt_`)
+//
+// These run real sh + coreutils + the static rootfs-helper as cage
+// children (python3 does NOT run in this box's cage — the granted
+// fs_read roots don't cover this host's venv python stdlib, so it dies
+// with "No module named 'encodings'"; that is an environment limit, not
+// a #162 defect). Every hunt child uses only sh/coreutils/helper.
+// ============================================================
+
+use std::time::Duration;
+
+/// Standard read-write COW policy over `workdir`, cwd inside it.
+fn hunt_policy(workdir: &std::path::Path, action: BranchAction) -> sandlock_core::Sandbox {
+    Sandbox::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/proc").fs_read("/dev")
+        .fs_write(workdir)
+        .workdir(workdir)
+        .cwd(workdir)
+        .on_exit(action)
+        .build()
+        .unwrap()
+}
+
+fn mkfifo_host(path: &std::path::Path) -> bool {
+    std::process::Command::new("mkfifo")
+        .arg(path)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// (#158 positive) A write-open of a lower FIFO under COW must NOT hang the
+/// child: prepare_copy virtualizes it as an empty regular upper stub without
+/// ever opening the reader-less FIFO. on_exit=Abort so no commit runs.
+#[tokio::test]
+async fn hunt_158_fifo_writeopen_no_child_hang_abort() {
+    let workdir = temp_dir("hunt-fifo-abort");
+    let fifo = workdir.join("pipe");
+    if !mkfifo_host(&fifo) {
+        eprintln!("hunt_158_fifo_writeopen_no_child_hang_abort skipped: mkfifo failed");
+        let _ = fs::remove_dir_all(&workdir);
+        return;
+    }
+
+    let policy = hunt_policy(&workdir, BranchAction::Abort);
+    let mut named = policy.clone().with_name("test");
+    let fut = named.run(&["sh", "-c", "echo hi > pipe; echo DONE"]);
+    match tokio::time::timeout(Duration::from_secs(20), fut).await {
+        Err(_) => panic!("FAIL: child write-open of a FIFO hung (>20s) — #158 copy-up path not fixed"),
+        Ok(Err(e)) => eprintln!("hunt_158 abort skipped: {}", e),
+        Ok(Ok(r)) => {
+            println!("hunt_158 abort: success={} stdout={:?} stderr={:?}",
+                r.success(), r.stdout_str(), r.stderr_str());
+            assert!(r.success(), "child should complete without hanging, stderr: {}", r.stderr_str().unwrap_or(""));
+            assert!(r.stdout_str().unwrap_or("").contains("DONE"), "child should reach DONE");
+        }
+    }
+    let _ = fs::remove_dir_all(&workdir);
+}
+
+/// (#158 NEW BUG) The FIFO hang is only relocated to commit(): the stub is
+/// never mark_deleted, so commit() O_WRONLY-opens the surviving lower FIFO
+/// (openat2_in_root passes flags verbatim, no O_NONBLOCK) and blocks forever.
+/// on_exit=Commit. A >25s stall is the confirmed hang.
+// NOTE: on_exit=Commit runs `cow.commit()` in `impl Drop for Sandbox`
+// (sandbox.rs:2092), synchronously, with the error swallowed (`let _`). So the
+// commit-time FIFO open happens when the Sandbox is dropped, and a hang there
+// blocks whatever thread is dropping it. A tokio timeout cannot interrupt an
+// inline-blocking Drop, so this test runs the whole run()+drop on a dedicated
+// OS thread and detects the hang by joining with a wall-clock deadline.
+#[test]
+fn hunt_158_fifo_commit_hang() {
+    use std::os::unix::fs::FileTypeExt;
+    use std::sync::mpsc;
+    let workdir = temp_dir("hunt-fifo-commit");
+    let fifo = workdir.join("pipe");
+    if !mkfifo_host(&fifo) {
+        eprintln!("hunt_158_fifo_commit_hang skipped: mkfifo failed");
+        let _ = fs::remove_dir_all(&workdir);
+        return;
+    }
+
+    let (tx, rx) = mpsc::channel::<String>();
+    let workdir_thread = workdir.clone();
+    let worker = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let msg = rt.block_on(async {
+            let policy = hunt_policy(&workdir_thread, BranchAction::Commit);
+            // Temporary Sandbox: it is dropped at the end of this statement,
+            // which is where on_exit=Commit actually runs commit().
+            let r = policy.clone().with_name("test")
+                .run(&["sh", "-c", "echo hi > pipe; echo CHILD_DONE"]).await;
+            // Reaching here means the run future resolved; the Sandbox drop
+            // (commit) has already run by the time the statement above ended.
+            match r {
+                Ok(rr) => format!("child_done={}", rr.stdout_str().unwrap_or("").contains("CHILD_DONE")),
+                Err(e) => format!("skip:{}", e),
+            }
+        });
+        let _ = tx.send(msg);
+    });
+
+    match rx.recv_timeout(Duration::from_secs(25)) {
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            // The worker thread is wedged (leaked, blocked on the FIFO open in
+            // commit()); it will be killed at process exit.
+            let md = fs::symlink_metadata(&fifo).ok();
+            let is_fifo = md.as_ref().map(|m| m.file_type().is_fifo()).unwrap_or(false);
+            panic!(
+                "FAIL (confirmed #158 half-close): commit() hung >25s. prepare_copy virtualized the \
+                 FIFO as an empty regular upper stub but never mark_deleted the lower FIFO, so \
+                 commit() (Drop) O_WRONLY-opens the surviving lower FIFO at seccomp.rs:~992 \
+                 (openat2_in_root passes flags verbatim, no O_NONBLOCK) and blocks forever waiting \
+                 for a reader. pipe still a FIFO on disk = {}. The #158 copy-up hang is merely \
+                 relocated to commit time.", is_fifo
+            );
+        }
+        Err(e) => panic!("worker channel error: {:?}", e),
+        Ok(msg) => {
+            let _ = worker.join();
+            println!("hunt_158_fifo_commit: worker msg = {}", msg);
+            if msg.starts_with("skip:") {
+                eprintln!("hunt_158_fifo_commit_hang skipped: {}", &msg[5..]);
+            } else {
+                // Commit completed without hanging: assert the merged view is
+                // correct (pipe replaced by the child's bytes).
+                let md = fs::symlink_metadata(&fifo).ok();
+                let is_file = md.as_ref().map(|m| m.file_type().is_file()).unwrap_or(false);
+                let content = if is_file { fs::read_to_string(&fifo).ok() } else { None };
+                assert!(is_file,
+                    "commit returned but `pipe` is still a FIFO — the child's write was not published");
+                assert_eq!(content.as_deref(), Some("hi\n"),
+                    "committed pipe should hold the child's bytes, got {:?}", content);
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(&workdir);
+}
+
+/// (#159 NEW incompleteness) open(dir, O_DIRECTORY) never consults
+/// is_deleted/covers, so a whiteouted lower-only dir opens on the real lower
+/// fd while stat() correctly says ENOENT. Probe with the static helper: its
+/// `ls` calls opendir() (open O_RDONLY|O_DIRECTORY) with NO pre-stat, so it
+/// exercises exactly the O_DIRECTORY open path; its `stat` takes the
+/// is_deleted-honoring stat path.
+#[tokio::test]
+async fn hunt_159_opendir_whiteouted_dir_leaks_lower() {
+    let workdir = temp_dir("hunt-opendir");
+    fs::create_dir_all(workdir.join("d")).unwrap();
+    fs::write(workdir.join("d/secret.txt"), "SECRET").unwrap();
+    let helper = helper_binary();
+    let helper_dir = helper.parent().unwrap().to_path_buf();
+
+    let policy = Sandbox::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/proc").fs_read("/dev")
+        .fs_read(&helper_dir)
+        .fs_write(&workdir)
+        .workdir(&workdir)
+        .cwd(&workdir)
+        .on_exit(BranchAction::Abort)
+        .build()
+        .unwrap();
+
+    // Empty then remove d (rm -rf shape), then `ls d` (O_DIRECTORY open) and
+    // `stat d` (stat path). Both should ENOENT in the merged view.
+    let script = "rm d/secret.txt ; rmdir d ; ls d ; stat d";
+    let result = policy.clone().with_name("test")
+        .run(&[helper.to_str().unwrap(), "sh", "-c", script]).await;
+    match result {
+        Ok(r) => {
+            let err = r.stderr_str().unwrap_or("").to_string();
+            let out = r.stdout_str().unwrap_or("").to_string();
+            println!("hunt_159_opendir: stdout={:?} stderr={:?}", out, err);
+            let stat_enoent = err.contains("stat: d:");
+            let ls_enoent = err.contains("ls: d:");
+            assert!(stat_enoent,
+                "precondition: stat of the whiteouted dir must be ENOENT (stderr={:?})", err);
+            assert!(ls_enoent,
+                "BUG (#159 incomplete): open(d, O_DIRECTORY) SUCCEEDED on the lower dir while \
+                 stat says ENOENT — the O_DIRECTORY open path skips is_deleted/covers \
+                 (seccomp.rs:450-452 & 510-523). stderr={:?}", err);
+        }
+        Err(e) => eprintln!("hunt_159_opendir skipped: {}", e),
+    }
+    let _ = fs::remove_dir_all(&workdir);
+}
+
+/// (#159 positive) read + stat under a recursively-deleted dir must ENOENT
+/// and must not leak the pre-delete bytes (non-O_DIRECTORY paths).
+#[tokio::test]
+async fn hunt_159_read_stat_under_deleted_dir_enoent() {
+    let workdir = temp_dir("hunt-under-deleted");
+    fs::create_dir_all(workdir.join("d/sub")).unwrap();
+    fs::write(workdir.join("d/sub/secret.txt"), "PREDELETE").unwrap();
+
+    let policy = hunt_policy(&workdir, BranchAction::Abort);
+    // rm -r d, then read + stat a path under it.
+    let script = "rm -r d; cat d/sub/secret.txt; stat d/sub";
+    let result = policy.clone().with_name("test").run(&["sh", "-c", script]).await;
+    match result {
+        Ok(r) => {
+            let out = r.stdout_str().unwrap_or("").to_string();
+            let err = r.stderr_str().unwrap_or("").to_string();
+            println!("hunt_159_under_deleted: stdout={:?} stderr={:?}", out, err);
+            assert!(!out.contains("PREDELETE"), "pre-delete bytes leaked through read path: {:?}", out);
+            let enoent_hits = err.matches("No such file").count();
+            assert!(enoent_hits >= 2,
+                "both cat and stat under a deleted dir must ENOENT (got {} 'No such file' in {:?})",
+                enoent_hits, err);
+        }
+        Err(e) => eprintln!("hunt_159_under_deleted skipped: {}", e),
+    }
+    let _ = fs::remove_dir_all(&workdir);
+}
+
+/// (#159 bonus) O_CREAT over a whiteouted file starts fresh — the pre-delete
+/// bytes must not resurrect.
+#[tokio::test]
+async fn hunt_159_ocreat_no_resurrect() {
+    let workdir = temp_dir("hunt-ocreat");
+    fs::write(workdir.join("f.txt"), "OLDSECRET").unwrap();
+
+    let policy = hunt_policy(&workdir, BranchAction::Commit);
+    // Delete f, then O_CREAT|O_APPEND write (>> creates) NEW; read back.
+    let script = "rm f.txt; printf NEW >> f.txt; cat f.txt";
+    let result = policy.clone().with_name("test").run(&["sh", "-c", script]).await;
+    match result {
+        Ok(r) => {
+            let out = r.stdout_str().unwrap_or("").to_string();
+            println!("hunt_159_ocreat: stdout={:?}", out);
+            assert!(!out.contains("OLD"), "O_CREAT resurrected pre-delete bytes: {:?}", out);
+            assert_eq!(out, "NEW", "recreated file should hold only the fresh bytes");
+            // After commit the workdir file must contain only NEW.
+            let committed = fs::read_to_string(workdir.join("f.txt")).unwrap_or_default();
+            assert_eq!(committed, "NEW", "committed file must be fresh, got {:?}", committed);
+        }
+        Err(e) => eprintln!("hunt_159_ocreat skipped: {}", e),
+    }
+    let _ = fs::remove_dir_all(&workdir);
+}
+
+/// (covers() positive) deleting `d` must not over-match sibling `d2`.
+#[tokio::test]
+async fn hunt_159_sibling_d_vs_d2_not_overmatched() {
+    let workdir = temp_dir("hunt-sibling");
+    fs::create_dir_all(workdir.join("d")).unwrap();
+    fs::write(workdir.join("d/x.txt"), "X").unwrap();
+    fs::create_dir_all(workdir.join("d2")).unwrap();
+    fs::write(workdir.join("d2/y.txt"), "Y").unwrap();
+
+    let policy = hunt_policy(&workdir, BranchAction::Commit);
+    let result = policy.clone().with_name("test").run(&["sh", "-c", "rm -r d"]).await;
+    match result {
+        Ok(r) => {
+            assert!(r.success(), "rm -r d should succeed, stderr {}", r.stderr_str().unwrap_or(""));
+            assert!(!workdir.join("d").exists(), "d must be gone after commit");
+            assert_eq!(fs::read_to_string(workdir.join("d2/y.txt")).unwrap_or_default(), "Y",
+                "sibling d2 must be untouched by deleting d");
+        }
+        Err(e) => eprintln!("hunt_159_sibling skipped: {}", e),
+    }
+    let _ = fs::remove_dir_all(&workdir);
+}
+
+/// (#161 positive) rmdir d; mkdir d yields an opaque dir: old contents hidden,
+/// new visible, after commit.
+#[tokio::test]
+async fn hunt_161_rmdir_then_mkdir_opaque() {
+    let workdir = temp_dir("hunt-opaque");
+    fs::create_dir_all(workdir.join("d")).unwrap();
+    fs::write(workdir.join("d/old.txt"), "OLD").unwrap();
+
+    let policy = hunt_policy(&workdir, BranchAction::Commit);
+    let script = "rm d/old.txt; rmdir d; mkdir d; printf NEW > d/new.txt";
+    let result = policy.clone().with_name("test").run(&["sh", "-c", script]).await;
+    match result {
+        Ok(r) => {
+            assert!(r.success(), "opaque-dir script should succeed, stderr {}", r.stderr_str().unwrap_or(""));
+            assert!(workdir.join("d/new.txt").exists(), "new.txt must exist after commit");
+            assert_eq!(fs::read_to_string(workdir.join("d/new.txt")).unwrap_or_default(), "NEW");
+            assert!(!workdir.join("d/old.txt").exists(), "old.txt must stay hidden in an opaque dir");
+        }
+        Err(e) => eprintln!("hunt_161_opaque skipped: {}", e),
+    }
+    let _ = fs::remove_dir_all(&workdir);
+}
+
+/// (#160 positive) rename a lower-only dir: contents survive, a whiteouted
+/// child does not reappear, and a whiteouted rename source gives ENOENT.
+#[tokio::test]
+async fn hunt_160_rename_children_survive_whiteout_holds() {
+    let workdir = temp_dir("hunt-mv-dir");
+    fs::create_dir_all(workdir.join("d")).unwrap();
+    fs::write(workdir.join("d/a.txt"), "A").unwrap();
+    fs::write(workdir.join("d/b.txt"), "B").unwrap();
+
+    let policy = hunt_policy(&workdir, BranchAction::Commit);
+    // delete b, rename d->d2, then rename the now-deleted d again (must fail).
+    let script = "rm d/b.txt; mv d d2; mv d e";
+    let result = policy.clone().with_name("test").run(&["sh", "-c", script]).await;
+    match result {
+        Ok(r) => {
+            let err = r.stderr_str().unwrap_or("").to_string();
+            println!("hunt_160_rename: stderr={:?}", err);
+            assert_eq!(fs::read_to_string(workdir.join("d2/a.txt")).unwrap_or_default(), "A",
+                "renamed dir must keep its non-deleted child");
+            assert!(!workdir.join("d2/b.txt").exists(),
+                "a whiteouted child must not reappear in the renamed dir");
+            assert!(!workdir.join("d").exists(), "source dir must be gone after commit");
+            assert!(!workdir.join("e").exists(),
+                "rename of a whiteouted source must fail (ENOENT), leaving no `e`");
+            assert!(err.contains("No such file") || err.contains("cannot"),
+                "the second mv of the deleted source should have reported an error, stderr={:?}", err);
+        }
+        Err(e) => eprintln!("hunt_160_rename skipped: {}", e),
+    }
+    let _ = fs::remove_dir_all(&workdir);
+}
+
+/// (#160 NEW BUG) Directory rename onto an existing lower-only destination
+/// silently merges the two trees instead of ENOTEMPTY / atomic-replace,
+/// because handle_rename never whiteouts the pre-existing lower `new`.
+/// Uses `mv -T` (renameat2, no target-dir semantics) so the syscall is
+/// rename("a","b") directly.
+#[tokio::test]
+async fn hunt_160_rename_onto_existing_dir_merges() {
+    let workdir = temp_dir("hunt-mv-onto");
+    fs::create_dir_all(workdir.join("a")).unwrap();
+    fs::write(workdir.join("a/a1.txt"), "A1").unwrap();
+    fs::create_dir_all(workdir.join("b")).unwrap();
+    fs::write(workdir.join("b/b1.txt"), "B1").unwrap();
+
+    let policy = hunt_policy(&workdir, BranchAction::Commit);
+    let result = policy.clone().with_name("test").run(&["sh", "-c", "mv -T a b; echo RC=$?"]).await;
+    match result {
+        Ok(r) => {
+            let out = r.stdout_str().unwrap_or("").to_string();
+            let err = r.stderr_str().unwrap_or("").to_string();
+            println!("hunt_160_onto: stdout={:?} stderr={:?}", out, err);
+            // Correct POSIX: rename onto a non-empty dir fails (ENOTEMPTY),
+            // both a and b survive unmerged. Bug: mv succeeds and b becomes
+            // the UNION {a1,b1} after commit.
+            let merged = workdir.join("b/a1.txt").exists() && workdir.join("b/b1.txt").exists();
+            assert!(!merged,
+                "BUG (#160): rename onto an existing lower dir merged both trees into b \
+                 (b now holds a1.txt AND b1.txt); POSIX requires ENOTEMPTY or atomic replace. \
+                 mv stdout={:?}", out);
+            assert!(out.contains("RC=0") == false || !merged,
+                "mv -T onto a non-empty dir should have returned nonzero");
+        }
+        Err(e) => eprintln!("hunt_160_onto skipped: {}", e),
+    }
+    let _ = fs::remove_dir_all(&workdir);
+}
