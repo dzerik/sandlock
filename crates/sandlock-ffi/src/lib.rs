@@ -15,6 +15,9 @@ use sandlock_core::{ExitStatus, Protection, RunResult, Sandbox, StdioMode};
 pub mod handler;
 pub mod notif_repr;
 mod runtime;
+mod txn;
+
+pub use txn::*;
 
 use runtime::{block_on_runtime, build_live_runtime, build_runtime, with_runtime};
 
@@ -2904,6 +2907,46 @@ unsafe fn read_argv(argv: *const *const c_char, argc: c_uint) -> Vec<String> {
         args.push(arg);
     }
     args
+}
+
+/// Defensive upper bound on `argc`. Linux's `ARG_MAX` is typically
+/// 128 KiB-2 MiB of *characters* across all argv+envp; an argv with
+/// 4096 entries is already preposterous in practice. Bounding here
+/// turns a malicious or buggy caller passing `argc = u32::MAX` (which
+/// would otherwise drive an unbounded deref loop) into a fast NULL
+/// return at the FFI boundary.
+const MAX_ARGV: c_uint = 4096;
+
+/// Read an argument vector, rejecting the whole of it rather than repairing
+/// any part of it.
+///
+/// Refused, each as `None`: a null array, a null element inside it, an `argc`
+/// of 0 (an empty command vector is not runnable), an `argc` above [`MAX_ARGV`]
+/// (which would otherwise drive an unbounded dereference loop), and an argument
+/// whose bytes are not UTF-8.
+///
+/// The last of those is the reason to prefer this over [`read_argv`], which
+/// substitutes an empty string for an argument it cannot decode. That
+/// substitution hides invalid input from the core and runs a command the caller
+/// never asked for; refusing hands the decision back to the caller, which is
+/// the only layer that knows what the bytes were meant to say.
+pub(crate) fn argv_from_c(argv: *const *const c_char, argc: c_uint) -> Option<Vec<String>> {
+    if argv.is_null() {
+        return None;
+    }
+    if argc == 0 || argc > MAX_ARGV {
+        return None;
+    }
+    let mut out = Vec::with_capacity(argc as usize);
+    for i in 0..(argc as usize) {
+        let p = unsafe { *argv.add(i) };
+        if p.is_null() {
+            return None;
+        }
+        let s = unsafe { CStr::from_ptr(p) }.to_str().ok()?.to_owned();
+        out.push(s);
+    }
+    Some(out)
 }
 
 #[cfg(test)]

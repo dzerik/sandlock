@@ -11,49 +11,13 @@ use sandlock_core::{RunResult, Sandbox, SandlockError};
 
 use super::abi::sandlock_handler_registration_t;
 use super::adapter::FfiHandler;
-
-/// Defensive upper bound on `argc`. Linux's `ARG_MAX` is typically
-/// 128 KiB-2 MiB of *characters* across all argv+envp; an argv with
-/// 4096 entries is already preposterous in practice. Bounding here
-/// turns a malicious or buggy caller passing `argc = u32::MAX` (which
-/// would otherwise drive an unbounded deref loop) into a fast NULL
-/// return at the FFI boundary.
-const MAX_ARGV: u32 = 4096;
+use crate::argv_from_c;
 
 /// Defensive upper bound on `nregistrations`. The kernel exposes
 /// ~400-500 syscalls on Linux; registering even all of them is well
 /// under this cap. Bounding here closes the same unbounded-deref vector
 /// for the registration array.
 const MAX_REGISTRATIONS: usize = 4096;
-
-fn argv_from_c(argv: *const *const std::os::raw::c_char, argc: u32) -> Option<Vec<String>> {
-    if argv.is_null() {
-        return None;
-    }
-    // Reject argc == 0 here: an empty argv would have us hand the
-    // sandbox an empty command vector, which the supervisor cannot
-    // execute. Failing fast keeps the error surfacing at the FFI
-    // boundary where the C caller can react.
-    if argc == 0 {
-        return None;
-    }
-    // Reject implausible `argc` values before we start dereferencing
-    // `argv`. Without this cap, a caller passing `argc = u32::MAX`
-    // would have us walk 4 billion pointer slots looking for nulls.
-    if argc > MAX_ARGV {
-        return None;
-    }
-    let mut out = Vec::with_capacity(argc as usize);
-    for i in 0..(argc as isize) {
-        let p = unsafe { *argv.offset(i) };
-        if p.is_null() {
-            return None;
-        }
-        let s = unsafe { CStr::from_ptr(p) }.to_str().ok()?.to_owned();
-        out.push(s);
-    }
-    Some(out)
-}
 
 fn collect_registrations(
     regs: *const sandlock_handler_registration_t,

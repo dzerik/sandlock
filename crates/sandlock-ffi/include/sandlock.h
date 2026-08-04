@@ -169,6 +169,15 @@ typedef struct sandlock_handle_t sandlock_handle_t;
 typedef struct sandlock_pipeline_t sandlock_pipeline_t;
 
 /**
+ * Opaque handle wrapping a transaction under construction.
+ *
+ * Create it with [`sandlock_txn_new`]. It is consumed by a run; a
+ * transaction that is built and then abandoned must be released with
+ * [`sandlock_txn_free`].
+ */
+typedef struct sandlock_txn_t sandlock_txn_t;
+
+/**
  * C-compatible syscall event passed to the policy callback.
  *
  * Path strings are intentionally absent (issue #27); use static Landlock
@@ -1646,6 +1655,73 @@ sandlock_result_t *sandlock_run_interactive_with_handlers(const sandlock_sandbox
                                                           uint32_t argc,
                                                           const sandlock_handler_registration_t *registrations,
                                                           uintptr_t nregistrations);
+
+/**
+ * Create an empty transaction.
+ *
+ * Free it with [`sandlock_txn_free`] unless it is consumed by a run.
+ */
+sandlock_txn_t *sandlock_txn_new(void);
+
+/**
+ * Append a stage. The policy is cloned; the caller retains ownership.
+ *
+ * Stages run in the order they are added, sequentially, over one shared
+ * copy-on-write upper.
+ *
+ * A stage this layer cannot read is DROPPED: nothing is appended and nothing
+ * is reported. That is the case for a null `txn` or `policy`, for a null
+ * `argv` or a null pointer inside it, for an `argc` of 0 or above 4096, and
+ * for an argument whose bytes are not valid UTF-8. Dropping is the same no-op
+ * a null handle already gets, and it is preferred to the alternative of
+ * substituting an empty string for an argument that could not be decoded,
+ * which would run a command the caller never asked for and report success.
+ * A transaction that lost a stage this way does not commit silently: the core
+ * sees the stage set it was actually given and refuses it.
+ *
+ * The cross-stage requirements (at least two stages, one shared workdir, no
+ * chroot, matching storage settings) are checked by the core when the
+ * transaction runs, not here, so that the caller gets the core's own
+ * explanation instead of a verdict invented in this layer.
+ *
+ * # Safety
+ * `txn` must be a valid transaction handle or null; `policy` a valid policy
+ * handle or null; `argv` must be null or point to `argc` pointers, each of
+ * which must itself be null or a valid C string.
+ */
+void sandlock_txn_add_stage(sandlock_txn_t *txn,
+                            const sandlock_sandbox_t *policy,
+                            const char *const *argv,
+                            unsigned int argc);
+
+/**
+ * Set how long the commit may wait for the workdir lock, in milliseconds.
+ *
+ * Passing 0 restores the core default of 30 seconds; it does not mean "do
+ * not wait". The default is a core constant that this layer cannot read, so
+ * the number is spelled out here for documentation only: the value is never
+ * materialised in the binding, the core supplies it.
+ *
+ * A consequence worth stating plainly: a zero wait, meaning one non-blocking
+ * attempt at the workdir lock, cannot be asked for through this ABI. The
+ * shortest wait it can express is 1.
+ *
+ * A null `txn` is a no-op.
+ *
+ * # Safety
+ * `txn` must be a valid transaction handle or null.
+ */
+void sandlock_txn_commit_lock_wait_ms(sandlock_txn_t *txn, uint64_t ms);
+
+/**
+ * Release a transaction that was never run. A null handle is a no-op.
+ *
+ * # Safety
+ * `txn` must be a handle from [`sandlock_txn_new`] that was not consumed by
+ * a run, or null. A run consumes the handle, so calling this afterwards is a
+ * double free.
+ */
+void sandlock_txn_free(sandlock_txn_t *txn);
 
 #ifdef __cplusplus
 }  // extern "C"
