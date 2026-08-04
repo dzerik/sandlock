@@ -169,6 +169,16 @@ typedef struct sandlock_handle_t sandlock_handle_t;
 typedef struct sandlock_pipeline_t sandlock_pipeline_t;
 
 /**
+ * Opaque handle holding the outcome of a transaction.
+ *
+ * Produced by [`sandlock_txn_run`] and [`sandlock_txn_dry_run`], released
+ * with [`sandlock_txn_outcome_free`]. It owns the per-stage results and the
+ * change list, so every pointer handed out by
+ * [`sandlock_txn_outcome_stage_at`] dies with it.
+ */
+typedef struct sandlock_txn_outcome_t sandlock_txn_outcome_t;
+
+/**
  * Opaque handle wrapping a transaction under construction.
  *
  * Create it with [`sandlock_txn_new`]. It is consumed by a run; a
@@ -1722,6 +1732,164 @@ void sandlock_txn_commit_lock_wait_ms(sandlock_txn_t *txn, uint64_t ms);
  * double free.
  */
 void sandlock_txn_free(sandlock_txn_t *txn);
+
+/**
+ * Run the transaction: every stage in turn over one shared copy-on-write
+ * upper, then merge that upper into the workdir if and only if every stage
+ * exited 0.
+ *
+ * On success returns an outcome handle and sets `*err` to 0. On failure
+ * returns null, sets `*err` to a discriminant and, when `err_msg` is
+ * non-null, stores an owned message the caller releases with
+ * `sandlock_string_free`.
+ *
+ * The handle is consumed on EVERY path, including every failure, and
+ * including `SANDLOCK_TXN_INVALID`, which is decided before anything runs.
+ * Passing it to [`sandlock_txn_free`] afterwards is a double free and adding
+ * a stage to it is a use after free; [`sandlock_txn_free`] is for the
+ * build-then-abandon path only. Recovering from a rejected stage set means
+ * building a new transaction, not repairing this one.
+ *
+ * A positive `*err` names one of the ways the core refused to carry the
+ * transaction out, and always comes with a message. The two negative values
+ * are not transaction verdicts and carry no message: -1 means the handle was
+ * null, and -2 means this thread's async runtime could not be built or
+ * panicked. Both are bugs in the caller or in its environment.
+ *
+ * A stage exiting non-zero, and a run that times out, are NOT failures: they
+ * are an outcome whose disposition is "aborted", with `*err` still 0. The
+ * workdir is untouched in both cases.
+ *
+ * `timeout_ms` bounds the stage phase only, never the commit; 0 means no
+ * timeout. The commit phase cannot be cancelled from this ABI at all.
+ *
+ * Each stage's standard error is written through to this process's file
+ * descriptor 2 as it is produced, as well as being captured (bounded) into
+ * the stage result. Standard input and output are inherited by every stage,
+ * so a stage result never carries captured stdout.
+ *
+ * The outcome must be released with [`sandlock_txn_outcome_free`].
+ *
+ * # Safety
+ * `txn` must be a handle from [`sandlock_txn_new`] that has not been run or
+ * freed, or null; it is consumed by this call and must not be used again.
+ * `err` and `err_msg` may both be null. When `err_msg` is non-null it must
+ * point to writable storage for one `*mut c_char`; it is cleared on entry.
+ */
+sandlock_txn_outcome_t *sandlock_txn_run(sandlock_txn_t *txn,
+                                         uint64_t timeout_ms,
+                                         int *err,
+                                         char **err_msg);
+
+/**
+ * Run every stage exactly as [`sandlock_txn_run`] does, then report the
+ * change set and discard it.
+ *
+ * The stages really execute; only the disposition of the shared upper
+ * differs. The workdir is never written to and the commit lock is never
+ * taken, so a dry run cannot conflict with anything.
+ *
+ * # Safety
+ * As [`sandlock_txn_run`].
+ */
+sandlock_txn_outcome_t *sandlock_txn_dry_run(sandlock_txn_t *txn,
+                                             uint64_t timeout_ms,
+                                             int *err,
+                                             char **err_msg);
+
+/**
+ * Which of the three terminal states the transaction ended in: 0 committed,
+ * 1 dry run, 2 aborted. Returns -1 for a null outcome.
+ *
+ * The three-set is total, so a caller can switch on it exhaustively.
+ *
+ * Why an abort happened is not published as a value here, but the two causes
+ * are still tellable apart from what the outcome carries. A stage that
+ * exited non-zero is reported and no later stage runs, so it is the last
+ * result: walk [`sandlock_txn_outcome_stage_at`] and look for
+ * `sandlock_result_success` returning false. A timeout kills the in-flight
+ * stage and reports no result for it, so an aborted outcome in which every
+ * reported stage succeeded is a timeout, and nothing else is.
+ *
+ * # Safety
+ * `o` must be null or an outcome pointer that has not been freed.
+ */
+int sandlock_txn_outcome_disposition(const sandlock_txn_outcome_t *o);
+
+/**
+ * Number of stage results. Returns 0 for a null outcome.
+ *
+ * Every stage that ran is reported, including on an abort and including the
+ * stages that had finished before a timeout stopped the run, so this can be
+ * smaller than the number of stages that were added.
+ *
+ * # Safety
+ * `o` must be null or an outcome pointer that has not been freed.
+ */
+uintptr_t sandlock_txn_outcome_stages_len(const sandlock_txn_outcome_t *o);
+
+/**
+ * The i-th stage result, in execution order, BORROWED from the outcome.
+ *
+ * The pointer stays valid until [`sandlock_txn_outcome_free`] and must never
+ * be passed to `sandlock_result_free`. Handing out an owned clone instead
+ * would copy every stage's captured output for no benefit.
+ *
+ * Returns null for a null outcome or an index that is out of range.
+ *
+ * # Safety
+ * `o` must be null or an outcome pointer that has not been freed. The
+ * returned pointer must not outlive `o`.
+ */
+const sandlock_result_t *sandlock_txn_outcome_stage_at(const sandlock_txn_outcome_t *o,
+                                                       uintptr_t i);
+
+/**
+ * Number of filesystem changes the shared upper held at the end of the run.
+ * Returns 0 for a null outcome.
+ *
+ * This is what the commit merged, or, for a dry run and for an abort, what
+ * was discarded instead.
+ *
+ * # Safety
+ * `o` must be null or an outcome pointer that has not been freed.
+ */
+uintptr_t sandlock_txn_outcome_changes_len(const sandlock_txn_outcome_t *o);
+
+/**
+ * Kind of the i-th change: 'A' added, 'M' modified, 'D' deleted. Returns 0
+ * for a null outcome or an index that is out of range.
+ *
+ * # Safety
+ * `o` must be null or an outcome pointer that has not been freed.
+ */
+char sandlock_txn_outcome_change_kind(const sandlock_txn_outcome_t *o, uintptr_t i);
+
+/**
+ * Path of the i-th change, relative to the workdir. The string is owned by
+ * the caller and is released with `sandlock_string_free`. Returns null for a
+ * null outcome or an index that is out of range.
+ *
+ * Path bytes that are not valid UTF-8 are replaced rather than preserved,
+ * exactly as `sandlock_dry_run_result_change_path` does, so this is a name to
+ * show a user and not always a name to open.
+ *
+ * # Safety
+ * `o` must be null or an outcome pointer that has not been freed.
+ */
+char *sandlock_txn_outcome_change_path(const sandlock_txn_outcome_t *o, uintptr_t i);
+
+/**
+ * Release an outcome. A null handle is a no-op.
+ *
+ * Every pointer obtained from [`sandlock_txn_outcome_stage_at`] is invalid
+ * afterwards.
+ *
+ * # Safety
+ * `o` must be null or an outcome pointer from a run that has not already
+ * been freed.
+ */
+void sandlock_txn_outcome_free(sandlock_txn_outcome_t *o);
 
 #ifdef __cplusplus
 }  // extern "C"
