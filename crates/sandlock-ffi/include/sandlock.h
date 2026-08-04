@@ -169,6 +169,33 @@ typedef struct sandlock_handle_t sandlock_handle_t;
 typedef struct sandlock_pipeline_t sandlock_pipeline_t;
 
 /**
+ * Opaque handle holding one sweep of a storage base.
+ *
+ * Owns its entries, so every pointer handed out by
+ * [`sandlock_preserved_list_at`] dies with it. Release it with
+ * [`sandlock_preserved_list_free`].
+ */
+typedef struct sandlock_preserved_list_t sandlock_preserved_list_t;
+
+/**
+ * Opaque handle holding one preserved change set: work that was left in
+ * branch storage instead of being reclaimed, because a commit could not take
+ * the workdir lock, a merge stopped partway, or the caller asked for it to be
+ * kept.
+ *
+ * There are two producers and they have DIFFERENT release rules.
+ * [`sandlock_preserved_read`] returns an OWNED handle that the caller
+ * releases with [`sandlock_preserved_free`].
+ * [`sandlock_preserved_list_at`] returns a BORROW of an entry inside a list,
+ * which must never reach [`sandlock_preserved_free`]: it is released by
+ * [`sandlock_preserved_list_free`] together with the rest of the list.
+ *
+ * Every accessor below works on either kind, and every string it returns is
+ * owned by the caller in both cases.
+ */
+typedef struct sandlock_preserved_t sandlock_preserved_t;
+
+/**
  * Opaque handle holding the outcome of a transaction.
  *
  * Produced by [`sandlock_txn_run`] and [`sandlock_txn_dry_run`], released
@@ -1890,6 +1917,231 @@ char *sandlock_txn_outcome_change_path(const sandlock_txn_outcome_t *o, uintptr_
  * been freed.
  */
 void sandlock_txn_outcome_free(sandlock_txn_outcome_t *o);
+
+/**
+ * Sweep `storage_base` for preserved change sets.
+ *
+ * Returns a list handle the caller releases with
+ * [`sandlock_preserved_list_free`]. Finding nothing is an EMPTY LIST, not
+ * null: a base that holds no preserved work and a base that could not be read
+ * (it does not exist, or is not readable) both sweep to nothing, and neither
+ * is a failure of this call. Null is returned only for a null argument.
+ *
+ * Entries that cannot be parsed are skipped rather than failing the sweep, so
+ * one broken branch directory cannot hide the rest.
+ *
+ * `storage_base` is read as a sequence of BYTES and is not narrowed to UTF-8:
+ * a path is bytes on this platform, and this one names a directory to walk,
+ * so a base another caller created is reachable whatever it is called. The
+ * same holds for every path this family hands back. That is the opposite of
+ * [`sandlock_txn_outcome_change_path`], which is lossy on purpose because it
+ * is a name to show rather than an address to open.
+ *
+ * Knowing WHICH base to sweep is the caller's problem, and this ABI cannot
+ * answer it: a failed commit names the preserved upper in its message and
+ * nowhere else, and the default base is derived inside the core from the
+ * environment. A caller that means to recover programmatically should set
+ * `sandlock_sandbox_builder_fs_storage` on its policies and sweep that same
+ * path, rather than parsing the message or guessing the default.
+ *
+ * A merge that is STILL RUNNING looks exactly like one that was interrupted:
+ * the marker is written before the first destructive step. Anything that acts
+ * on an entry, rather than only reporting it, must first check that
+ * [`sandlock_preserved_pid`] is not a live process.
+ *
+ * # Safety
+ * `storage_base` must be null or a valid C string.
+ */
+sandlock_preserved_list_t *sandlock_preserved_list(const char *storage_base);
+
+/**
+ * Number of preserved change sets in the sweep. 0 for a null list.
+ *
+ * # Safety
+ * `l` must be null or a list pointer that has not been freed.
+ */
+uintptr_t sandlock_preserved_list_len(const sandlock_preserved_list_t *l);
+
+/**
+ * The i-th preserved change set, BORROWED from the list.
+ *
+ * The pointer stays valid until [`sandlock_preserved_list_free`] and must
+ * NEVER be passed to [`sandlock_preserved_free`]: it is not a separate
+ * allocation, and freeing it would free memory the list still owns. Only a
+ * handle from [`sandlock_preserved_read`] is freed that way.
+ *
+ * Returns null for a null list or an index that is out of range.
+ *
+ * # Safety
+ * `l` must be null or a list pointer that has not been freed. The returned
+ * pointer must not outlive `l`.
+ */
+const sandlock_preserved_t *sandlock_preserved_list_at(const sandlock_preserved_list_t *l,
+                                                       uintptr_t i);
+
+/**
+ * Read one preserved change set from its branch directory.
+ *
+ * Returns an OWNED handle the caller releases with
+ * [`sandlock_preserved_free`], which is the one handle that may be freed that
+ * way.
+ *
+ * Null means the directory is not a usable preserved branch: it is null or
+ * unreadable, it holds no marker, it is the live storage of a running
+ * process, or its marker was cut short by a crash. Those cases are not
+ * distinguishable here, deliberately: a half-parsed record is worse than none
+ * at all, because acting on it would target the wrong workdir.
+ *
+ * `branch_dir` is read as a sequence of BYTES, not narrowed to UTF-8, so what
+ * [`sandlock_preserved_branch_dir`] reported can be fed straight back here.
+ *
+ * # Safety
+ * `branch_dir` must be null or a valid C string.
+ */
+sandlock_preserved_t *sandlock_preserved_read(const char *branch_dir);
+
+/**
+ * The branch's private storage directory: what to remove once the change set
+ * has been recovered, and what [`sandlock_preserved_read`] takes.
+ *
+ * The string is OWNED by the caller and is released with
+ * `sandlock_string_free`, whether the record came from a list borrow or from
+ * a read. Freeing the record does not free strings already handed out, and
+ * freeing a string does not touch the record. Returns null for a null record.
+ *
+ * It carries the path's BYTES verbatim and may therefore not be valid UTF-8.
+ * A binding must keep those bytes rather than decode them: this is the string
+ * that goes back into [`sandlock_preserved_read`] and that names the directory
+ * to remove once the change set has been recovered, so a substituted character
+ * would name a directory that does not exist. Every path this family returns
+ * works the same way, and none of them is like
+ * [`sandlock_txn_outcome_change_path`], which is lossy because it is a name to
+ * show rather than an address to open.
+ *
+ * # Safety
+ * `p` must be null or a record pointer that has not been freed.
+ */
+char *sandlock_preserved_branch_dir(const sandlock_preserved_t *p);
+
+/**
+ * The upper holding the preserved additions and modifications.
+ *
+ * This is only half of the change set: the deletions have no representation
+ * here at all, so copying this upper over the workdir and nothing else would
+ * resurrect every file the run removed. See
+ * [`sandlock_preserved_deleted_at`], and apply deletions FIRST.
+ *
+ * Owned string, released with `sandlock_string_free`, carrying the path's
+ * bytes verbatim (see [`sandlock_preserved_branch_dir`]). Null for a null
+ * record.
+ *
+ * # Safety
+ * `p` must be null or a record pointer that has not been freed.
+ */
+char *sandlock_preserved_upper(const sandlock_preserved_t *p);
+
+/**
+ * The workdir the change set belongs to, canonicalized when the branch was
+ * created.
+ *
+ * Owned string, released with `sandlock_string_free`, carrying the path's
+ * bytes verbatim (see [`sandlock_preserved_branch_dir`]). Null for a null
+ * record.
+ *
+ * # Safety
+ * `p` must be null or a record pointer that has not been freed.
+ */
+char *sandlock_preserved_workdir(const sandlock_preserved_t *p);
+
+/**
+ * Why the change set was preserved, which is what says how far the workdir
+ * got: 0 a merge was interrupted (the workdir may be partly merged), 1 a
+ * commit was deferred (the workdir is untouched and the whole change set is
+ * here), 2 the caller asked for it to be kept. Returns -1 for a null record.
+ *
+ * 0 is also what a merge that is still running looks like; see
+ * [`sandlock_preserved_pid`].
+ *
+ * # Safety
+ * `p` must be null or a record pointer that has not been freed.
+ */
+int sandlock_preserved_reason(const sandlock_preserved_t *p);
+
+/**
+ * The process that preserved the change set. 0 for a null record, which is
+ * not a process id anything here can have.
+ *
+ * Load-bearing for one thing: a merge writes its marker BEFORE its first
+ * destructive step, so a merge in flight and a merge that was interrupted are
+ * the same record, and this pid is the only thing that tells them apart.
+ * Anything that acts on such a record must check that the pid is not live
+ * first. Beyond that it is triage only: the process may be long gone and its
+ * pid reused.
+ *
+ * # Safety
+ * `p` must be null or a record pointer that has not been freed.
+ */
+uint32_t sandlock_preserved_pid(const sandlock_preserved_t *p);
+
+/**
+ * Number of paths the run deleted. 0 for a null record.
+ *
+ * # Safety
+ * `p` must be null or a record pointer that has not been freed.
+ */
+uintptr_t sandlock_preserved_deleted_len(const sandlock_preserved_t *p);
+
+/**
+ * The i-th deleted path, relative to the workdir, in sorted order.
+ *
+ * These are the outstanding deletions as of the last write of the record, and
+ * they are the half of the change set that the upper cannot carry. A recovery
+ * applies them BEFORE the upper: an addition under a path the run also
+ * deleted only lands correctly once that path has been emptied.
+ *
+ * Owned string, released with `sandlock_string_free`, carrying the path's
+ * bytes verbatim (see [`sandlock_preserved_branch_dir`]). Null for a null
+ * record or an index that is out of range.
+ *
+ * # Safety
+ * `p` must be null or a record pointer that has not been freed.
+ */
+char *sandlock_preserved_deleted_at(const sandlock_preserved_t *p, uintptr_t i);
+
+/**
+ * Release a sweep. A null list is a no-op.
+ *
+ * Every pointer obtained from [`sandlock_preserved_list_at`] is invalid
+ * afterwards. Strings already handed out by the accessors are not: they are
+ * separate allocations the caller still owns and still has to free.
+ *
+ * This does not remove anything from disk. The preserved storage outlives the
+ * sweep, and removing it is the caller's decision once the change set has
+ * been recovered.
+ *
+ * # Safety
+ * `l` must be null or a list from [`sandlock_preserved_list`] that has not
+ * already been freed.
+ */
+void sandlock_preserved_list_free(sandlock_preserved_list_t *l);
+
+/**
+ * Release a record from [`sandlock_preserved_read`]. A null record is a
+ * no-op.
+ *
+ * ONLY for a handle from [`sandlock_preserved_read`]. A pointer from
+ * [`sandlock_preserved_list_at`] borrows from its list and passing it here is
+ * a double free; that list is released by [`sandlock_preserved_list_free`]
+ * instead.
+ *
+ * This does not remove anything from disk, for the same reason
+ * [`sandlock_preserved_list_free`] does not.
+ *
+ * # Safety
+ * `p` must be null or a record from [`sandlock_preserved_read`] that has not
+ * already been freed.
+ */
+void sandlock_preserved_free(sandlock_preserved_t *p);
 
 #ifdef __cplusplus
 }  // extern "C"

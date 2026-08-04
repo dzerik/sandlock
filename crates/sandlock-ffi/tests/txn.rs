@@ -13,18 +13,28 @@
 //! The run half is observable from outside, so it is tested from outside: the
 //! three dispositions, the failure discriminants, and the workdir state that
 //! makes "all or nothing" mean something.
+//!
+//! The recovery half is where the memory contract is sharpest, because two
+//! producers of the same handle type have different release rules, so it is
+//! tested for what it hands out as much as for what it reports.
 
-use std::ffi::CString;
+use std::ffi::{CString, OsString};
 use std::os::fd::AsRawFd;
 use std::os::raw::{c_char, c_int, c_uint};
-use std::path::Path;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::path::{Path, PathBuf};
 use std::ptr;
 
 use sandlock_ffi::{
-    sandlock_result_exit_code, sandlock_result_free, sandlock_result_success, sandlock_run,
-    sandlock_sandbox_build, sandlock_sandbox_builder_cwd, sandlock_sandbox_builder_fs_read,
-    sandlock_sandbox_builder_fs_storage, sandlock_sandbox_builder_fs_write,
-    sandlock_sandbox_builder_new, sandlock_sandbox_builder_workdir, sandlock_sandbox_free,
+    sandlock_preserved_branch_dir, sandlock_preserved_deleted_at, sandlock_preserved_deleted_len,
+    sandlock_preserved_free, sandlock_preserved_list, sandlock_preserved_list_at,
+    sandlock_preserved_list_free, sandlock_preserved_list_len, sandlock_preserved_pid,
+    sandlock_preserved_read, sandlock_preserved_reason, sandlock_preserved_upper,
+    sandlock_preserved_workdir, sandlock_result_exit_code, sandlock_result_free,
+    sandlock_result_success, sandlock_run, sandlock_sandbox_build, sandlock_sandbox_builder_cwd,
+    sandlock_sandbox_builder_fs_read, sandlock_sandbox_builder_fs_storage,
+    sandlock_sandbox_builder_fs_write, sandlock_sandbox_builder_new,
+    sandlock_sandbox_builder_on_exit, sandlock_sandbox_builder_workdir, sandlock_sandbox_free,
     sandlock_sandbox_t, sandlock_string_free, sandlock_txn_add_stage,
     sandlock_txn_commit_lock_wait_ms, sandlock_txn_dry_run, sandlock_txn_free, sandlock_txn_new,
     sandlock_txn_outcome_change_kind, sandlock_txn_outcome_change_path,
@@ -41,6 +51,12 @@ const TXN_OK: c_int = 0;
 const TXN_NULL_HANDLE: c_int = -1;
 const TXN_INVALID: c_int = 1;
 const TXN_CONFLICT: c_int = 4;
+
+const ON_EXIT_COMMIT: u8 = 0;
+const ON_EXIT_KEEP: u8 = 2;
+
+const REASON_COMMIT_DEFERRED: c_int = 1;
+const REASON_KEPT: c_int = 2;
 
 /// Own the CStrings and hand back the `*const c_char` vector they back.
 fn argv(cmd: &[&str]) -> (Vec<CString>, Vec<*const c_char>) {
@@ -60,6 +76,17 @@ fn cstr(p: &Path) -> CString {
 /// `workdir` and `storage` are optional so the same helper serves the
 /// pointer-contract tests, which never run anything.
 fn build_policy(workdir: Option<&Path>, storage: Option<&Path>) -> *mut sandlock_sandbox_t {
+    build_policy_on_exit(workdir, storage, ON_EXIT_COMMIT)
+}
+
+/// As [`build_policy`], with the copy-on-write branch action a run applies
+/// when its child exits 0. `ON_EXIT_KEEP` is what leaves a preserved change
+/// set behind without needing a failure to produce one.
+fn build_policy_on_exit(
+    workdir: Option<&Path>,
+    storage: Option<&Path>,
+    on_exit: u8,
+) -> *mut sandlock_sandbox_t {
     let mut b = sandlock_sandbox_builder_new();
     for p in ["/usr", "/lib", "/lib64", "/bin", "/etc", "/proc"] {
         // Granting a nonexistent path makes the build fail, and not every
@@ -81,6 +108,9 @@ fn build_policy(workdir: Option<&Path>, storage: Option<&Path>) -> *mut sandlock
     if let Some(st) = storage {
         let c = cstr(st);
         b = unsafe { sandlock_sandbox_builder_fs_storage(b, c.as_ptr()) };
+    }
+    if on_exit != ON_EXIT_COMMIT {
+        b = unsafe { sandlock_sandbox_builder_on_exit(b, on_exit) };
     }
     let mut err: c_int = 0;
     let policy = unsafe { sandlock_sandbox_build(b, &mut err, ptr::null_mut()) };
@@ -681,5 +711,384 @@ fn txn_outcome_accessors_tolerate_a_null_outcome() {
         assert_eq!(sandlock_txn_outcome_change_kind(ptr::null(), 0), 0);
         assert!(sandlock_txn_outcome_change_path(ptr::null(), 0).is_null());
         sandlock_txn_outcome_free(ptr::null_mut());
+    }
+}
+
+// ----------------------------------------------------------------
+// Recovery: preserved change sets
+// ----------------------------------------------------------------
+
+/// Take ownership of a path the ABI produced: read it, then release it the way
+/// the surface says to. Every path getter in the preserved family allocates,
+/// so every one of them has to be freed exactly once.
+unsafe fn take_path(s: *mut c_char) -> PathBuf {
+    assert!(!s.is_null(), "the getter must have produced a path");
+    let bytes = std::ffi::CStr::from_ptr(s).to_bytes().to_vec();
+    sandlock_string_free(s);
+    PathBuf::from(OsString::from_vec(bytes))
+}
+
+/// Leave exactly one preserved branch under `storage`.
+///
+/// A plain run whose branch action is Keep is the cheapest way to produce one:
+/// it needs no failure and no contention. The child both writes and deletes,
+/// so the resulting record exercises the half of the change set that lives in
+/// the upper and the half that only the marker can carry.
+fn keep_one_branch(workdir: &Path, storage: &Path) {
+    std::fs::write(workdir.join("victim.txt"), "ORIGINAL").unwrap();
+    let policy = build_policy_on_exit(Some(workdir), Some(storage), ON_EXIT_KEEP);
+    let (_owned, ptrs) = argv(&["sh", "-c", "rm victim.txt && echo NEW > added.txt"]);
+    unsafe {
+        let r = sandlock_run(policy, ptr::null(), ptrs.as_ptr(), ptrs.len() as c_uint);
+        assert!(!r.is_null(), "the kept run must have produced a result");
+        assert!(
+            sandlock_result_success(r),
+            "the kept run's child must have written and deleted",
+        );
+        sandlock_result_free(r);
+        sandlock_sandbox_free(policy);
+    }
+}
+
+/// A preserved record has to carry the whole change set, not only the part of
+/// it that is visible as files.
+///
+/// Deletions are held in RAM while the branch is live and nothing in the upper
+/// represents them, so a recovery driven by the upper alone would resurrect
+/// every file the run removed. The record is the only place they exist.
+#[test]
+fn preserved_record_carries_the_upper_the_deletions_and_the_writing_pid() {
+    if !sandbox_available() {
+        eprintln!("preserved record test skipped: sandbox unavailable");
+        return;
+    }
+    let workdir = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    keep_one_branch(workdir.path(), storage.path());
+
+    let base = cstr(storage.path());
+    unsafe {
+        let list = sandlock_preserved_list(base.as_ptr());
+        assert!(!list.is_null());
+        assert_eq!(
+            sandlock_preserved_list_len(list),
+            1,
+            "the kept branch must be findable by a sweep",
+        );
+
+        let p = sandlock_preserved_list_at(list, 0);
+        assert!(!p.is_null());
+        assert!(
+            sandlock_preserved_list_at(list, 1).is_null(),
+            "an index past the end is null, not the last entry",
+        );
+
+        assert_eq!(
+            sandlock_preserved_reason(p),
+            REASON_KEPT,
+            "the caller asked for the changes to be kept, so nothing touched the workdir",
+        );
+        assert_eq!(
+            sandlock_preserved_pid(p),
+            std::process::id(),
+            "the record names the process that preserved it, which is this one",
+        );
+
+        let branch_dir = take_path(sandlock_preserved_branch_dir(p));
+        let upper = take_path(sandlock_preserved_upper(p));
+        let wd = take_path(sandlock_preserved_workdir(p));
+
+        assert_eq!(
+            branch_dir.parent(),
+            Some(storage.path()),
+            "the branch dir is the thing to remove once recovered, so it must be the real one",
+        );
+        assert!(
+            upper.starts_with(&branch_dir),
+            "the upper must live inside the branch dir, got {upper:?} under {branch_dir:?}",
+        );
+        assert_eq!(
+            wd,
+            workdir.path().canonicalize().unwrap(),
+            "the record must name the workdir the change set belongs to",
+        );
+        assert_eq!(
+            std::fs::read_to_string(upper.join("added.txt")).unwrap(),
+            "NEW\n",
+            "the upper the getter named must still hold the addition",
+        );
+
+        assert_eq!(sandlock_preserved_deleted_len(p), 1);
+        assert_eq!(
+            take_path(sandlock_preserved_deleted_at(p, 0)),
+            Path::new("victim.txt"),
+            "the deletion is reported relative to the workdir",
+        );
+        assert!(
+            sandlock_preserved_deleted_at(p, 1).is_null(),
+            "an index past the end is null",
+        );
+        assert!(
+            !upper.join("victim.txt").exists(),
+            "nothing in the upper represents the deletion: that is why the record carries it",
+        );
+
+        sandlock_preserved_list_free(list);
+    }
+}
+
+/// The two producers of a `sandlock_preserved_t` have different release rules,
+/// which only works if what they hand out really is independent.
+///
+/// A list entry is borrowed and dies with the list; a record from
+/// `sandlock_preserved_read` is owned and does not. Strings are owned by the
+/// caller in both cases.
+#[test]
+fn preserved_getters_hand_out_owned_copies_not_borrows_into_the_record() {
+    if !sandbox_available() {
+        eprintln!("preserved ownership test skipped: sandbox unavailable");
+        return;
+    }
+    let workdir = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    keep_one_branch(workdir.path(), storage.path());
+
+    let base = cstr(storage.path());
+    unsafe {
+        let list = sandlock_preserved_list(base.as_ptr());
+        assert_eq!(sandlock_preserved_list_len(list), 1);
+        let p = sandlock_preserved_list_at(list, 0);
+
+        // Two calls, two allocations. A getter that handed out a pointer into
+        // the record would return the same address twice, and the mandated
+        // `sandlock_string_free` would then be freeing the record's own memory.
+        let first = sandlock_preserved_branch_dir(p);
+        let second = sandlock_preserved_branch_dir(p);
+        assert!(!first.is_null() && !second.is_null());
+        assert_ne!(
+            first, second,
+            "each call must allocate: the caller frees what it gets",
+        );
+        let dir = take_path(first);
+        assert_eq!(
+            dir,
+            take_path(second),
+            "the two copies must say the same thing"
+        );
+
+        // A string taken from a borrowed entry belongs to the caller, so it
+        // outlives the list it came from.
+        let upper_from_list = sandlock_preserved_upper(p);
+        assert!(!upper_from_list.is_null());
+
+        // Reading the same directory gives an owned record. It must not share
+        // anything with the list: freeing the list leaves it whole.
+        let dir_arg = CString::new(dir.as_os_str().as_bytes()).unwrap();
+        let owned = sandlock_preserved_read(dir_arg.as_ptr());
+        assert!(
+            !owned.is_null(),
+            "the branch dir the sweep reported must be readable on its own",
+        );
+
+        sandlock_preserved_list_free(list);
+
+        assert_eq!(
+            take_path(upper_from_list),
+            take_path(sandlock_preserved_upper(owned)),
+            "a string handed out before the list was freed must still be readable, and equal",
+        );
+        assert_eq!(sandlock_preserved_reason(owned), REASON_KEPT);
+        assert_eq!(sandlock_preserved_pid(owned), std::process::id());
+        assert_eq!(
+            sandlock_preserved_deleted_len(owned),
+            1,
+            "the owned record carries the same change set as the list entry did",
+        );
+        assert_eq!(
+            take_path(sandlock_preserved_deleted_at(owned, 0)),
+            Path::new("victim.txt"),
+        );
+
+        // Owned means the caller frees it, and only this handle may be freed
+        // this way: the borrow from `sandlock_preserved_list_at` may not.
+        sandlock_preserved_free(owned);
+    }
+}
+
+/// The paths in a record are addresses to open, not names to show, so they
+/// have to come back byte for byte.
+///
+/// The C ABI's own builders take paths through `str` and cannot create storage
+/// whose name is not UTF-8, but a sweeper written in C can be pointed at
+/// storage a Rust or CLI caller made. If the sweep mangled such a name, the
+/// branch dir it reported could not be fed back into
+/// `sandlock_preserved_read`, and the change set it names could not be removed.
+#[test]
+fn preserved_paths_round_trip_through_a_storage_base_that_is_not_utf8() {
+    if !sandbox_available() {
+        eprintln!("preserved byte-exactness test skipped: sandbox unavailable");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let workdir = tempfile::tempdir().unwrap();
+    let storage = root.path().join("store");
+    std::fs::create_dir(&storage).unwrap();
+    keep_one_branch(workdir.path(), &storage);
+
+    let odd = root.path().join(OsString::from_vec(b"st\xffre".to_vec()));
+    std::fs::rename(&storage, &odd).unwrap();
+
+    let base = CString::new(odd.as_os_str().as_bytes()).unwrap();
+    unsafe {
+        let list = sandlock_preserved_list(base.as_ptr());
+        assert!(
+            !list.is_null(),
+            "a base whose name is not UTF-8 is still a base",
+        );
+        assert_eq!(sandlock_preserved_list_len(list), 1);
+
+        let p = sandlock_preserved_list_at(list, 0);
+        let branch_dir = take_path(sandlock_preserved_branch_dir(p));
+        assert!(
+            branch_dir.starts_with(&odd),
+            "the reported branch dir must be the real one byte for byte, got {branch_dir:?}",
+        );
+
+        let again = CString::new(branch_dir.as_os_str().as_bytes()).unwrap();
+        let owned = sandlock_preserved_read(again.as_ptr());
+        assert!(
+            !owned.is_null(),
+            "what the sweep reported must be readable back through the ABI",
+        );
+        assert_eq!(sandlock_preserved_reason(owned), REASON_KEPT);
+        sandlock_preserved_free(owned);
+        sandlock_preserved_list_free(list);
+    }
+}
+
+/// The failure the recovery surface exists for: a commit that could not take
+/// the workdir lock says the change set was preserved, and this is the only
+/// way to find it.
+#[test]
+fn preserved_change_set_is_listable_after_a_commit_lock_failure() {
+    if !sandbox_available() {
+        eprintln!("preserved conflict test skipped: sandbox unavailable");
+        return;
+    }
+    let workdir = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let policy = build_policy(Some(workdir.path()), Some(storage.path()));
+
+    let txn = sandlock_txn_new();
+    for cmd in ["echo plan > a.txt", "cat a.txt && echo built > b.txt"] {
+        let (_owned, ptrs) = argv(&["sh", "-c", cmd]);
+        unsafe { sandlock_txn_add_stage(txn, policy, ptrs.as_ptr(), ptrs.len() as c_uint) };
+    }
+    unsafe { sandlock_txn_commit_lock_wait_ms(txn, 300) };
+
+    let held = std::fs::File::open(workdir.path()).unwrap();
+    assert_eq!(
+        unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0,
+        "test setup: could not take the workdir lock",
+    );
+
+    let mut err: c_int = -99;
+    let outcome = unsafe { sandlock_txn_run(txn, 0, &mut err, ptr::null_mut()) };
+    drop(held);
+    assert!(outcome.is_null());
+    assert_eq!(err, TXN_CONFLICT);
+
+    let base = cstr(storage.path());
+    unsafe {
+        let list = sandlock_preserved_list(base.as_ptr());
+        assert!(!list.is_null());
+        assert_eq!(
+            sandlock_preserved_list_len(list),
+            1,
+            "a commit that never took the lock must leave exactly one branch to recover",
+        );
+
+        let p = sandlock_preserved_list_at(list, 0);
+        assert_eq!(
+            sandlock_preserved_reason(p),
+            REASON_COMMIT_DEFERRED,
+            "the merge never started, so the reason must say the workdir is untouched",
+        );
+        assert_eq!(
+            sandlock_preserved_deleted_len(p),
+            0,
+            "the transaction deleted nothing",
+        );
+
+        let upper = take_path(sandlock_preserved_upper(p));
+        assert_eq!(
+            std::fs::read_to_string(upper.join("a.txt")).unwrap(),
+            "plan\n",
+            "the first stage's write must survive in the preserved upper",
+        );
+        assert_eq!(
+            std::fs::read_to_string(upper.join("b.txt")).unwrap(),
+            "built\n",
+            "the last stage's write must survive in the preserved upper",
+        );
+        assert_eq!(
+            take_path(sandlock_preserved_workdir(p)),
+            workdir.path().canonicalize().unwrap(),
+        );
+        sandlock_preserved_list_free(list);
+        sandlock_sandbox_free(policy);
+    }
+    assert!(
+        !workdir.path().join("a.txt").exists(),
+        "the lock was never taken, so nothing may have been merged",
+    );
+}
+
+/// Nothing to recover and could not look are different answers, and neither of
+/// them may be a crash.
+#[test]
+fn preserved_accessors_tolerate_null_and_report_an_unmarked_directory() {
+    let empty = tempfile::tempdir().unwrap();
+    let base = cstr(empty.path());
+    unsafe {
+        let list = sandlock_preserved_list(base.as_ptr());
+        assert!(
+            !list.is_null(),
+            "an empty sweep is an empty list, not a failure",
+        );
+        assert_eq!(sandlock_preserved_list_len(list), 0);
+        assert!(sandlock_preserved_list_at(list, 0).is_null());
+        sandlock_preserved_list_free(list);
+
+        // A base that does not exist reads the same way: there is nothing to
+        // recover from it either.
+        let missing = cstr(&empty.path().join("nope"));
+        let list = sandlock_preserved_list(missing.as_ptr());
+        assert!(!list.is_null());
+        assert_eq!(sandlock_preserved_list_len(list), 0);
+        sandlock_preserved_list_free(list);
+
+        // A directory with no marker is not a preserved branch.
+        assert!(sandlock_preserved_read(base.as_ptr()).is_null());
+
+        // Null in, null out, and never a dereference: a binding that failed
+        // its own allocation passes null through.
+        assert!(sandlock_preserved_list(ptr::null()).is_null());
+        assert!(sandlock_preserved_read(ptr::null()).is_null());
+        assert_eq!(sandlock_preserved_list_len(ptr::null()), 0);
+        assert!(sandlock_preserved_list_at(ptr::null(), 0).is_null());
+        assert!(sandlock_preserved_branch_dir(ptr::null()).is_null());
+        assert!(sandlock_preserved_upper(ptr::null()).is_null());
+        assert!(sandlock_preserved_workdir(ptr::null()).is_null());
+        assert_eq!(sandlock_preserved_reason(ptr::null()), -1);
+        assert_eq!(sandlock_preserved_pid(ptr::null()), 0);
+        assert_eq!(sandlock_preserved_deleted_len(ptr::null()), 0);
+        assert!(sandlock_preserved_deleted_at(ptr::null(), 0).is_null());
+
+        // Freeing nothing is not a failure: a caller that bailed out early
+        // must be able to run its cleanup unconditionally.
+        sandlock_preserved_list_free(ptr::null_mut());
+        sandlock_preserved_free(ptr::null_mut());
     }
 }

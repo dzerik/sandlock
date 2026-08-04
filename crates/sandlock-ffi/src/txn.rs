@@ -10,10 +10,13 @@
 //! takes ownership of the stage list. Materialising `Stage` is therefore
 //! deferred to the moment of the run.
 
-use std::ffi::{c_char, c_int, c_uint, CString};
+use std::ffi::{c_char, c_int, c_uint, CStr, CString, OsString};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::path::{Path, PathBuf};
 use std::ptr;
 use std::time::Duration;
 
+use sandlock_core::recovery::{list_preserved, read_preserved, PreserveReason, PreservedBranch};
 use sandlock_core::{Change, ChangeKind, Sandbox, Stage, Transaction, TxnDisposition, TxnError};
 
 use crate::runtime::with_runtime;
@@ -553,6 +556,380 @@ pub unsafe extern "C" fn sandlock_txn_outcome_free(o: *mut sandlock_txn_outcome_
     }
 }
 
+// ----------------------------------------------------------------
+// Recovery: preserved change sets
+// ----------------------------------------------------------------
+
+/// Opaque handle holding one preserved change set: work that was left in
+/// branch storage instead of being reclaimed, because a commit could not take
+/// the workdir lock, a merge stopped partway, or the caller asked for it to be
+/// kept.
+///
+/// There are two producers and they have DIFFERENT release rules.
+/// [`sandlock_preserved_read`] returns an OWNED handle that the caller
+/// releases with [`sandlock_preserved_free`].
+/// [`sandlock_preserved_list_at`] returns a BORROW of an entry inside a list,
+/// which must never reach [`sandlock_preserved_free`]: it is released by
+/// [`sandlock_preserved_list_free`] together with the rest of the list.
+///
+/// Every accessor below works on either kind, and every string it returns is
+/// owned by the caller in both cases.
+#[allow(non_camel_case_types)]
+pub struct sandlock_preserved_t {
+    _private: PreservedBranch,
+}
+
+/// Opaque handle holding one sweep of a storage base.
+///
+/// Owns its entries, so every pointer handed out by
+/// [`sandlock_preserved_list_at`] dies with it. Release it with
+/// [`sandlock_preserved_list_free`].
+#[allow(non_camel_case_types)]
+pub struct sandlock_preserved_list_t {
+    /// Pre-wrapped in the published handle type so that `list_at` can hand out
+    /// a borrow directly. Casting a `&PreservedBranch` instead would tie the
+    /// accessor to the layout of a single-field struct.
+    items: Vec<sandlock_preserved_t>,
+}
+
+/// Read a C string as a filesystem path. `None` only for a null pointer.
+///
+/// The bytes go through unchanged. A path is bytes on this platform, and these
+/// arguments name directories to walk and to open, so narrowing them to UTF-8
+/// here would make a sweep unable to reach storage that another caller
+/// created.
+///
+/// # Safety
+/// `p` must be null or a valid C string.
+unsafe fn path_arg(p: *const c_char) -> Option<PathBuf> {
+    if p.is_null() {
+        return None;
+    }
+    Some(PathBuf::from(OsString::from_vec(
+        CStr::from_ptr(p).to_bytes().to_vec(),
+    )))
+}
+
+/// Hand a path back as an owned C string, byte for byte.
+///
+/// Unlike the change report, whose paths are names to show, these are
+/// addresses to open and to remove: a lossy conversion would name a directory
+/// that does not exist, and the change set it points at could never be
+/// recovered. A path read off the filesystem cannot contain a NUL, so the one
+/// failure mode is unreachable; it is reported as null rather than papered
+/// over with a substitute.
+fn path_out(p: &Path) -> *mut c_char {
+    match CString::new(p.as_os_str().as_bytes()) {
+        Ok(c) => c.into_raw(),
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+/// Sweep `storage_base` for preserved change sets.
+///
+/// Returns a list handle the caller releases with
+/// [`sandlock_preserved_list_free`]. Finding nothing is an EMPTY LIST, not
+/// null: a base that holds no preserved work and a base that could not be read
+/// (it does not exist, or is not readable) both sweep to nothing, and neither
+/// is a failure of this call. Null is returned only for a null argument.
+///
+/// Entries that cannot be parsed are skipped rather than failing the sweep, so
+/// one broken branch directory cannot hide the rest.
+///
+/// `storage_base` is read as a sequence of BYTES and is not narrowed to UTF-8:
+/// a path is bytes on this platform, and this one names a directory to walk,
+/// so a base another caller created is reachable whatever it is called. The
+/// same holds for every path this family hands back. That is the opposite of
+/// [`sandlock_txn_outcome_change_path`], which is lossy on purpose because it
+/// is a name to show rather than an address to open.
+///
+/// Knowing WHICH base to sweep is the caller's problem, and this ABI cannot
+/// answer it: a failed commit names the preserved upper in its message and
+/// nowhere else, and the default base is derived inside the core from the
+/// environment. A caller that means to recover programmatically should set
+/// `sandlock_sandbox_builder_fs_storage` on its policies and sweep that same
+/// path, rather than parsing the message or guessing the default.
+///
+/// A merge that is STILL RUNNING looks exactly like one that was interrupted:
+/// the marker is written before the first destructive step. Anything that acts
+/// on an entry, rather than only reporting it, must first check that
+/// [`sandlock_preserved_pid`] is not a live process.
+///
+/// # Safety
+/// `storage_base` must be null or a valid C string.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_preserved_list(
+    storage_base: *const c_char,
+) -> *mut sandlock_preserved_list_t {
+    let Some(base) = path_arg(storage_base) else {
+        return ptr::null_mut();
+    };
+    let items = list_preserved(&base)
+        .into_iter()
+        .map(|b| sandlock_preserved_t { _private: b })
+        .collect();
+    Box::into_raw(Box::new(sandlock_preserved_list_t { items }))
+}
+
+/// Number of preserved change sets in the sweep. 0 for a null list.
+///
+/// # Safety
+/// `l` must be null or a list pointer that has not been freed.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_preserved_list_len(l: *const sandlock_preserved_list_t) -> usize {
+    if l.is_null() {
+        return 0;
+    }
+    (*l).items.len()
+}
+
+/// The i-th preserved change set, BORROWED from the list.
+///
+/// The pointer stays valid until [`sandlock_preserved_list_free`] and must
+/// NEVER be passed to [`sandlock_preserved_free`]: it is not a separate
+/// allocation, and freeing it would free memory the list still owns. Only a
+/// handle from [`sandlock_preserved_read`] is freed that way.
+///
+/// Returns null for a null list or an index that is out of range.
+///
+/// # Safety
+/// `l` must be null or a list pointer that has not been freed. The returned
+/// pointer must not outlive `l`.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_preserved_list_at(
+    l: *const sandlock_preserved_list_t,
+    i: usize,
+) -> *const sandlock_preserved_t {
+    if l.is_null() {
+        return ptr::null();
+    }
+    let items = &(*l).items;
+    match items.get(i) {
+        Some(p) => p as *const sandlock_preserved_t,
+        None => ptr::null(),
+    }
+}
+
+/// Read one preserved change set from its branch directory.
+///
+/// Returns an OWNED handle the caller releases with
+/// [`sandlock_preserved_free`], which is the one handle that may be freed that
+/// way.
+///
+/// Null means the directory is not a usable preserved branch: it is null or
+/// unreadable, it holds no marker, it is the live storage of a running
+/// process, or its marker was cut short by a crash. Those cases are not
+/// distinguishable here, deliberately: a half-parsed record is worse than none
+/// at all, because acting on it would target the wrong workdir.
+///
+/// `branch_dir` is read as a sequence of BYTES, not narrowed to UTF-8, so what
+/// [`sandlock_preserved_branch_dir`] reported can be fed straight back here.
+///
+/// # Safety
+/// `branch_dir` must be null or a valid C string.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_preserved_read(
+    branch_dir: *const c_char,
+) -> *mut sandlock_preserved_t {
+    let Some(dir) = path_arg(branch_dir) else {
+        return ptr::null_mut();
+    };
+    match read_preserved(&dir) {
+        Some(b) => Box::into_raw(Box::new(sandlock_preserved_t { _private: b })),
+        None => ptr::null_mut(),
+    }
+}
+
+/// The branch's private storage directory: what to remove once the change set
+/// has been recovered, and what [`sandlock_preserved_read`] takes.
+///
+/// The string is OWNED by the caller and is released with
+/// `sandlock_string_free`, whether the record came from a list borrow or from
+/// a read. Freeing the record does not free strings already handed out, and
+/// freeing a string does not touch the record. Returns null for a null record.
+///
+/// It carries the path's BYTES verbatim and may therefore not be valid UTF-8.
+/// A binding must keep those bytes rather than decode them: this is the string
+/// that goes back into [`sandlock_preserved_read`] and that names the directory
+/// to remove once the change set has been recovered, so a substituted character
+/// would name a directory that does not exist. Every path this family returns
+/// works the same way, and none of them is like
+/// [`sandlock_txn_outcome_change_path`], which is lossy because it is a name to
+/// show rather than an address to open.
+///
+/// # Safety
+/// `p` must be null or a record pointer that has not been freed.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_preserved_branch_dir(
+    p: *const sandlock_preserved_t,
+) -> *mut c_char {
+    if p.is_null() {
+        return ptr::null_mut();
+    }
+    path_out(&(*p)._private.branch_dir)
+}
+
+/// The upper holding the preserved additions and modifications.
+///
+/// This is only half of the change set: the deletions have no representation
+/// here at all, so copying this upper over the workdir and nothing else would
+/// resurrect every file the run removed. See
+/// [`sandlock_preserved_deleted_at`], and apply deletions FIRST.
+///
+/// Owned string, released with `sandlock_string_free`, carrying the path's
+/// bytes verbatim (see [`sandlock_preserved_branch_dir`]). Null for a null
+/// record.
+///
+/// # Safety
+/// `p` must be null or a record pointer that has not been freed.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_preserved_upper(p: *const sandlock_preserved_t) -> *mut c_char {
+    if p.is_null() {
+        return ptr::null_mut();
+    }
+    path_out(&(*p)._private.upper)
+}
+
+/// The workdir the change set belongs to, canonicalized when the branch was
+/// created.
+///
+/// Owned string, released with `sandlock_string_free`, carrying the path's
+/// bytes verbatim (see [`sandlock_preserved_branch_dir`]). Null for a null
+/// record.
+///
+/// # Safety
+/// `p` must be null or a record pointer that has not been freed.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_preserved_workdir(p: *const sandlock_preserved_t) -> *mut c_char {
+    if p.is_null() {
+        return ptr::null_mut();
+    }
+    path_out(&(*p)._private.workdir)
+}
+
+/// Why the change set was preserved, which is what says how far the workdir
+/// got: 0 a merge was interrupted (the workdir may be partly merged), 1 a
+/// commit was deferred (the workdir is untouched and the whole change set is
+/// here), 2 the caller asked for it to be kept. Returns -1 for a null record.
+///
+/// 0 is also what a merge that is still running looks like; see
+/// [`sandlock_preserved_pid`].
+///
+/// # Safety
+/// `p` must be null or a record pointer that has not been freed.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_preserved_reason(p: *const sandlock_preserved_t) -> c_int {
+    if p.is_null() {
+        return -1;
+    }
+    match (*p)._private.reason {
+        PreserveReason::MergeInterrupted => 0,
+        PreserveReason::CommitDeferred => 1,
+        PreserveReason::Kept => 2,
+    }
+}
+
+/// The process that preserved the change set. 0 for a null record, which is
+/// not a process id anything here can have.
+///
+/// Load-bearing for one thing: a merge writes its marker BEFORE its first
+/// destructive step, so a merge in flight and a merge that was interrupted are
+/// the same record, and this pid is the only thing that tells them apart.
+/// Anything that acts on such a record must check that the pid is not live
+/// first. Beyond that it is triage only: the process may be long gone and its
+/// pid reused.
+///
+/// # Safety
+/// `p` must be null or a record pointer that has not been freed.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_preserved_pid(p: *const sandlock_preserved_t) -> u32 {
+    if p.is_null() {
+        return 0;
+    }
+    (*p)._private.pid
+}
+
+/// Number of paths the run deleted. 0 for a null record.
+///
+/// # Safety
+/// `p` must be null or a record pointer that has not been freed.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_preserved_deleted_len(p: *const sandlock_preserved_t) -> usize {
+    if p.is_null() {
+        return 0;
+    }
+    (*p)._private.deleted.len()
+}
+
+/// The i-th deleted path, relative to the workdir, in sorted order.
+///
+/// These are the outstanding deletions as of the last write of the record, and
+/// they are the half of the change set that the upper cannot carry. A recovery
+/// applies them BEFORE the upper: an addition under a path the run also
+/// deleted only lands correctly once that path has been emptied.
+///
+/// Owned string, released with `sandlock_string_free`, carrying the path's
+/// bytes verbatim (see [`sandlock_preserved_branch_dir`]). Null for a null
+/// record or an index that is out of range.
+///
+/// # Safety
+/// `p` must be null or a record pointer that has not been freed.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_preserved_deleted_at(
+    p: *const sandlock_preserved_t,
+    i: usize,
+) -> *mut c_char {
+    if p.is_null() {
+        return ptr::null_mut();
+    }
+    let deleted = &(*p)._private.deleted;
+    match deleted.get(i) {
+        Some(path) => path_out(path),
+        None => ptr::null_mut(),
+    }
+}
+
+/// Release a sweep. A null list is a no-op.
+///
+/// Every pointer obtained from [`sandlock_preserved_list_at`] is invalid
+/// afterwards. Strings already handed out by the accessors are not: they are
+/// separate allocations the caller still owns and still has to free.
+///
+/// This does not remove anything from disk. The preserved storage outlives the
+/// sweep, and removing it is the caller's decision once the change set has
+/// been recovered.
+///
+/// # Safety
+/// `l` must be null or a list from [`sandlock_preserved_list`] that has not
+/// already been freed.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_preserved_list_free(l: *mut sandlock_preserved_list_t) {
+    if !l.is_null() {
+        drop(Box::from_raw(l));
+    }
+}
+
+/// Release a record from [`sandlock_preserved_read`]. A null record is a
+/// no-op.
+///
+/// ONLY for a handle from [`sandlock_preserved_read`]. A pointer from
+/// [`sandlock_preserved_list_at`] borrows from its list and passing it here is
+/// a double free; that list is released by [`sandlock_preserved_list_free`]
+/// instead.
+///
+/// This does not remove anything from disk, for the same reason
+/// [`sandlock_preserved_list_free`] does not.
+///
+/// # Safety
+/// `p` must be null or a record from [`sandlock_preserved_read`] that has not
+/// already been freed.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_preserved_free(p: *mut sandlock_preserved_t) {
+    if !p.is_null() {
+        drop(Box::from_raw(p));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -703,6 +1080,43 @@ mod tests {
         );
         assert_eq!(TXN_NULL_HANDLE, -1);
         assert_eq!(TXN_NO_RUNTIME, -2);
+    }
+
+    /// The preservation reasons are permanent numbers too, and the one that
+    /// decides the most is the one no test can produce: an interrupted merge
+    /// needs a crash between the marker and the end of the merge. Reported as
+    /// `Kept` or `CommitDeferred` it would tell a recovery tool the workdir is
+    /// untouched when it may be half merged, and the tool would replay the
+    /// whole upper onto a workdir that already holds part of it.
+    #[test]
+    fn every_preserve_reason_maps_to_its_own_published_value() {
+        let record = |reason| sandlock_preserved_t {
+            _private: PreservedBranch {
+                branch_dir: PathBuf::from("/preserve-reason-test/branch"),
+                upper: PathBuf::from("/preserve-reason-test/branch/upper"),
+                workdir: PathBuf::from("/preserve-reason-test/work"),
+                deleted: Vec::new(),
+                reason,
+                pid: 1,
+            },
+        };
+        for (reason, value) in [
+            (PreserveReason::MergeInterrupted, 0),
+            (PreserveReason::CommitDeferred, 1),
+            (PreserveReason::Kept, 2),
+        ] {
+            let r = record(reason);
+            assert_eq!(
+                unsafe { sandlock_preserved_reason(&r) },
+                value,
+                "{reason:?} must keep the value the header publishes",
+            );
+        }
+        assert_eq!(
+            unsafe { sandlock_preserved_reason(ptr::null()) },
+            -1,
+            "not a member of the set: the question was not asked of a record",
+        );
     }
 
     #[test]
