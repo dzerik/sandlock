@@ -52,10 +52,20 @@ parse_deps = false
 # Force-emit the two action/exception enums: they are referenced from Rust only
 # via `... as u32` casts, never as a typed field or parameter, so cbindgen would
 # otherwise drop them as unreferenced even though their constants are public ABI.
+#
+# The three transaction enums are in the same position: `sandlock_txn_run`
+# reports `sandlock_txn_err_t` through an `int` out-parameter (it also carries
+# negative codes that no `uint32_t` can hold), and
+# `sandlock_txn_outcome_disposition` and `sandlock_preserved_reason` return
+# their enums as an `int` (both keep a -1 for a null handle), so none of the
+# three names appears in a signature.
 include = [
     "sandlock_action_kind_t",
     "sandlock_exception_policy_t",
     "sandlock_policy_ud_drop_t",
+    "sandlock_txn_err_t",
+    "sandlock_txn_disposition_t",
+    "sandlock_preserve_reason_t",
 ]
 exclude = [
     "SandboxBuilder",
@@ -74,6 +84,14 @@ exclude = [
 "sandlock_exception_policy_t" = "sandlock_exception"
 "sandlock_action_kind_t" = "sandlock_action"
 "sandlock_exit_reason_t" = "sandlock_exit_reason"
+# Same treatment for the transaction enums: SANDLOCK_TXN_CONFLICT,
+# SANDLOCK_TXN_DISPOSITION_ABORTED and SANDLOCK_PRESERVE_KEPT rather than
+# SANDLOCK_TXN_ERR_T_CONFLICT and friends. The `sandlock_txn` type name does
+# not collide with the `sandlock_txn_t` handle: one is a uint32_t, the other a
+# struct tag.
+"sandlock_txn_err_t" = "sandlock_txn"
+"sandlock_txn_disposition_t" = "sandlock_txn_disposition"
+"sandlock_preserve_reason_t" = "sandlock_preserve"
 
 [enum]
 rename_variants = "ScreamingSnakeCase"

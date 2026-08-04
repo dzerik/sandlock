@@ -138,53 +138,108 @@ pub unsafe extern "C" fn sandlock_txn_free(txn: *mut sandlock_txn_t) {
 // Running a transaction
 // ----------------------------------------------------------------
 
-// Discriminants reported through the `err` out-parameter of
-// `sandlock_txn_run` and `sandlock_txn_dry_run`.
-//
-// Non-negative values name a way the core refused to carry the transaction
-// out; the list is append only, so a published value never changes meaning.
-// Negative values are not transaction verdicts at all: they say the call
-// could not be made, and they carry no message.
+/// How a transaction ended, as reported through the `err` out-parameter of
+/// [`sandlock_txn_run`] and [`sandlock_txn_dry_run`].
+///
+/// The list is append only: a published value never changes meaning, and a
+/// caller that meets a value it does not know must treat it as a failure it
+/// cannot classify rather than as success.
+///
+/// Two of these are easy to mistake for each other and mean opposite things.
+/// `SANDLOCK_TXN_CONFLICT` is the retryable one (another commit held the
+/// lock); `SANDLOCK_TXN_COMMIT_LOCK` is not (the lock could not be taken at
+/// all).
+///
+/// The two negative codes that can also appear in `err` are deliberately not
+/// members: they are not verdicts on a transaction, so they must not be
+/// switched on alongside these. See `SANDLOCK_TXN_NULL_HANDLE` and
+/// `SANDLOCK_TXN_NO_RUNTIME`.
+// `#[repr(u32)]` (not `#[repr(C)]`) pins the discriminant width, matching the
+// sibling FFI enums; a bare C enum's width is implementation-defined
+// (`-fshort-enums`). The functions keep returning `int`, because `err` also
+// carries the negative codes, which no `uint32_t` can hold.
+#[allow(non_camel_case_types)]
+#[repr(u32)]
+pub enum sandlock_txn_err_t {
+    /// The transaction ran. An outcome handle was returned; its disposition
+    /// says whether it committed.
+    Ok = 0,
+    /// The stage set is not a valid transaction. Checked before anything runs.
+    Invalid = 1,
+    /// The shared copy-on-write branch could not be created. No stage ran.
+    Branch = 2,
+    /// A stage could not be started or driven to completion. This is not a
+    /// stage that FAILED: a non-zero exit is an aborted outcome, not an error.
+    Stage = 3,
+    /// Contention: another commit held the workdir lock for longer than
+    /// [`sandlock_txn_commit_lock_wait_ms`]. The workdir is untouched and the
+    /// whole change set was preserved. Retrying is the expected response.
+    Conflict = 4,
+    /// The workdir commit lock could not be taken for a reason other than
+    /// contention (the workdir could not be opened, or `flock` failed). As
+    /// with `SANDLOCK_TXN_CONFLICT` the workdir is untouched and the change
+    /// set was preserved.
+    CommitLock = 5,
+    /// The commit merge failed. The merge is not rolled back, so the workdir
+    /// may be partially merged, and what did not land was preserved WHEN a
+    /// marker could be written for it. Failing to write that marker is itself
+    /// one of the ways this failure is reached, and in that case the workdir
+    /// was not touched at all and no sweep will ever find the change set. The
+    /// message says which of the two happened, so read it before acting.
+    Merge = 6,
+    /// The commit phase never ran to completion because the runtime was shut
+    /// down under it. This is the one failure that cannot say what state the
+    /// workdir and the change set are in.
+    CommitAbandoned = 7,
+    /// A failure this version of the ABI has no name for. The core failure set
+    /// is open, so a binding built against an older header can meet a newer
+    /// core; the message still carries the core's own explanation.
+    Unknown = 8,
+}
 
-/// The transaction ran. An outcome handle was returned; its disposition says
-/// whether it committed.
-const TXN_OK: c_int = 0;
-/// The handle was null: a bug in the calling binding, not a failed
-/// transaction.
-const TXN_NULL_HANDLE: c_int = -1;
-/// This thread's Tokio runtime could not be built, or it panicked while
-/// driving the transaction. Nothing can be said about the workdir from here;
-/// `crate::runtime` has already reported the cause on stderr.
-const TXN_NO_RUNTIME: c_int = -2;
-/// The stage set is not a valid transaction. Checked before anything runs.
-const TXN_INVALID: c_int = 1;
-/// The shared copy-on-write branch could not be created. No stage ran.
-const TXN_BRANCH: c_int = 2;
-/// A stage could not be started or driven to completion. This is not a stage
-/// that *failed*: a non-zero exit is an aborted outcome, not an error.
-const TXN_STAGE: c_int = 3;
-/// Contention: another commit held the workdir lock for longer than
-/// [`sandlock_txn_commit_lock_wait_ms`]. The workdir is untouched and the whole
-/// change set was preserved. Retrying is the expected response.
-const TXN_CONFLICT: c_int = 4;
-/// The workdir commit lock could not be taken for a reason other than
-/// contention (the workdir could not be opened, or `flock` failed). As with
-/// `TXN_CONFLICT` the workdir is untouched and the change set was preserved.
-const TXN_COMMIT_LOCK: c_int = 5;
-/// The commit merge failed. The merge is not rolled back, so the workdir may
-/// be partially merged, and what did not land was preserved when a marker
-/// could be written for it. Failing to write that marker is itself one of the
-/// ways this failure is reached, and in that case the workdir was not touched
-/// at all; the message says which happened.
-const TXN_MERGE: c_int = 6;
-/// The commit phase never ran to completion because the runtime was shut down
-/// under it. This is the one failure that cannot say what state the workdir
-/// and the change set are in.
-const TXN_COMMIT_ABANDONED: c_int = 7;
-/// A failure this version of the ABI has no name for. The core failure set is
-/// open, so a binding built against an older header can meet a newer one; the
-/// message still carries the core's own explanation.
-const TXN_UNKNOWN: c_int = 8;
+/// `err` value meaning the transaction handle was null: a bug in the calling
+/// binding, not a failed transaction. No message accompanies it.
+///
+/// Negative, and so outside `sandlock_txn_err_t`, on purpose: nothing was
+/// attempted, so there is no verdict on a workdir to report.
+pub const SANDLOCK_TXN_NULL_HANDLE: c_int = -1;
+
+/// `err` value meaning this thread's async runtime could not be built, or it
+/// panicked while driving the transaction. No message accompanies it; the
+/// cause has already been reported on this process's file descriptor 2.
+///
+/// Negative for the same reason as `SANDLOCK_TXN_NULL_HANDLE`, though here the
+/// transaction may well have run: nothing can be said about the workdir from
+/// here, which is precisely why it is not one of the named verdicts.
+pub const SANDLOCK_TXN_NO_RUNTIME: c_int = -2;
+
+/// Which terminal state a transaction that ran ended in, as reported by
+/// [`sandlock_txn_outcome_disposition`].
+///
+/// Unlike `sandlock_txn_err_t` this set is not append only, it is TOTAL: a
+/// transaction that ran ended in exactly one of these three, so a caller may
+/// switch on it exhaustively and need no default arm. The core keeps it that
+/// way on purpose, by funnelling future abort causes through the reason an
+/// abort carries rather than through a fourth state.
+///
+/// `sandlock_txn_outcome_disposition` returns -1 for a null outcome, which is
+/// not a member: it says there was no transaction to have a disposition.
+// `#[repr(u32)]` for the same reason as `sandlock_txn_err_t`: a bare C enum's
+// width is implementation-defined. The function keeps returning `int` because
+// of the -1.
+#[allow(non_camel_case_types)]
+#[repr(u32)]
+pub enum sandlock_txn_disposition_t {
+    /// Every stage exited 0 and the shared upper was merged into the workdir.
+    Committed = 0,
+    /// Every stage exited 0 and the upper was discarded on purpose: the run
+    /// was a dry run, so the workdir was never written to.
+    DryRun = 1,
+    /// A stage exited non-zero, or the stage phase timed out. The upper was
+    /// discarded and the workdir is untouched. Which of the two happened is
+    /// not published as a value; see [`sandlock_txn_outcome_disposition`].
+    Aborted = 2,
+}
 
 /// Opaque handle holding the outcome of a transaction.
 ///
@@ -211,18 +266,19 @@ pub struct sandlock_txn_outcome_t {
 /// one (another commit held the lock), `CommitLock` is not (the lock could not
 /// be taken at all).
 fn txn_err_code(e: &TxnError) -> c_int {
-    match e {
-        TxnError::Invalid(_) => TXN_INVALID,
-        TxnError::Branch { .. } => TXN_BRANCH,
-        TxnError::Stage { .. } => TXN_STAGE,
-        TxnError::Conflict { .. } => TXN_CONFLICT,
-        TxnError::CommitLock { .. } => TXN_COMMIT_LOCK,
-        TxnError::Merge { .. } => TXN_MERGE,
-        TxnError::CommitAbandoned(_) => TXN_COMMIT_ABANDONED,
+    let code = match e {
+        TxnError::Invalid(_) => sandlock_txn_err_t::Invalid,
+        TxnError::Branch { .. } => sandlock_txn_err_t::Branch,
+        TxnError::Stage { .. } => sandlock_txn_err_t::Stage,
+        TxnError::Conflict { .. } => sandlock_txn_err_t::Conflict,
+        TxnError::CommitLock { .. } => sandlock_txn_err_t::CommitLock,
+        TxnError::Merge { .. } => sandlock_txn_err_t::Merge,
+        TxnError::CommitAbandoned(_) => sandlock_txn_err_t::CommitAbandoned,
         // The core failure set is `#[non_exhaustive]`: a variant added by a
         // later phase must not be silently reported as one of the above.
-        _ => TXN_UNKNOWN,
-    }
+        _ => sandlock_txn_err_t::Unknown,
+    };
+    code as c_int
 }
 
 /// Store `msg` in `*out` as an owned C string, or leave `*out` null when the
@@ -261,7 +317,7 @@ unsafe fn txn_execute(
         // does. There is nothing user-actionable to say and saying it here
         // would put a hard-coded sentence in the wrong layer.
         if !err.is_null() {
-            *err = TXN_NULL_HANDLE;
+            *err = SANDLOCK_TXN_NULL_HANDLE;
         }
         return ptr::null_mut();
     }
@@ -299,7 +355,7 @@ unsafe fn txn_execute(
     match ran {
         Some(Ok(outcome)) => {
             if !err.is_null() {
-                *err = TXN_OK;
+                *err = sandlock_txn_err_t::Ok as c_int;
             }
             Box::into_raw(Box::new(sandlock_txn_outcome_t {
                 disposition: outcome.disposition,
@@ -320,7 +376,7 @@ unsafe fn txn_execute(
         }
         None => {
             if !err.is_null() {
-                *err = TXN_NO_RUNTIME;
+                *err = SANDLOCK_TXN_NO_RUNTIME;
             }
             ptr::null_mut()
         }
@@ -397,10 +453,8 @@ pub unsafe extern "C" fn sandlock_txn_dry_run(
     txn_execute(txn, timeout_ms, err, err_msg, true)
 }
 
-/// Which of the three terminal states the transaction ended in: 0 committed,
-/// 1 dry run, 2 aborted. Returns -1 for a null outcome.
-///
-/// The three-set is total, so a caller can switch on it exhaustively.
+/// Which of the three terminal states the transaction ended in, as one of the
+/// `SANDLOCK_TXN_DISPOSITION_*` values. Returns -1 for a null outcome.
 ///
 /// Why an abort happened is not published as a value here, but the two causes
 /// are still tellable apart from what the outcome carries. A stage that
@@ -419,11 +473,12 @@ pub unsafe extern "C" fn sandlock_txn_outcome_disposition(
     if o.is_null() {
         return -1;
     }
-    match (*o).disposition {
-        TxnDisposition::Committed => 0,
-        TxnDisposition::DryRun => 1,
-        TxnDisposition::Aborted(_) => 2,
-    }
+    let d = match (*o).disposition {
+        TxnDisposition::Committed => sandlock_txn_disposition_t::Committed,
+        TxnDisposition::DryRun => sandlock_txn_disposition_t::DryRun,
+        TxnDisposition::Aborted(_) => sandlock_txn_disposition_t::Aborted,
+    };
+    d as c_int
 }
 
 /// Number of stage results. Returns 0 for a null outcome.
@@ -559,6 +614,31 @@ pub unsafe extern "C" fn sandlock_txn_outcome_free(o: *mut sandlock_txn_outcome_
 // ----------------------------------------------------------------
 // Recovery: preserved change sets
 // ----------------------------------------------------------------
+
+/// Why a change set was left in branch storage instead of being reclaimed, as
+/// reported by [`sandlock_preserved_reason`].
+///
+/// This is what says how far the workdir got, so it decides what a recovery
+/// may do rather than merely describing history. The list is append only.
+///
+/// `sandlock_preserved_reason` returns -1 for a null record, which is not a
+/// member: it says the question was not asked of a record at all.
+// `#[repr(u32)]` for the same reason as `sandlock_txn_err_t`: a bare C enum's
+// width is implementation-defined.
+#[allow(non_camel_case_types)]
+#[repr(u32)]
+pub enum sandlock_preserve_reason_t {
+    /// A merge started and did not finish, so the workdir may be partly
+    /// merged. A merge that is STILL RUNNING is indistinguishable from this:
+    /// the marker is written before the first destructive step. Check
+    /// [`sandlock_preserved_pid`] before acting on such a record.
+    MergeInterrupted = 0,
+    /// A commit could not take the workdir lock. The workdir is untouched and
+    /// the whole change set is here.
+    CommitDeferred = 1,
+    /// The caller asked for the branch to be kept.
+    Kept = 2,
+}
 
 /// Opaque handle holding one preserved change set: work that was left in
 /// branch storage instead of being reclaimed, because a commit could not take
@@ -807,13 +887,13 @@ pub unsafe extern "C" fn sandlock_preserved_workdir(p: *const sandlock_preserved
     path_out(&(*p)._private.workdir)
 }
 
-/// Why the change set was preserved, which is what says how far the workdir
-/// got: 0 a merge was interrupted (the workdir may be partly merged), 1 a
-/// commit was deferred (the workdir is untouched and the whole change set is
-/// here), 2 the caller asked for it to be kept. Returns -1 for a null record.
+/// Why the change set was preserved, as one of the
+/// `SANDLOCK_PRESERVE_*` values. Returns -1 for a null record.
 ///
-/// 0 is also what a merge that is still running looks like; see
-/// [`sandlock_preserved_pid`].
+/// This is what says how far the workdir got, so a recovery has to read it
+/// before it reads anything else; `SANDLOCK_PRESERVE_MERGE_INTERRUPTED` is
+/// also what a merge that is still running looks like, and see
+/// [`sandlock_preserved_pid`] for why that matters.
 ///
 /// # Safety
 /// `p` must be null or a record pointer that has not been freed.
@@ -822,11 +902,12 @@ pub unsafe extern "C" fn sandlock_preserved_reason(p: *const sandlock_preserved_
     if p.is_null() {
         return -1;
     }
-    match (*p)._private.reason {
-        PreserveReason::MergeInterrupted => 0,
-        PreserveReason::CommitDeferred => 1,
-        PreserveReason::Kept => 2,
-    }
+    let reason = match (*p)._private.reason {
+        PreserveReason::MergeInterrupted => sandlock_preserve_reason_t::MergeInterrupted,
+        PreserveReason::CommitDeferred => sandlock_preserve_reason_t::CommitDeferred,
+        PreserveReason::Kept => sandlock_preserve_reason_t::Kept,
+    };
+    reason as c_int
 }
 
 /// The process that preserved the change set. 0 for a null record, which is
@@ -1073,13 +1154,14 @@ mod tests {
                 "{e} must keep the discriminant the header publishes",
             );
         }
-        assert_eq!(TXN_OK, 0);
+        assert_eq!(sandlock_txn_err_t::Ok as c_int, 0);
         assert_eq!(
-            TXN_UNKNOWN, 8,
+            sandlock_txn_err_t::Unknown as c_int,
+            8,
             "reserved for a core failure this version of the ABI cannot name",
         );
-        assert_eq!(TXN_NULL_HANDLE, -1);
-        assert_eq!(TXN_NO_RUNTIME, -2);
+        assert_eq!(SANDLOCK_TXN_NULL_HANDLE, -1);
+        assert_eq!(SANDLOCK_TXN_NO_RUNTIME, -2);
     }
 
     /// The preservation reasons are permanent numbers too, and the one that

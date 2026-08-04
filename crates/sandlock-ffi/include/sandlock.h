@@ -35,6 +35,26 @@ typedef struct sandlock_handler_t sandlock_handler_t;
 #define SANDLOCK_INJECT_NO_CLOEXEC (1 << 1)
 
 /**
+ * `err` value meaning the transaction handle was null: a bug in the calling
+ * binding, not a failed transaction. No message accompanies it.
+ *
+ * Negative, and so outside `sandlock_txn_err_t`, on purpose: nothing was
+ * attempted, so there is no verdict on a workdir to report.
+ */
+#define SANDLOCK_TXN_NULL_HANDLE -1
+
+/**
+ * `err` value meaning this thread's async runtime could not be built, or it
+ * panicked while driving the transaction. No message accompanies it; the
+ * cause has already been reported on this process's file descriptor 2.
+ *
+ * Negative for the same reason as `SANDLOCK_TXN_NULL_HANDLE`, though here the
+ * transaction may well have run: nothing can be said about the workdir from
+ * here, which is precisely why it is not one of the named verdicts.
+ */
+#define SANDLOCK_TXN_NO_RUNTIME -2
+
+/**
  * Why a sandboxed process terminated. `EXITED` carries an exit code
  * (`sandlock_result_exit_code`); `SIGNALED` carries the signal number
  * (`sandlock_result_signal`). Linux bottoms both a timeout and an OOM kill out
@@ -130,6 +150,160 @@ enum sandlock_exception
 };
 #ifndef __cplusplus
 typedef uint32_t sandlock_exception;
+#endif // __cplusplus
+
+/**
+ * How a transaction ended, as reported through the `err` out-parameter of
+ * [`sandlock_txn_run`] and [`sandlock_txn_dry_run`].
+ *
+ * The list is append only: a published value never changes meaning, and a
+ * caller that meets a value it does not know must treat it as a failure it
+ * cannot classify rather than as success.
+ *
+ * Two of these are easy to mistake for each other and mean opposite things.
+ * `SANDLOCK_TXN_CONFLICT` is the retryable one (another commit held the
+ * lock); `SANDLOCK_TXN_COMMIT_LOCK` is not (the lock could not be taken at
+ * all).
+ *
+ * The two negative codes that can also appear in `err` are deliberately not
+ * members: they are not verdicts on a transaction, so they must not be
+ * switched on alongside these. See `SANDLOCK_TXN_NULL_HANDLE` and
+ * `SANDLOCK_TXN_NO_RUNTIME`.
+ */
+enum sandlock_txn
+#ifdef __cplusplus
+  : uint32_t
+#endif // __cplusplus
+ {
+  /**
+   * The transaction ran. An outcome handle was returned; its disposition
+   * says whether it committed.
+   */
+  SANDLOCK_TXN_OK = 0,
+  /**
+   * The stage set is not a valid transaction. Checked before anything runs.
+   */
+  SANDLOCK_TXN_INVALID = 1,
+  /**
+   * The shared copy-on-write branch could not be created. No stage ran.
+   */
+  SANDLOCK_TXN_BRANCH = 2,
+  /**
+   * A stage could not be started or driven to completion. This is not a
+   * stage that FAILED: a non-zero exit is an aborted outcome, not an error.
+   */
+  SANDLOCK_TXN_STAGE = 3,
+  /**
+   * Contention: another commit held the workdir lock for longer than
+   * [`sandlock_txn_commit_lock_wait_ms`]. The workdir is untouched and the
+   * whole change set was preserved. Retrying is the expected response.
+   */
+  SANDLOCK_TXN_CONFLICT = 4,
+  /**
+   * The workdir commit lock could not be taken for a reason other than
+   * contention (the workdir could not be opened, or `flock` failed). As
+   * with `SANDLOCK_TXN_CONFLICT` the workdir is untouched and the change
+   * set was preserved.
+   */
+  SANDLOCK_TXN_COMMIT_LOCK = 5,
+  /**
+   * The commit merge failed. The merge is not rolled back, so the workdir
+   * may be partially merged, and what did not land was preserved WHEN a
+   * marker could be written for it. Failing to write that marker is itself
+   * one of the ways this failure is reached, and in that case the workdir
+   * was not touched at all and no sweep will ever find the change set. The
+   * message says which of the two happened, so read it before acting.
+   */
+  SANDLOCK_TXN_MERGE = 6,
+  /**
+   * The commit phase never ran to completion because the runtime was shut
+   * down under it. This is the one failure that cannot say what state the
+   * workdir and the change set are in.
+   */
+  SANDLOCK_TXN_COMMIT_ABANDONED = 7,
+  /**
+   * A failure this version of the ABI has no name for. The core failure set
+   * is open, so a binding built against an older header can meet a newer
+   * core; the message still carries the core's own explanation.
+   */
+  SANDLOCK_TXN_UNKNOWN = 8,
+};
+#ifndef __cplusplus
+typedef uint32_t sandlock_txn;
+#endif // __cplusplus
+
+/**
+ * Which terminal state a transaction that ran ended in, as reported by
+ * [`sandlock_txn_outcome_disposition`].
+ *
+ * Unlike `sandlock_txn_err_t` this set is not append only, it is TOTAL: a
+ * transaction that ran ended in exactly one of these three, so a caller may
+ * switch on it exhaustively and need no default arm. The core keeps it that
+ * way on purpose, by funnelling future abort causes through the reason an
+ * abort carries rather than through a fourth state.
+ *
+ * `sandlock_txn_outcome_disposition` returns -1 for a null outcome, which is
+ * not a member: it says there was no transaction to have a disposition.
+ */
+enum sandlock_txn_disposition
+#ifdef __cplusplus
+  : uint32_t
+#endif // __cplusplus
+ {
+  /**
+   * Every stage exited 0 and the shared upper was merged into the workdir.
+   */
+  SANDLOCK_TXN_DISPOSITION_COMMITTED = 0,
+  /**
+   * Every stage exited 0 and the upper was discarded on purpose: the run
+   * was a dry run, so the workdir was never written to.
+   */
+  SANDLOCK_TXN_DISPOSITION_DRY_RUN = 1,
+  /**
+   * A stage exited non-zero, or the stage phase timed out. The upper was
+   * discarded and the workdir is untouched. Which of the two happened is
+   * not published as a value; see [`sandlock_txn_outcome_disposition`].
+   */
+  SANDLOCK_TXN_DISPOSITION_ABORTED = 2,
+};
+#ifndef __cplusplus
+typedef uint32_t sandlock_txn_disposition;
+#endif // __cplusplus
+
+/**
+ * Why a change set was left in branch storage instead of being reclaimed, as
+ * reported by [`sandlock_preserved_reason`].
+ *
+ * This is what says how far the workdir got, so it decides what a recovery
+ * may do rather than merely describing history. The list is append only.
+ *
+ * `sandlock_preserved_reason` returns -1 for a null record, which is not a
+ * member: it says the question was not asked of a record at all.
+ */
+enum sandlock_preserve
+#ifdef __cplusplus
+  : uint32_t
+#endif // __cplusplus
+ {
+  /**
+   * A merge started and did not finish, so the workdir may be partly
+   * merged. A merge that is STILL RUNNING is indistinguishable from this:
+   * the marker is written before the first destructive step. Check
+   * [`sandlock_preserved_pid`] before acting on such a record.
+   */
+  SANDLOCK_PRESERVE_MERGE_INTERRUPTED = 0,
+  /**
+   * A commit could not take the workdir lock. The workdir is untouched and
+   * the whole change set is here.
+   */
+  SANDLOCK_PRESERVE_COMMIT_DEFERRED = 1,
+  /**
+   * The caller asked for the branch to be kept.
+   */
+  SANDLOCK_PRESERVE_KEPT = 2,
+};
+#ifndef __cplusplus
+typedef uint32_t sandlock_preserve;
 #endif // __cplusplus
 
 /**
@@ -1825,10 +1999,8 @@ sandlock_txn_outcome_t *sandlock_txn_dry_run(sandlock_txn_t *txn,
                                              char **err_msg);
 
 /**
- * Which of the three terminal states the transaction ended in: 0 committed,
- * 1 dry run, 2 aborted. Returns -1 for a null outcome.
- *
- * The three-set is total, so a caller can switch on it exhaustively.
+ * Which of the three terminal states the transaction ended in, as one of the
+ * `SANDLOCK_TXN_DISPOSITION_*` values. Returns -1 for a null outcome.
  *
  * Why an abort happened is not published as a value here, but the two causes
  * are still tellable apart from what the outcome carries. A stage that
@@ -2054,13 +2226,13 @@ char *sandlock_preserved_upper(const sandlock_preserved_t *p);
 char *sandlock_preserved_workdir(const sandlock_preserved_t *p);
 
 /**
- * Why the change set was preserved, which is what says how far the workdir
- * got: 0 a merge was interrupted (the workdir may be partly merged), 1 a
- * commit was deferred (the workdir is untouched and the whole change set is
- * here), 2 the caller asked for it to be kept. Returns -1 for a null record.
+ * Why the change set was preserved, as one of the
+ * `SANDLOCK_PRESERVE_*` values. Returns -1 for a null record.
  *
- * 0 is also what a merge that is still running looks like; see
- * [`sandlock_preserved_pid`].
+ * This is what says how far the workdir got, so a recovery has to read it
+ * before it reads anything else; `SANDLOCK_PRESERVE_MERGE_INTERRUPTED` is
+ * also what a merge that is still running looks like, and see
+ * [`sandlock_preserved_pid`] for why that matters.
  *
  * # Safety
  * `p` must be null or a record pointer that has not been freed.

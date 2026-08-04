@@ -1,12 +1,19 @@
-//! Compile and run the pure-C smoke test against the cdylib.
+//! Compile and run the pure-C smoke tests against the cdylib.
 
-#[test]
-fn c_smoke_compiles_and_runs() {
-    use std::path::PathBuf;
-    use std::process::Command;
+use std::path::PathBuf;
+use std::process::Command;
 
+/// Compile `tests/c/<source>` against the generated header and the cdylib,
+/// then run it and require a zero exit.
+///
+/// This is the only check that the committed `include/sandlock.h` is usable
+/// from plain C at all: everything else in the crate reaches the symbols
+/// through Rust declarations and would keep passing with an unbuildable
+/// header. `-Werror` therefore matters as much as the run does.
+fn compile_and_run(source: &str, bin_name: &str) {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let out_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
-    let bin = out_dir.join("handler_smoke");
+    let bin = out_dir.join(bin_name);
     let profile = if cfg!(debug_assertions) {
         "debug"
     } else {
@@ -14,7 +21,7 @@ fn c_smoke_compiles_and_runs() {
     };
 
     // Cargo links integration tests against the crate's *rlib*, and does not
-    // treat the *cdylib* as a build prerequisite — so `cargo test` never
+    // treat the *cdylib* as a build prerequisite, so `cargo test` never
     // (re)builds `libsandlock_ffi.so`. Build it ourselves so we always link the
     // current artifact instead of a stale one left in `target/` (which fails
     // with "undefined reference" when the symbol set has changed). `--lib`
@@ -26,12 +33,15 @@ fn c_smoke_compiles_and_runs() {
         build.arg("--release");
     }
     let build_status = build.status().expect("invoke cargo build for cdylib");
-    assert!(build_status.success(), "failed to build sandlock-ffi cdylib");
+    assert!(
+        build_status.success(),
+        "failed to build sandlock-ffi cdylib"
+    );
 
     let target_dir = std::env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            manifest_dir
                 .parent()
                 .unwrap()
                 .parent()
@@ -52,6 +62,8 @@ fn c_smoke_compiles_and_runs() {
     .expect("libsandlock_ffi cdylib should exist in target output");
 
     let rpath_arg = format!("-Wl,-rpath,{}", cdylib_dir.to_str().unwrap());
+    let include_dir = manifest_dir.join("include");
+    let c_file = manifest_dir.join("tests").join("c").join(source);
 
     let status = Command::new("cc")
         .args([
@@ -60,8 +72,8 @@ fn c_smoke_compiles_and_runs() {
             "-Wextra",
             "-Werror",
             "-I",
-            concat!(env!("CARGO_MANIFEST_DIR"), "/include"),
-            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/c/handler_smoke.c"),
+            include_dir.to_str().unwrap(),
+            c_file.to_str().unwrap(),
             "-L",
             cdylib_dir.to_str().unwrap(),
             &rpath_arg,
@@ -71,13 +83,25 @@ fn c_smoke_compiles_and_runs() {
         ])
         .status()
         .expect("cc invocation");
-    assert!(status.success(), "C compile failed");
+    assert!(status.success(), "C compile of {source} failed");
 
-    let out = Command::new(&bin).output().expect("run handler_smoke");
+    let out = Command::new(&bin)
+        .output()
+        .unwrap_or_else(|e| panic!("run {bin_name}: {e}"));
     assert!(
         out.status.success(),
-        "handler_smoke exited non-zero: stdout={:?} stderr={:?}",
+        "{bin_name} exited non-zero: stdout={:?} stderr={:?}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+#[test]
+fn c_smoke_compiles_and_runs() {
+    compile_and_run("handler_smoke.c", "handler_smoke");
+}
+
+#[test]
+fn c_txn_smoke_compiles_and_runs() {
+    compile_and_run("txn_smoke.c", "txn_smoke");
 }
