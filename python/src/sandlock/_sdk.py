@@ -1986,7 +1986,19 @@ class Transaction:
         del txn_p
 
         if not outcome_p:
-            raise _txn_failure(err.value, err_msg.value if err_msg else None)
+            # err_msg.value is a copy of the C string's bytes; the underlying
+            # allocation still needs releasing afterwards. The negative codes
+            # carry no message at all, so a null here is expected rather than
+            # a reason to invent one.
+            #
+            # Ownership follows the POINTER, not the bytes: err_msg.value reads
+            # b"" both for a null and for an allocated empty string, so asking
+            # the copy would leak a zero-length message. c_char_p is falsy only
+            # when it is actually null.
+            message = err_msg.value
+            if err_msg:
+                _lib.sandlock_string_free(err_msg)
+            raise _txn_failure(err.value, message)
 
         try:
             return TxnOutcome(

@@ -539,6 +539,62 @@ def test_a_transaction_abandoned_before_it_runs_frees_its_handle(tmp_path, monke
 
 
 @requires_sandbox
+def test_the_failure_message_is_released_once_it_has_been_read(tmp_path, monkeypatch):
+    """The core hands the message over owned; nothing else will free it."""
+    workdir, storage = _workdir(tmp_path)
+    sb = _policy(workdir, storage)
+    freed: list[bool] = []
+    real = _sdk._lib.sandlock_string_free
+
+    def spy(s):
+        freed.append(bool(s))
+        return real(s)
+
+    monkeypatch.setattr(_sdk._lib, "sandlock_string_free", spy)
+
+    with pytest.raises(TransactionError) as ei:
+        Transaction([Stage(sb, ["true"])]).run()
+
+    assert "at least 2 stages" in str(ei.value), "the message was read before being freed"
+    assert freed == [True], "the owned message was released exactly once"
+
+
+def test_a_failure_message_of_zero_length_is_released_too(tmp_path, monkeypatch):
+    """Ownership follows the pointer, not the bytes it points at.
+
+    ``err_msg.value`` reads ``b""`` both for a null pointer and for an
+    allocated empty string, so deciding by the copy would leak every message
+    the core ever hands over with nothing in it. The core has no such message
+    today, which is exactly why the entry point is stood in for here: the
+    question is what this layer does when it meets one, and no fixture can
+    make the core produce it.
+    """
+    freed: list[bool] = []
+    # Deliberately does NOT delegate: the empty string below is allocated by
+    # ctypes, so handing it to the core's allocator would be an invalid free.
+    monkeypatch.setattr(_sdk._lib, "sandlock_string_free", lambda s: freed.append(bool(s)))
+
+    def empty_message_run(txn_p, timeout_ms, err_ref, err_msg_ref):
+        _sdk._lib.sandlock_txn_free(txn_p)  # the real entry consumes the handle
+        err_ref._obj.value = int(TxnErrorKind.CONFLICT)
+        err_msg_ref._obj.value = b""  # a real pointer to a zero-length string
+        return None
+
+    monkeypatch.setattr(_sdk._lib, "sandlock_txn_run", empty_message_run)
+
+    workdir, storage = _workdir(tmp_path)
+    sb = _policy(workdir, storage)
+    with pytest.raises(TransactionError) as ei:
+        Transaction([
+            Stage(sb, ["sh", "-c", "true"]),
+            Stage(sb, ["sh", "-c", "true"]),
+        ]).run()
+
+    assert ei.value.kind is TxnErrorKind.CONFLICT
+    assert freed == [True], "an empty message is an allocation like any other"
+
+
+@requires_sandbox
 def test_the_same_transaction_can_be_run_again(tmp_path):
     """Each run builds its own handle, so reuse is not a use after free."""
     workdir, storage = _workdir(tmp_path)
