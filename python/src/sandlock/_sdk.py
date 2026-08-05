@@ -1855,13 +1855,15 @@ def _txn_stage_argv(args: Sequence[str], index: int):
     return argv_type(*encoded), ctypes.c_uint(len(encoded))
 
 
-def _txn_millis(seconds: float | None, what: str, *, none_is: int | None) -> int | None:
+def _txn_millis(
+    seconds: float | None, what: str, *, none_is: int | None, zero_means: str
+) -> int | None:
     """Convert a duration in seconds to the whole milliseconds the ABI takes.
 
-    The ABI reads 0 ms as "use the core default", so a wait that rounds down to
-    zero cannot be expressed. Rounding it up, or letting it pass as 0, would
-    silently substitute a duration the caller did not ask for, so it is
-    refused instead.
+    Zero already means something else on this ABI, so a duration that rounds
+    down to it cannot be expressed at all. Rounding up, or letting it through
+    as 0, would silently substitute a duration the caller did not ask for, so
+    it is refused instead and the caller finds out at the call site.
     """
     if seconds is None:
         return none_is
@@ -1869,7 +1871,7 @@ def _txn_millis(seconds: float | None, what: str, *, none_is: int | None) -> int
     if ms <= 0:
         raise ValueError(
             f"{what}={seconds!r} rounds down to 0 ms, which the transaction ABI "
-            f"reads as 'no {what}'; the shortest value it can express is 0.001"
+            f"reads as {zero_means}; the shortest value it can express is 0.001"
         )
     return ms
 
@@ -1967,10 +1969,15 @@ class Transaction:
             for index, (stage, native) in enumerate(zip(self.stages, natives)):
                 argv, argc = _txn_stage_argv(stage.args, index)
                 _lib.sandlock_txn_add_stage(txn_p, native.ptr, argv, argc)
-            wait_ms = _txn_millis(self.commit_lock_wait, "commit_lock_wait", none_is=None)
+            wait_ms = _txn_millis(
+                self.commit_lock_wait, "commit_lock_wait",
+                none_is=None, zero_means="'use the core default'",
+            )
             if wait_ms is not None:
                 _lib.sandlock_txn_commit_lock_wait_ms(txn_p, wait_ms)
-            timeout_ms = _txn_millis(timeout, "timeout", none_is=0)
+            timeout_ms = _txn_millis(
+                timeout, "timeout", none_is=0, zero_means="'no timeout'",
+            )
         except BaseException:
             # Building the transaction is the only path on which this layer
             # still owns the handle, and so the only one that may free it.
