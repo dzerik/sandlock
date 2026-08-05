@@ -205,6 +205,106 @@ p.Stdout // *os.File
 p.Stderr // *os.File
 ```
 
+### Transactions
+
+```go
+func (t *Transaction) Run(ctx context.Context) (*TxnOutcome, error)
+func (t *Transaction) DryRun(ctx context.Context) (*TxnOutcome, error)
+
+func (o *TxnOutcome) Committed() bool
+func (o *TxnOutcome) TimedOut() bool
+func (k TxnErrorKind) IsVerdict() bool
+```
+
+A `Transaction` runs its stages in order over one shared copy-on-write upper
+and commits every change they made, or none of them. Every stage must name the
+same `Workdir` and leave `OnExit`/`OnError` unset, so that no stage can decide
+the fate of the shared upper on its own; set `FSStorage` too, since that is
+where a change set a commit could not apply is left, and the only place a
+recovery can find it.
+
+```go
+sb := &sandlock.Sandbox{
+    FSReadable: []string{"/usr", "/lib", "/lib64", "/bin", "/etc"},
+    FSWritable: []string{workdir},
+    Workdir:    workdir,
+    Cwd:        workdir,
+    FSStorage:  storage,
+}
+txn := &sandlock.Transaction{Stages: []sandlock.Stage{
+    {Sandbox: sb, Args: []string{"sh", "-c", "echo plan > a.txt"}},
+    {Sandbox: sb, Args: []string{"sh", "-c", "cat a.txt && echo built > b.txt"}},
+}}
+out, err := txn.Run(context.Background())
+```
+
+- **Run** merges the shared upper into the workdir if and only if every stage
+  exits 0. A `ctx` deadline bounds the stage phase only: the commit cannot be
+  cancelled at all.
+- **DryRun** runs the stages exactly as `Run` does, reports what they changed,
+  and discards it. The workdir is never written to and the commit lock is never
+  taken, so a dry run cannot conflict with a commit in flight.
+- A stage that exits non-zero, and a run that hits its deadline, are **not**
+  errors. Both give a `*TxnOutcome` with `Disposition == TxnAborted` and a nil
+  error; `TimedOut` says which of the two happened.
+- A `*TxnError` is the core's verdict on a transaction. Switch on its `Kind`,
+  guarded by `IsVerdict`: the kinds differ in what they say about the workdir.
+  `TxnErrConflict` (another commit held the lock) leaves it untouched and the
+  change set whole, so a retry is the expected response, while its neighbour
+  `TxnErrCommitLock` means the lock could not be taken at all and retrying will
+  not help. `TxnErrMerge` means the workdir may be partially merged.
+- Not every returned error is one, so reach for `Kind` through `errors.As` and
+  never through a type assertion. A run that never started returns `ctx`'s own
+  error, or a stage this binding refused to hand to the ABI (no `Sandbox`, no
+  `Args`, an argument that is not valid UTF-8 or carries a NUL); neither is a
+  `*TxnError`, because neither says anything about a workdir.
+- A `Transaction` carries no native state, so the value that failed is the
+  value to retry with, and one value may be run more than once.
+- Stages inherit stdin and stdout, so `Result.Stdout` is always empty for a
+  stage; stderr is written through to fd 2 and captured as well.
+
+```go
+var txnErr *sandlock.TxnError
+if errors.As(err, &txnErr) && txnErr.Kind == sandlock.TxnErrConflict {
+    out, err = txn.Run(ctx) // the change set is intact; retry
+}
+```
+
+A retry reclaims nothing. It runs a new branch, so the failed attempt's change
+set is still under `FSStorage` once the retry has committed, and a loop that
+retries contention without ever removing one fills the storage base with a full
+copy of what the stages wrote per attempt. `ListPreserved` finds them and
+removing `BranchDir` is what closes a recovery.
+
+### Recovering a preserved change set
+
+```go
+func ListPreserved(storageBase string) ([]PreservedBranch, error)
+func ReadPreserved(branchDir string) (*PreservedBranch, error)
+```
+
+`ListPreserved` sweeps a storage base for change sets that were left in branch
+storage rather than reclaimed, which is how work survives a commit that could
+not take the workdir lock. Finding nothing is an empty result, not an error.
+Sweep the same path you set as `FSStorage`; the storage base is not discoverable
+from an error.
+
+`PreservedBranch.Reason` says what state the workdir is in and so what a
+recovery may do. Two things are easy to get wrong:
+
+- `Deleted` is the half of the change set that `Upper` cannot carry. Copying
+  the upper over the workdir and nothing else resurrects every file the run
+  removed, so apply the deletions **first**.
+- `PreserveMergeInterrupted` is also what a merge that is **still running**
+  looks like, because the marker is written before the first destructive step.
+  Check that `PID` is not a live process before acting on such a record.
+
+Every path in a `PreservedBranch` carries its bytes verbatim and may not be
+valid UTF-8: these are addresses to open, and `BranchDir` is both what
+`ReadPreserved` takes and what to remove once the change set has been
+recovered. Do not decode or reformat them. `TxnOutcome.Changes` is the opposite:
+its paths are lossy on purpose, because they are names to show.
+
 ### Confine the current process
 
 ```go
@@ -227,10 +327,11 @@ func SyscallNr(name string) (int, error)
 
 ## Status
 
-This SDK covers the static policy surface, dynamic `policy_fn` callbacks, and
-in-process `Confine`. The following sandlock features are not yet bound and are
-tracked as follow-ups: custom seccomp handlers, pipelines, gather (fan-in), COW
-`fork`/`reduce`, and `checkpoint`/restore.
+This SDK covers the static policy surface, dynamic `policy_fn` callbacks,
+in-process `Confine`, and transactions with their recovery surface. The
+following sandlock features are not yet bound and are tracked as follow-ups:
+custom seccomp handlers, pipelines, gather (fan-in), COW `fork`/`reduce`, and
+`checkpoint`/restore.
 
 ## License
 
