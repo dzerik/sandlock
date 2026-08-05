@@ -12,7 +12,8 @@ from enum import IntEnum
 from pathlib import Path
 from typing import Any, NamedTuple, Sequence
 
-from .sandbox import Sandbox as PolicyDataclass
+from .exceptions import SandlockError, TransactionError
+from .sandbox import Change, Sandbox as PolicyDataclass
 
 # ----------------------------------------------------------------
 # Load the shared library
@@ -432,6 +433,57 @@ _lib.sandlock_gather_free.argtypes = [_c_gather_p]
 
 _lib.sandlock_string_free.restype = None
 _lib.sandlock_string_free.argtypes = [ctypes.c_char_p]
+
+# Transaction (RFC #65)
+_c_txn_p = ctypes.c_void_p
+_c_txn_outcome_p = ctypes.c_void_p
+
+_lib.sandlock_txn_new.restype = _c_txn_p
+_lib.sandlock_txn_new.argtypes = []
+
+_lib.sandlock_txn_add_stage.restype = None
+_lib.sandlock_txn_add_stage.argtypes = [
+    _c_txn_p, _c_policy_p, ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint,
+]
+
+_lib.sandlock_txn_commit_lock_wait_ms.restype = None
+_lib.sandlock_txn_commit_lock_wait_ms.argtypes = [_c_txn_p, ctypes.c_uint64]
+
+_lib.sandlock_txn_free.restype = None
+_lib.sandlock_txn_free.argtypes = [_c_txn_p]
+
+for _txn_entry in ("sandlock_txn_run", "sandlock_txn_dry_run"):
+    _fn = getattr(_lib, _txn_entry)
+    _fn.restype = _c_txn_outcome_p
+    _fn.argtypes = [
+        _c_txn_p, ctypes.c_uint64,
+        ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_char_p),
+    ]
+del _txn_entry, _fn
+
+_lib.sandlock_txn_outcome_disposition.restype = ctypes.c_int
+_lib.sandlock_txn_outcome_disposition.argtypes = [_c_txn_outcome_p]
+
+_lib.sandlock_txn_outcome_stages_len.restype = ctypes.c_size_t
+_lib.sandlock_txn_outcome_stages_len.argtypes = [_c_txn_outcome_p]
+
+_lib.sandlock_txn_outcome_stage_at.restype = _c_result_p
+_lib.sandlock_txn_outcome_stage_at.argtypes = [_c_txn_outcome_p, ctypes.c_size_t]
+
+_lib.sandlock_txn_outcome_changes_len.restype = ctypes.c_size_t
+_lib.sandlock_txn_outcome_changes_len.argtypes = [_c_txn_outcome_p]
+
+_lib.sandlock_txn_outcome_change_kind.restype = ctypes.c_char
+_lib.sandlock_txn_outcome_change_kind.argtypes = [_c_txn_outcome_p, ctypes.c_size_t]
+
+# Owned strings are read back as c_void_p, never c_char_p: ctypes copies a
+# c_char_p restype into a bytes object and drops the pointer that
+# sandlock_string_free needs.
+_lib.sandlock_txn_outcome_change_path.restype = ctypes.c_void_p
+_lib.sandlock_txn_outcome_change_path.argtypes = [_c_txn_outcome_p, ctypes.c_size_t]
+
+_lib.sandlock_txn_outcome_free.restype = None
+_lib.sandlock_txn_outcome_free.argtypes = [_c_txn_outcome_p]
 
 # Fork
 _INIT_FN_TYPE = ctypes.CFUNCTYPE(None)
@@ -1489,3 +1541,328 @@ class Pipeline:
             result.error = "Pipeline timed out"
 
         return result
+
+
+# ----------------------------------------------------------------
+# Transaction (RFC #65 Phase 1)
+# ----------------------------------------------------------------
+
+class TxnDisposition(IntEnum):
+    """What became of a transaction's shared upper layer.
+
+    Mirrors the C ``sandlock_txn_disposition``. Unlike the error taxonomy this
+    set is total: a run that produced an outcome landed in exactly one of these.
+    """
+
+    COMMITTED = 0
+    """Every stage exited 0 and the whole change set was merged into the workdir."""
+    DRY_RUN = 1
+    """The stages ran and the change set was reported, then discarded."""
+    ABORTED = 2
+    """A stage exited non-zero, or the run timed out; the workdir is untouched."""
+
+
+class TxnErrorKind(IntEnum):
+    """Why the core could not carry a transaction out.
+
+    Mirrors the C ``sandlock_txn_err_t``, which is append only: a discriminant
+    this SDK does not name arrives as :attr:`UNKNOWN` rather than as a
+    plausible-looking neighbour.
+
+    The two ways a commit can fail to take the workdir lock are deliberately
+    different values, because the answers differ: :attr:`CONFLICT` is retryable
+    and :attr:`COMMIT_LOCK` is not.
+    """
+
+    INVALID = 1
+    """The stage set was refused before anything ran; fix the call."""
+    BRANCH = 2
+    """The copy-on-write branch could not be created; no stage ran."""
+    STAGE = 3
+    """A stage could not be driven at all (not the same as a non-zero exit)."""
+    CONFLICT = 4
+    """Gave up waiting for another commit to release the workdir lock.
+
+    The workdir is untouched and this transaction's change set was preserved,
+    so retrying is the expected response."""
+    COMMIT_LOCK = 5
+    """The workdir lock could not be taken for a reason other than contention.
+
+    As with :attr:`CONFLICT` the workdir is untouched and the change set was
+    preserved, but the reason will not go away on its own: retrying is not."""
+    MERGE = 6
+    """The merge failed, in one of two states this one code does not separate.
+
+    Either the merge ran partway, leaving the workdir half modified with
+    whatever did not land preserved, or the marker could not be written at
+    all, in which case the workdir was never touched and no sweep will ever
+    find the change set. Only the core's message says which, so this is the
+    one kind to read before acting: an empty :func:`list_preserved` here does
+    not mean the merge finished."""
+    COMMIT_ABANDONED = 7
+    """The commit never ran to completion: the runtime was shut down under it.
+
+    This is the one failure that cannot say what state it left behind, neither
+    whether the workdir was written to nor whether the change set survives
+    anywhere. An empty :func:`list_preserved` proves nothing here either."""
+    UNKNOWN = 8
+    """A failure this ABI level does not name. The message still explains it."""
+
+
+@dataclass(frozen=True)
+class TxnOutcome:
+    """What a transaction did.
+
+    ``stages`` holds one :class:`Result` per stage that ran, in order; a run
+    that aborted stops at the stage that failed, so this can be shorter than
+    the stage set. Every stage inherits this process's standard input and
+    output, so a stage result never carries captured stdout; stderr is both
+    written through and captured.
+    """
+
+    disposition: TxnDisposition
+    stages: list[Result]
+    changes: list[Change]
+    """The change set: added, modified and deleted paths relative to the workdir.
+
+    Populated for a dry run. A committed run reports what it merged."""
+
+    @property
+    def committed(self) -> bool:
+        """True only when the change set reached the workdir."""
+        return self.disposition is TxnDisposition.COMMITTED
+
+
+def _take_owned_bytes(raw) -> bytes | None:
+    """Consume an owned C string from the ABI as raw bytes, freeing it."""
+    if not raw:
+        return None
+    c_str = ctypes.cast(raw, ctypes.c_char_p)
+    value = c_str.value
+    _lib.sandlock_string_free(c_str)
+    return value
+
+
+def _txn_failure(code: int, message: bytes | None) -> Exception:
+    """Turn the ABI's failure discriminant into the exception for it."""
+    text = message.decode("utf-8", "replace") if message else None
+    if code < 0:
+        # Negative values are outside the taxonomy on purpose and carry no
+        # message: they are not verdicts on the transaction. -1 means this
+        # layer passed a null handle, -2 that the thread's async runtime could
+        # not be built. Reporting either as a TxnErrorKind would put a
+        # transaction verdict on something that is not one.
+        detail = {
+            -1: "a null transaction handle reached the core; this is a bug in the SDK",
+            -2: "the sandlock async runtime for this thread could not be built",
+        }.get(code, f"the transaction ABI returned {code}")
+        return SandlockError(f"sandlock transaction could not run: {detail}")
+    try:
+        kind = TxnErrorKind(code)
+    except ValueError:
+        # A core newer than this SDK. UNKNOWN says exactly that; guessing at a
+        # named neighbour would put words in the core's mouth, and the core's
+        # own message comes through untouched either way.
+        kind = TxnErrorKind.UNKNOWN
+    return TransactionError(text or f"transaction failed ({kind.name})", kind)
+
+
+_TXN_MAX_ARGC = 4096
+"""The largest ``argc`` ``sandlock_txn_add_stage`` reads; above it the stage is dropped."""
+
+
+def _txn_stage_argv(args: Sequence[str], index: int):
+    """Encode one stage's argv, refusing the shapes the ABI cannot carry.
+
+    ``sandlock_txn_add_stage`` returns void, so a stage it cannot read is
+    dropped with nothing said. The header argues that this is safe because the
+    core then refuses the stage set it was actually given, and that holds only
+    while what is left is invalid. Drop the middle stage of three and two
+    valid stages remain: the core runs them, commits, and reports success for
+    a change set nobody described. That is the all-or-nothing promise broken
+    silently, so the call site finds out here instead, with the stage named.
+
+    This asks only whether the argument survives the crossing, not whether the
+    command should be allowed to run: what a stage may do stays the core's
+    question, answered when the transaction runs.
+    """
+    if len(args) == 0:
+        raise ValueError(
+            f"stage {index} has an empty argv; a stage needs a program to run"
+        )
+    if len(args) > _TXN_MAX_ARGC:
+        raise ValueError(
+            f"stage {index} has {len(args)} arguments; the transaction ABI "
+            f"carries at most {_TXN_MAX_ARGC}"
+        )
+    encoded = []
+    for position, arg in enumerate(args):
+        raw = _encode(arg)
+        try:
+            raw.decode("utf-8")
+        except UnicodeDecodeError:
+            raise ValueError(
+                f"argument {position} of stage {index} is not valid UTF-8: "
+                f"{raw!r}; the transaction ABI cannot carry it"
+            ) from None
+        encoded.append(raw)
+    argv_type = ctypes.c_char_p * len(encoded)
+    return argv_type(*encoded), ctypes.c_uint(len(encoded))
+
+
+def _txn_millis(seconds: float | None, what: str, *, none_is: int | None) -> int | None:
+    """Convert a duration in seconds to the whole milliseconds the ABI takes.
+
+    The ABI reads 0 ms as "use the core default", so a wait that rounds down to
+    zero cannot be expressed. Rounding it up, or letting it pass as 0, would
+    silently substitute a duration the caller did not ask for, so it is
+    refused instead.
+    """
+    if seconds is None:
+        return none_is
+    ms = int(seconds * 1000)
+    if ms <= 0:
+        raise ValueError(
+            f"{what}={seconds!r} rounds down to 0 ms, which the transaction ABI "
+            f"reads as 'no {what}'; the shortest value it can express is 0.001"
+        )
+    return ms
+
+
+class Transaction:
+    """Run stages over one shared copy-on-write workdir, committing all or none.
+
+    The stages run in order over a single upper layer, so a later stage reads
+    what an earlier one wrote. If every stage exits 0 the whole change set is
+    merged into the workdir in one step; if any stage exits non-zero, or the
+    run times out, nothing is merged and the workdir is left as it was.
+
+    Usage::
+
+        sb = Sandbox(workdir="/w", fs_storage="/s", on_error=BranchAction.COMMIT)
+        outcome = Transaction([
+            Stage(sb, ["sh", "-c", "echo plan > a.txt"]),
+            Stage(sb, ["sh", "-c", "cat a.txt > b.txt"]),
+        ]).run()
+        assert outcome.committed
+
+    Every stage policy must leave ``on_exit`` and ``on_error`` at the core's
+    default of ``commit``: the transaction owns commit and abort for the whole
+    set, so a per-stage branch action contradicts it and the core refuses the
+    stage set. :class:`~sandlock.Sandbox` defaults ``on_error`` to ``abort``
+    and cannot express "not set", so a stage policy has to say
+    ``on_error=BranchAction.COMMIT``.
+
+    This is not a context manager. ``run()`` is one atomic call over a stage
+    list fixed in advance; there is no phase in which a transaction is open and
+    work happens inside it, so ``with`` would wrap nothing.
+    """
+
+    def __init__(
+        self,
+        stages: Sequence[Stage],
+        commit_lock_wait: float | None = None,
+    ):
+        """
+        :param stages: the stages, in order. The core requires at least two.
+        :param commit_lock_wait: how long the commit may wait for the workdir
+            lock, in seconds; ``None`` leaves the core's default. Exceeding it
+            raises :class:`TransactionError` with ``kind == CONFLICT``.
+        """
+        self.stages = list(stages)
+        self.commit_lock_wait = commit_lock_wait
+
+    def run(self, timeout: float | None = None) -> TxnOutcome:
+        """Run every stage, then commit the change set if all of them exited 0.
+
+        :param timeout: bounds the stage phase only, never the commit. A run
+            that exceeds it is an ``ABORTED`` outcome, not an exception.
+        :raises TransactionError: the core reached a named verdict and could
+            not carry the transaction out; ``kind`` says which.
+        :raises SandlockError: the transaction never reached the core, so
+            there is no verdict on it. Catching only ``TransactionError``
+            misses this.
+        :raises ValueError: a stage or a duration cannot be represented on
+            this ABI. ``commit_lock_wait`` is read here rather than in the
+            constructor, so a value set there is refused at this call.
+        """
+        return self._execute(_lib.sandlock_txn_run, timeout)
+
+    def dry_run(self, timeout: float | None = None) -> TxnOutcome:
+        """Run every stage and report the change set without committing it.
+
+        The stages really execute; only the fate of the shared upper differs.
+        The workdir is never written to and the commit lock is never taken, so
+        a dry run cannot conflict with anything.
+
+        :param timeout: as for :meth:`run`.
+        :raises TransactionError: as for :meth:`run`, minus the commit
+            verdicts a dry run never reaches.
+        :raises SandlockError: as for :meth:`run`.
+        :raises ValueError: as for :meth:`run`.
+        """
+        return self._execute(_lib.sandlock_txn_dry_run, timeout)
+
+    def _execute(self, entry, timeout: float | None) -> TxnOutcome:
+        txn_p = _lib.sandlock_txn_new()
+        if not txn_p:
+            raise SandlockError("could not allocate a sandlock transaction")
+
+        try:
+            # Every native policy is built up front and kept in a list that
+            # outlives the run. Sandbox._ensure_native rebuilds and overwrites
+            # Sandbox._native on each call, so two stages sharing one Sandbox
+            # would drop the first policy the moment the second is built. The
+            # core clones the policy, but a cloned policy_fn holds a raw
+            # pointer into the ctypes trampoline the dropped wrapper owns, so
+            # an early release leaves a running stage calling freed memory.
+            # One Sandbox across the stages is the documented shape, and this
+            # list is what makes it safe.
+            natives = [stage.sandbox._ensure_native() for stage in self.stages]
+            for index, (stage, native) in enumerate(zip(self.stages, natives)):
+                argv, argc = _txn_stage_argv(stage.args, index)
+                _lib.sandlock_txn_add_stage(txn_p, native.ptr, argv, argc)
+            wait_ms = _txn_millis(self.commit_lock_wait, "commit_lock_wait", none_is=None)
+            if wait_ms is not None:
+                _lib.sandlock_txn_commit_lock_wait_ms(txn_p, wait_ms)
+            timeout_ms = _txn_millis(timeout, "timeout", none_is=0)
+        except BaseException:
+            # Building the transaction is the only path on which this layer
+            # still owns the handle, and so the only one that may free it.
+            _lib.sandlock_txn_free(txn_p)
+            raise
+
+        err = ctypes.c_int(0)
+        err_msg = ctypes.c_char_p()
+        outcome_p = entry(txn_p, timeout_ms, ctypes.byref(err), ctypes.byref(err_msg))
+        # The entry point consumed the handle on every path, including failure.
+        # Freeing it now would be a double free and reusing it a use after
+        # free, so the name goes away here rather than staying in scope.
+        del txn_p
+
+        if not outcome_p:
+            raise _txn_failure(err.value, err_msg.value if err_msg else None)
+
+        try:
+            return TxnOutcome(
+                disposition=TxnDisposition(_lib.sandlock_txn_outcome_disposition(outcome_p)),
+                # Stage results are BORROWED from the outcome: read, never free.
+                stages=[
+                    _result_from_ptr(_lib.sandlock_txn_outcome_stage_at(outcome_p, i))
+                    for i in range(_lib.sandlock_txn_outcome_stages_len(outcome_p))
+                ],
+                changes=[
+                    Change(
+                        kind=_lib.sandlock_txn_outcome_change_kind(outcome_p, i).decode(),
+                        # Lossy on purpose: a change path is a name to show.
+                        path=(_take_owned_bytes(
+                            _lib.sandlock_txn_outcome_change_path(outcome_p, i)
+                        ) or b"").decode("utf-8", "replace"),
+                    )
+                    for i in range(_lib.sandlock_txn_outcome_changes_len(outcome_p))
+                ],
+            )
+        finally:
+            # Everything above must be materialised before this runs: the stage
+            # pointers die with the outcome.
+            _lib.sandlock_txn_outcome_free(outcome_p)

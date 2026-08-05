@@ -10,6 +10,7 @@ from ._sdk import (
     Stage, Pipeline, Result, ExitReason, SyscallEvent, PolicyContext, Checkpoint, SkippedFd,
     NamedStage, Gather, GatherPipeline,
     Protection,
+    Transaction, TxnOutcome, TxnDisposition, TxnErrorKind,
     landlock_abi_version, min_landlock_abi, confine,
 )
 from .inputs import inputs
@@ -31,6 +32,7 @@ from .exceptions import (
     NotifError,
     BranchError,
     BranchConflictError,
+    TransactionError,
 )
 
 __all__ = [
@@ -48,6 +50,11 @@ __all__ = [
     "NamedStage",
     "Gather",
     "GatherPipeline",
+    # Transactions (RFC #65)
+    "Transaction",
+    "TxnOutcome",
+    "TxnDisposition",
+    "TxnErrorKind",
     "inputs",
     "BranchAction",
     "parse_ports",
@@ -81,4 +88,5 @@ __all__ = [
     "NotifError",
     "BranchError",
     "BranchConflictError",
+    "TransactionError",
 ]
