@@ -11,6 +11,7 @@ from ._sdk import (
     NamedStage, Gather, GatherPipeline,
     Protection,
     Transaction, TxnOutcome, TxnDisposition, TxnErrorKind,
+    PreservedBranch, PreserveReason, list_preserved, read_preserved,
     landlock_abi_version, min_landlock_abi, confine,
 )
 from .inputs import inputs
@@ -55,6 +56,10 @@ __all__ = [
     "TxnOutcome",
     "TxnDisposition",
     "TxnErrorKind",
+    "PreservedBranch",
+    "PreserveReason",
+    "list_preserved",
+    "read_preserved",
     "inputs",
     "BranchAction",
     "parse_ports",

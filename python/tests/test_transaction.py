@@ -24,6 +24,8 @@ import pytest
 
 from sandlock import (
     BranchAction,
+    PreserveReason,
+    PreservedBranch,
     Sandbox,
     SandlockError,
     Stage,
@@ -31,6 +33,8 @@ from sandlock import (
     TransactionError,
     TxnDisposition,
     TxnErrorKind,
+    list_preserved,
+    read_preserved,
 )
 from sandlock import _sdk
 
@@ -280,7 +284,7 @@ def test_a_stage_that_sets_its_own_branch_action_is_rejected(tmp_path):
 
 
 @requires_sandbox
-def test_a_busy_commit_lock_is_a_conflict(tmp_path):
+def test_a_busy_commit_lock_is_a_conflict_and_the_change_set_survives(tmp_path):
     """Contention is retryable, and it says so with its own discriminant."""
     workdir, storage = _workdir(tmp_path)
     sb = _policy(workdir, storage)
@@ -299,6 +303,18 @@ def test_a_busy_commit_lock_is_a_conflict(tmp_path):
     assert ei.value.kind is TxnErrorKind.CONFLICT, \
         "contention is CONFLICT; COMMIT_LOCK is the lock failing for another reason"
     assert not (workdir / "a.txt").exists(), "the workdir was never touched"
+
+    preserved = list_preserved(storage)
+    assert len(preserved) == 1
+    entry = preserved[0]
+    assert entry.reason is PreserveReason.COMMIT_DEFERRED
+    assert entry.pid == os.getpid(), \
+        "the marker names this process, which is how a live merge is told from a dead one"
+    assert entry.workdir == os.fsencode(workdir)
+    upper = Path(os.fsdecode(entry.upper))
+    assert (upper / "a.txt").read_text() == "plan\n", \
+        "the whole change set is on disk, which is what makes a retry safe"
+    assert (upper / "b.txt").read_text() == "plan\n"
 
 
 @requires_sandbox
@@ -460,6 +476,7 @@ def _header_constants(prefix: str) -> dict[str, int]:
 @pytest.mark.parametrize("prefix,enum,drop", [
     ("SANDLOCK_TXN_", TxnErrorKind, {"OK"}),
     ("SANDLOCK_TXN_DISPOSITION_", TxnDisposition, set()),
+    ("SANDLOCK_PRESERVE_", PreserveReason, set()),
 ])
 def test_discriminants_match_the_c_header(prefix, enum, drop):
     """Guards the one mistake that silently mislabels every failure: a shifted map."""
@@ -548,6 +565,129 @@ def test_a_rejected_transaction_can_be_rebuilt_and_run(tmp_path):
         with pytest.raises(TransactionError) as ei:
             rejected.run()
         assert ei.value.kind is TxnErrorKind.INVALID
+
+
+# ----------------------------------------------------------------
+# Recovery
+# ----------------------------------------------------------------
+
+@requires_sandbox
+def test_preserved_paths_survive_a_storage_base_that_is_not_utf8(tmp_path):
+    """Preserved paths are addresses to open, so they cross the boundary as bytes."""
+    workdir, storage = _workdir(tmp_path)
+    (workdir / "victim.txt").write_text("bye\n")
+    sb = _policy(workdir, storage)
+
+    held = os.open(str(workdir), os.O_RDONLY)
+    try:
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(TransactionError):
+            Transaction([
+                Stage(sb, ["sh", "-c", "rm victim.txt"]),
+                Stage(sb, ["sh", "-c", "echo new > n.txt"]),
+            ], commit_lock_wait=0.2).run()
+    finally:
+        os.close(held)
+
+    undecodable = tmp_path / os.fsdecode(b"st-\xff\xfe")
+    os.rename(storage, undecodable)
+
+    swept = list_preserved(undecodable)
+    assert len(swept) == 1
+    entry = swept[0]
+    assert isinstance(entry.branch_dir, bytes)
+    assert entry.branch_dir.startswith(os.fsencode(undecodable))
+    assert entry.deleted == [b"victim.txt"], "the deletions are the half the upper cannot carry"
+
+    again = read_preserved(entry.branch_dir)
+    assert again is not None, "what the sweep reported can be fed straight back"
+    assert again.reason is entry.reason is PreserveReason.COMMIT_DEFERRED
+
+    lossy = entry.branch_dir.decode("utf-8", "replace").encode("utf-8")
+    assert lossy != entry.branch_dir
+    assert read_preserved(lossy) is None, \
+        "a decoded path names nothing, which is why these stay bytes"
+
+
+def test_list_preserved_of_a_clean_base_is_empty(tmp_path):
+    assert list_preserved(tmp_path) == []
+    assert list_preserved(tmp_path / "was-never-created") == []
+
+
+def test_read_preserved_of_a_directory_without_a_marker_is_none(tmp_path):
+    assert read_preserved(tmp_path) is None
+
+
+@requires_sandbox
+def test_a_reason_this_sdk_cannot_name_hides_none_of_the_others(tmp_path, monkeypatch):
+    """The reason list is append only, so a newer core is a case, not a crash.
+
+    A reason decides what a recovery may do, so a record carrying one this SDK
+    cannot read is left out. What must not happen is the sweep failing over
+    it: that would put the recoverable change sets out of reach because of a
+    record nobody asked about. The core skips branch directories it cannot
+    parse for the same reason, and this keeps the binding to that promise.
+    """
+    workdir, storage = _workdir(tmp_path)
+    sb = _policy(workdir, storage)
+    for i in range(2):
+        held = os.open(str(workdir), os.O_RDONLY)
+        try:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with pytest.raises(TransactionError):
+                Transaction([
+                    Stage(sb, ["sh", "-c", f"echo plan > a{i}.txt"]),
+                    Stage(sb, ["sh", "-c", "true"]),
+                ], commit_lock_wait=0.2).run()
+        finally:
+            os.close(held)
+
+    assert len(list_preserved(storage)) == 2, "both runs left a change set behind"
+
+    real = _sdk._lib.sandlock_preserved_reason
+    unnamed = max(PreserveReason) + 1
+    calls: list[int] = []
+
+    def one_reason_from_the_future(p):
+        calls.append(p)
+        return unnamed if len(calls) == 1 else real(p)
+
+    monkeypatch.setattr(_sdk._lib, "sandlock_preserved_reason", one_reason_from_the_future)
+    swept = list_preserved(storage)
+    monkeypatch.undo()
+
+    assert len(swept) == 1, "the record nobody can act on did not take the other one with it"
+    assert swept[0].reason is PreserveReason.COMMIT_DEFERRED
+    assert read_preserved(swept[0].branch_dir) == swept[0], \
+        "and what survived the sweep is still a usable address"
+
+    monkeypatch.setattr(_sdk._lib, "sandlock_preserved_reason", lambda p: unnamed)
+    assert read_preserved(swept[0].branch_dir) is None, \
+        "read on its own reports the same record as one it cannot speak for"
+
+
+@requires_sandbox
+def test_preserved_branch_accepts_a_path_object(tmp_path):
+    """``list_preserved`` takes what the caller already has: str, bytes or Path."""
+    workdir, storage = _workdir(tmp_path)
+    sb = _policy(workdir, storage)
+    held = os.open(str(workdir), os.O_RDONLY)
+    try:
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(TransactionError):
+            Transaction([
+                Stage(sb, ["sh", "-c", "echo plan > a.txt"]),
+                Stage(sb, ["sh", "-c", "true"]),
+            ], commit_lock_wait=0.2).run()
+    finally:
+        os.close(held)
+
+    from_path = list_preserved(storage)
+    from_str = list_preserved(str(storage))
+    from_bytes = list_preserved(os.fsencode(storage))
+    assert from_path == from_str == from_bytes
+    assert isinstance(from_path[0], PreservedBranch)
+    assert read_preserved(Path(os.fsdecode(from_path[0].branch_dir))) == from_path[0]
 
 
 # ----------------------------------------------------------------

@@ -437,6 +437,8 @@ _lib.sandlock_string_free.argtypes = [ctypes.c_char_p]
 # Transaction (RFC #65)
 _c_txn_p = ctypes.c_void_p
 _c_txn_outcome_p = ctypes.c_void_p
+_c_preserved_list_p = ctypes.c_void_p
+_c_preserved_p = ctypes.c_void_p
 
 _lib.sandlock_txn_new.restype = _c_txn_p
 _lib.sandlock_txn_new.argtypes = []
@@ -484,6 +486,47 @@ _lib.sandlock_txn_outcome_change_path.argtypes = [_c_txn_outcome_p, ctypes.c_siz
 
 _lib.sandlock_txn_outcome_free.restype = None
 _lib.sandlock_txn_outcome_free.argtypes = [_c_txn_outcome_p]
+
+# Preserved change sets (recovery)
+_lib.sandlock_preserved_list.restype = _c_preserved_list_p
+_lib.sandlock_preserved_list.argtypes = [ctypes.c_char_p]
+
+_lib.sandlock_preserved_list_len.restype = ctypes.c_size_t
+_lib.sandlock_preserved_list_len.argtypes = [_c_preserved_list_p]
+
+_lib.sandlock_preserved_list_at.restype = _c_preserved_p
+_lib.sandlock_preserved_list_at.argtypes = [_c_preserved_list_p, ctypes.c_size_t]
+
+_lib.sandlock_preserved_read.restype = _c_preserved_p
+_lib.sandlock_preserved_read.argtypes = [ctypes.c_char_p]
+
+for _preserved_str in (
+    "sandlock_preserved_branch_dir",
+    "sandlock_preserved_upper",
+    "sandlock_preserved_workdir",
+):
+    _fn = getattr(_lib, _preserved_str)
+    _fn.restype = ctypes.c_void_p
+    _fn.argtypes = [_c_preserved_p]
+del _preserved_str, _fn
+
+_lib.sandlock_preserved_reason.restype = ctypes.c_int
+_lib.sandlock_preserved_reason.argtypes = [_c_preserved_p]
+
+_lib.sandlock_preserved_pid.restype = ctypes.c_uint32
+_lib.sandlock_preserved_pid.argtypes = [_c_preserved_p]
+
+_lib.sandlock_preserved_deleted_len.restype = ctypes.c_size_t
+_lib.sandlock_preserved_deleted_len.argtypes = [_c_preserved_p]
+
+_lib.sandlock_preserved_deleted_at.restype = ctypes.c_void_p
+_lib.sandlock_preserved_deleted_at.argtypes = [_c_preserved_p, ctypes.c_size_t]
+
+_lib.sandlock_preserved_list_free.restype = None
+_lib.sandlock_preserved_list_free.argtypes = [_c_preserved_list_p]
+
+_lib.sandlock_preserved_free.restype = None
+_lib.sandlock_preserved_free.argtypes = [_c_preserved_p]
 
 # Fork
 _INIT_FN_TYPE = ctypes.CFUNCTYPE(None)
@@ -1584,7 +1627,7 @@ class TxnErrorKind(IntEnum):
     """Gave up waiting for another commit to release the workdir lock.
 
     The workdir is untouched and this transaction's change set was preserved,
-    so retrying is the expected response."""
+    so retrying is the expected response. See :func:`list_preserved`."""
     COMMIT_LOCK = 5
     """The workdir lock could not be taken for a reason other than contention.
 
@@ -1607,6 +1650,24 @@ class TxnErrorKind(IntEnum):
     anywhere. An empty :func:`list_preserved` proves nothing here either."""
     UNKNOWN = 8
     """A failure this ABI level does not name. The message still explains it."""
+
+
+class PreserveReason(IntEnum):
+    """Why a change set is sitting in storage instead of in the workdir.
+
+    Mirrors the C ``sandlock_preserve_reason_t``.
+    """
+
+    MERGE_INTERRUPTED = 0
+    """The workdir may be PARTIALLY merged.
+
+    A merge writes its marker before its first destructive step, so a merge
+    still in flight and a merge that died look identical. Check that
+    :attr:`PreservedBranch.pid` is not a live process before acting on one."""
+    COMMIT_DEFERRED = 1
+    """The workdir is untouched and the whole change set is here."""
+    KEPT = 2
+    """The branch was kept on purpose (``on_exit=keep``)."""
 
 
 @dataclass(frozen=True)
@@ -1633,6 +1694,43 @@ class TxnOutcome:
         return self.disposition is TxnDisposition.COMMITTED
 
 
+@dataclass(frozen=True)
+class PreservedBranch:
+    """A change set a failed commit left in storage, and where to find it.
+
+    The paths are ``bytes``, not ``str``, and that is not an oversight. These
+    are addresses to open: :attr:`branch_dir` goes back into
+    :func:`read_preserved` and names the directory to remove once the change
+    set has been recovered. A path is bytes on Linux, so decoding one with a
+    replacement character produces a name that opens nothing. Use
+    :func:`os.fsdecode` when a name is wanted for display.
+
+    ``TxnOutcome.changes`` is the deliberate opposite: those paths are ``str``
+    because they are shown, not opened, and the ABI narrows them lossily.
+    """
+
+    branch_dir: bytes
+    """The branch's private storage directory: what to pass back to
+    :func:`read_preserved`, and what to remove after recovery."""
+    upper: bytes
+    """The copy-on-write upper holding the added and modified files."""
+    workdir: bytes
+    """The workdir this change set was meant for."""
+    deleted: list[bytes]
+    """Paths the run deleted, relative to the workdir, in sorted order.
+
+    This is the half of the change set the upper cannot carry. A recovery
+    applies these FIRST, then copies the upper over the workdir."""
+    reason: PreserveReason
+    pid: int
+    """The process that preserved the change set.
+
+    Load bearing for :attr:`PreserveReason.MERGE_INTERRUPTED`: the marker is
+    written before the first destructive step, so this pid is the only thing
+    that separates a merge in flight from one that died. Beyond that it is
+    triage only, since a pid can be reused."""
+
+
 def _take_owned_bytes(raw) -> bytes | None:
     """Consume an owned C string from the ABI as raw bytes, freeing it."""
     if not raw:
@@ -1641,6 +1739,53 @@ def _take_owned_bytes(raw) -> bytes | None:
     value = c_str.value
     _lib.sandlock_string_free(c_str)
     return value
+
+
+def _fspath_bytes(path, what: str) -> bytes:
+    """Encode a path for the preserved-change-set ABI, which reads bytes.
+
+    A NUL is refused rather than truncated at: C would stop there and open a
+    different directory than the one named.
+    """
+    raw = os.fsencode(path)
+    if b"\x00" in raw:
+        raise ValueError(f"NUL byte in {what}: {raw!r}")
+    return raw
+
+
+class _UnnamedPreserveReason(Exception):
+    """A record whose reason this ABI level has no name for.
+
+    Internal: it never leaves this module. The reason is what decides what a
+    recovery may do, so a record carrying one this SDK cannot read is a record
+    it cannot say anything safe about.
+    """
+
+
+def _preserved_from_ptr(p) -> PreservedBranch:
+    """Copy a preserved record out of a pointer, borrowed or owned.
+
+    Every accessor hands back an owned string even when the record itself is a
+    borrow from a list, so the strings are consumed here either way.
+
+    The reason is read first, before anything is allocated, so that a reason
+    this SDK cannot name costs nothing to walk away from.
+    """
+    try:
+        reason = PreserveReason(_lib.sandlock_preserved_reason(p))
+    except ValueError as exc:
+        raise _UnnamedPreserveReason(str(exc)) from None
+    return PreservedBranch(
+        branch_dir=_take_owned_bytes(_lib.sandlock_preserved_branch_dir(p)) or b"",
+        upper=_take_owned_bytes(_lib.sandlock_preserved_upper(p)) or b"",
+        workdir=_take_owned_bytes(_lib.sandlock_preserved_workdir(p)) or b"",
+        deleted=[
+            _take_owned_bytes(_lib.sandlock_preserved_deleted_at(p, i)) or b""
+            for i in range(_lib.sandlock_preserved_deleted_len(p))
+        ],
+        reason=reason,
+        pid=_lib.sandlock_preserved_pid(p),
+    )
 
 
 def _txn_failure(code: int, message: bytes | None) -> Exception:
@@ -1866,3 +2011,56 @@ class Transaction:
             # Everything above must be materialised before this runs: the stage
             # pointers die with the outcome.
             _lib.sandlock_txn_outcome_free(outcome_p)
+
+
+def list_preserved(storage_base) -> list[PreservedBranch]:
+    """Sweep ``storage_base`` for change sets a failed commit left behind.
+
+    ``storage_base`` is the ``fs_storage`` the stage policies were given; a
+    caller that means to recover programmatically should set it rather than
+    parse the failure message. Accepts anything :func:`os.fsencode` takes.
+
+    A base holding no preserved work and a base that cannot be read both sweep
+    to an empty list: neither is a failure of this call.
+
+    The reason list is append only, so a core newer than this SDK can report a
+    reason it has no name for. Such a record is left out rather than raised
+    over, for the same reason the core skips a branch directory it cannot
+    parse: one record nobody can act on must not hide the ones that can be
+    recovered.
+    """
+    list_p = _lib.sandlock_preserved_list(_fspath_bytes(storage_base, "storage_base"))
+    if not list_p:
+        raise SandlockError("could not sweep for preserved change sets")
+    swept = []
+    try:
+        for i in range(_lib.sandlock_preserved_list_len(list_p)):
+            try:
+                swept.append(_preserved_from_ptr(_lib.sandlock_preserved_list_at(list_p, i)))
+            except _UnnamedPreserveReason:
+                continue
+    finally:
+        _lib.sandlock_preserved_list_free(list_p)
+    return swept
+
+
+def read_preserved(branch_dir) -> PreservedBranch | None:
+    """Read one preserved change set, or ``None`` if there is no usable record.
+
+    ``None`` covers every way the directory is not one: unreadable, holding no
+    marker, the live storage of a running process, a marker a crash cut short,
+    or a reason this SDK has no name for. Those are not distinguished on
+    purpose, because acting on a record that was only half understood would
+    target the wrong workdir.
+
+    Pass back what :attr:`PreservedBranch.branch_dir` reported.
+    """
+    p = _lib.sandlock_preserved_read(_fspath_bytes(branch_dir, "branch_dir"))
+    if not p:
+        return None
+    try:
+        return _preserved_from_ptr(p)
+    except _UnnamedPreserveReason:
+        return None
+    finally:
+        _lib.sandlock_preserved_free(p)
