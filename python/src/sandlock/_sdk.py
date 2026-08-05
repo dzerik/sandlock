@@ -755,6 +755,25 @@ def _read_result_bytes(result_p, fn) -> bytes:
         return b""
     return ctypes.string_at(ptr, length.value)
 
+def _result_from_ptr(result_p) -> Result:
+    """Materialise a ``Result`` from a result pointer WITHOUT taking ownership.
+
+    Every field is copied out here, so the caller decides what happens to the
+    pointer afterwards: a pointer from ``sandlock_run`` is the caller's to free,
+    while one from ``sandlock_txn_outcome_stage_at`` is borrowed from its
+    outcome and must never be freed. Keeping the read in one place is what
+    makes that difference a caller's decision instead of a rule repeated at
+    every call site.
+    """
+    return Result(
+        success=bool(_lib.sandlock_result_success(result_p)),
+        exit_code=_lib.sandlock_result_exit_code(result_p),
+        reason=ExitReason(_lib.sandlock_result_reason(result_p)),
+        signal=_lib.sandlock_result_signal(result_p),
+        stdout=_read_result_bytes(result_p, _lib.sandlock_result_stdout_bytes),
+        stderr=_read_result_bytes(result_p, _lib.sandlock_result_stderr_bytes),
+    )
+
 
 # ----------------------------------------------------------------
 # Result
@@ -1401,27 +1420,13 @@ class GatherPipeline:
             error = "Gather timed out" if timeout else "Gather failed"
             return Result(success=False, exit_code=-1, error=error)
 
-        exit_code = _lib.sandlock_result_exit_code(result_p)
-        success = _lib.sandlock_result_success(result_p)
-        reason = ExitReason(_lib.sandlock_result_reason(result_p))
-        signal = _lib.sandlock_result_signal(result_p)
-        out_bytes = _read_result_bytes(result_p, _lib.sandlock_result_stdout_bytes)
-        stderr = _read_result_bytes(result_p, _lib.sandlock_result_stderr_bytes)
+        result = _result_from_ptr(result_p)
         _lib.sandlock_result_free(result_p)
 
-        error = None
-        if reason == ExitReason.TIMEOUT:
-            error = "Gather timed out"
+        if result.reason == ExitReason.TIMEOUT:
+            result.error = "Gather timed out"
 
-        return Result(
-            success=bool(success),
-            exit_code=exit_code,
-            reason=reason,
-            signal=signal,
-            stdout=out_bytes,
-            stderr=stderr,
-            error=error,
-        )
+        return result
 
 
 class Pipeline:
@@ -1472,29 +1477,15 @@ class Pipeline:
             error = "Pipeline timed out" if timeout else "Pipeline failed"
             return Result(success=False, exit_code=-1, error=error)
 
-        exit_code = _lib.sandlock_result_exit_code(result_p)
-        success = _lib.sandlock_result_success(result_p)
-        reason = ExitReason(_lib.sandlock_result_reason(result_p))
-        signal = _lib.sandlock_result_signal(result_p)
-        out_bytes = _read_result_bytes(result_p, _lib.sandlock_result_stdout_bytes)
-        stderr = _read_result_bytes(result_p, _lib.sandlock_result_stderr_bytes)
+        result = _result_from_ptr(result_p)
         _lib.sandlock_result_free(result_p)
 
         # Handle stdout fd redirection
-        if stdout is not None and out_bytes:
-            os.write(stdout, out_bytes)
-            out_bytes = b""
+        if stdout is not None and result.stdout:
+            os.write(stdout, result.stdout)
+            result.stdout = b""
 
-        error = None
-        if reason == ExitReason.TIMEOUT:
-            error = "Pipeline timed out"
+        if result.reason == ExitReason.TIMEOUT:
+            result.error = "Pipeline timed out"
 
-        return Result(
-            success=bool(success),
-            exit_code=exit_code,
-            reason=reason,
-            signal=signal,
-            stdout=out_bytes,
-            stderr=stderr,
-            error=error,
-        )
+        return result
