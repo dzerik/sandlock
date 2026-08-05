@@ -434,6 +434,44 @@ func TestTransactionConflictIsNotCommitLockAndIsRetryable(t *testing.T) {
 	}
 	mustNotExist(t, filepath.Join(wd, "a.txt"))
 
+	// The change set is the one thing the caller cannot reconstruct from
+	// anywhere else, so the sweep has to find it.
+	preserved, err := sandlock.ListPreserved(st)
+	if err != nil {
+		t.Fatalf("ListPreserved: %v", err)
+	}
+	if len(preserved) != 1 {
+		t.Fatalf("preserved change sets = %d, want 1", len(preserved))
+	}
+	p := preserved[0]
+	if p.Reason != sandlock.PreserveCommitDeferred {
+		t.Errorf("reason = %v, want commit-deferred: the merge never started, so the workdir is untouched", p.Reason)
+	}
+	if p.PID != uint32(os.Getpid()) {
+		t.Errorf("PID = %d, want %d: the record names the process that preserved it", p.PID, os.Getpid())
+	}
+	if len(p.Deleted) != 0 {
+		t.Errorf("deleted = %v, want none: the transaction deleted nothing", p.Deleted)
+	}
+	if got := mustRead(t, filepath.Join(p.Upper, "b.txt")); got != "built\n" {
+		t.Errorf("preserved upper b.txt = %q, want %q: the last stage's write must survive", got, "built\n")
+	}
+	if want := evalSymlinks(t, wd); p.Workdir != want {
+		t.Errorf("workdir = %q, want %q", p.Workdir, want)
+	}
+	if filepath.Dir(p.BranchDir) != evalSymlinks(t, st) {
+		t.Errorf("branch dir = %q, want it directly under the storage base %q", p.BranchDir, st)
+	}
+	// What the sweep reported has to be readable back on its own: that path is
+	// the address of the thing to remove once the change set is recovered.
+	again, err := sandlock.ReadPreserved(p.BranchDir)
+	if err != nil {
+		t.Fatalf("ReadPreserved(%q): %v", p.BranchDir, err)
+	}
+	if again.Reason != p.Reason || again.Upper != p.Upper || again.Workdir != p.Workdir {
+		t.Errorf("ReadPreserved returned %+v, want the same record the sweep did: %+v", again, p)
+	}
+
 	// Retrying is the expected response to contention, and the value that
 	// failed is the value to retry with.
 	out, err := txn.Run(context.Background())
@@ -449,6 +487,34 @@ func TestTransactionConflictIsNotCommitLockAndIsRetryable(t *testing.T) {
 	if got := mustRead(t, filepath.Join(wd, "b.txt")); got != "built\n" {
 		t.Errorf("b.txt after the retry = %q, want %q", got, "built\n")
 	}
+
+	// The retry ran a NEW branch and swept nothing: the failed attempt's change
+	// set is still in storage, holding a full copy of what the stages wrote.
+	// Nothing in this package removes it, which is what makes a retry loop over
+	// a contended workdir fill its storage base one copy per attempt, so the
+	// caller has to remove BranchDir itself once the set is accounted for.
+	after, err := sandlock.ListPreserved(st)
+	if err != nil {
+		t.Fatalf("ListPreserved after the retry: %v", err)
+	}
+	if len(after) != 1 || after[0].BranchDir != p.BranchDir {
+		t.Fatalf("preserved after the retry = %+v, want the failed attempt's record %q still there and nothing else", after, p.BranchDir)
+	}
+	if err := os.RemoveAll(p.BranchDir); err != nil {
+		t.Fatalf("removing the recovered change set: %v", err)
+	}
+	if after, err = sandlock.ListPreserved(st); err != nil || len(after) != 0 {
+		t.Fatalf("after removing %q the sweep found %+v (err %v), want nothing: removing BranchDir is what closes a recovery", p.BranchDir, after, err)
+	}
+}
+
+func evalSymlinks(t *testing.T, path string) string {
+	t.Helper()
+	real, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		t.Fatalf("resolving %q: %v", path, err)
+	}
+	return real
 }
 
 // TestTransactionTimeoutIsAnAbortTellableFromAStageFailure covers the context
@@ -528,6 +594,103 @@ func TestTransactionTimeoutIsAnAbortTellableFromAStageFailure(t *testing.T) {
 	}
 	if failed.TimedOut() {
 		t.Error("an abort with a failing stage result is not a timeout")
+	}
+}
+
+// TestPreservedRecordCarriesDeletionsAndTheWritingPID covers the half of a
+// preserved change set that is not visible as files. Deletions live in the
+// record and nowhere else: nothing in the upper represents them, so a recovery
+// driven by the upper alone would resurrect every file the run removed.
+//
+// A plain run whose branch action is Keep is the cheapest way to produce a
+// record; it needs neither a failure nor contention. That is also why this
+// case is not a transaction: the core refuses a stage whose branch action was
+// changed, precisely so a transaction cannot commit half of itself.
+func TestPreservedRecordCarriesDeletionsAndTheWritingPID(t *testing.T) {
+	requireSandbox(t)
+	wd, st := t.TempDir(), t.TempDir()
+	if err := os.WriteFile(filepath.Join(wd, "victim.txt"), []byte("ORIGINAL"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sb := txnSandbox(wd, st)
+	sb.OnExit = sandlock.BranchActionKeep
+
+	res, err := sb.Run(context.Background(), "sh", "-c", "rm victim.txt && echo NEW > added.txt")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !res.Success {
+		t.Fatalf("the kept run's child must have written and deleted: exit=%d stderr=%s", res.ExitCode, res.Stderr)
+	}
+
+	preserved, err := sandlock.ListPreserved(st)
+	if err != nil {
+		t.Fatalf("ListPreserved: %v", err)
+	}
+	if len(preserved) != 1 {
+		t.Fatalf("preserved change sets = %d, want 1", len(preserved))
+	}
+	p := preserved[0]
+	if p.Reason != sandlock.PreserveKept {
+		t.Errorf("reason = %v, want kept", p.Reason)
+	}
+	if p.PID != uint32(os.Getpid()) {
+		t.Errorf("PID = %d, want %d", p.PID, os.Getpid())
+	}
+	if got, want := p.Deleted, []string{"victim.txt"}; !equalStrings(got, want) {
+		t.Errorf("deleted = %v, want %v: the record is the only place a deletion exists", got, want)
+	}
+	if got := mustRead(t, filepath.Join(p.Upper, "added.txt")); got != "NEW\n" {
+		t.Errorf("upper added.txt = %q, want %q", got, "NEW\n")
+	}
+	mustNotExist(t, filepath.Join(p.Upper, "victim.txt"))
+
+	// What the sweep reports must be readable back on its own, deletions and
+	// all: that path is the address of the thing to remove once recovered.
+	owned, err := sandlock.ReadPreserved(p.BranchDir)
+	if err != nil {
+		t.Fatalf("ReadPreserved(%q): %v", p.BranchDir, err)
+	}
+	if !equalStrings(owned.Deleted, p.Deleted) || owned.Reason != p.Reason || owned.PID != p.PID {
+		t.Errorf("ReadPreserved returned %+v, want the same record the sweep did: %+v", owned, p)
+	}
+}
+
+// TestPreservedSweepDistinguishesNothingToFindFromCouldNotLook: finding nothing
+// is an empty sweep and not a failure, for a base that is empty and for one
+// that does not exist alike. A directory that is not a preserved branch is a
+// failure of ReadPreserved, because acting on a half-read record would target
+// the wrong workdir.
+func TestPreservedSweepDistinguishesNothingToFindFromCouldNotLook(t *testing.T) {
+	empty := t.TempDir()
+
+	got, err := sandlock.ListPreserved(empty)
+	if err != nil {
+		t.Fatalf("an empty sweep is not a failure: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("preserved = %d, want 0", len(got))
+	}
+
+	got, err = sandlock.ListPreserved(filepath.Join(empty, "nope"))
+	if err != nil {
+		t.Fatalf("a base that does not exist sweeps to nothing: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("preserved = %d, want 0", len(got))
+	}
+
+	if _, err := sandlock.ReadPreserved(empty); err == nil {
+		t.Error("a directory with no marker is not a preserved branch")
+	}
+
+	// A path this binding cannot pass through intact is refused rather than
+	// truncated at the NUL, which would sweep a different directory.
+	if _, err := sandlock.ListPreserved("/a\x00b"); !errors.Is(err, sandlock.ErrInvalidString) {
+		t.Errorf("ListPreserved with an interior NUL: err = %v, want ErrInvalidString", err)
+	}
+	if _, err := sandlock.ReadPreserved("/a\x00b"); !errors.Is(err, sandlock.ErrInvalidString) {
+		t.Errorf("ReadPreserved with an interior NUL: err = %v, want ErrInvalidString", err)
 	}
 }
 

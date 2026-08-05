@@ -101,6 +101,13 @@ const (
 	// preserved under the policy's FSStorage, so retrying is the expected
 	// response. This is the retryable one; TxnErrCommitLock, its neighbour, is
 	// not.
+	//
+	// A retry does not reclaim what the failed attempt preserved: it runs a new
+	// branch and leaves the old change set where it is, so a loop that retries
+	// contention without ever removing one fills the storage base with a full
+	// copy of the stages' output per attempt. ListPreserved finds them and
+	// removing PreservedBranch.BranchDir is what closes the recovery; nothing
+	// in this package does it for the caller.
 	TxnErrConflict TxnErrorKind = 4
 	// TxnErrCommitLock: the workdir commit lock could not be taken for a
 	// reason other than contention (the workdir could not be opened, or the
@@ -259,4 +266,71 @@ type Transaction struct {
 	// to zero, which would mean the opposite of what it says. A single
 	// non-blocking attempt cannot be asked for at all.
 	CommitLockWait time.Duration
+}
+
+// PreserveReason says why a change set was left in branch storage instead of
+// being reclaimed, and so how far the workdir got. A recovery reads this before
+// it reads anything else. The set is append only.
+type PreserveReason int
+
+const (
+	// PreserveMergeInterrupted: a merge started and did not finish, so the
+	// workdir may be partly merged. A merge that is STILL RUNNING is
+	// indistinguishable from this, because the marker is written before the
+	// first destructive step; check PreservedBranch.PID before acting.
+	PreserveMergeInterrupted PreserveReason = 0
+	// PreserveCommitDeferred: a commit could not take the workdir lock. The
+	// workdir is untouched and the whole change set is here.
+	PreserveCommitDeferred PreserveReason = 1
+	// PreserveKept: the caller asked for the branch to be kept.
+	PreserveKept PreserveReason = 2
+)
+
+func (r PreserveReason) String() string {
+	switch r {
+	case PreserveMergeInterrupted:
+		return "merge-interrupted"
+	case PreserveCommitDeferred:
+		return "commit-deferred"
+	case PreserveKept:
+		return "kept"
+	default:
+		return fmt.Sprintf("PreserveReason(%d)", int(r))
+	}
+}
+
+// PreservedBranch is one change set that was left in branch storage rather than
+// reclaimed. ListPreserved finds them; ReadPreserved reads one by name.
+//
+// Every path here carries its bytes verbatim, so it may not be valid UTF-8 and
+// must not be decoded or reformatted before being used: these are addresses to
+// open, and BranchDir in particular is both what ReadPreserved takes and what
+// to remove once the change set has been recovered. That is the opposite of
+// TxnOutcome.Changes, whose paths are lossy because they are names to show.
+type PreservedBranch struct {
+	// BranchDir is the branch's private storage directory.
+	BranchDir string
+	// Upper holds the preserved additions and modifications. It is only half
+	// of the change set: nothing in it represents a deletion, so copying it
+	// over the workdir and doing nothing else would resurrect every file the
+	// run removed. Apply Deleted FIRST.
+	Upper string
+	// Workdir is the directory the change set belongs to, canonicalized when
+	// the branch was created.
+	Workdir string
+	// Deleted lists the paths the run removed, relative to Workdir, in sorted
+	// order. This is the half of the change set the upper cannot carry.
+	Deleted []string
+	// Reason says what state Workdir is in, which decides what a recovery may
+	// do.
+	Reason PreserveReason
+	// PID is the process that preserved the change set.
+	//
+	// Load-bearing for one thing: a merge writes its marker BEFORE its first
+	// destructive step, so a merge in flight and a merge that was interrupted
+	// are the same record, and this is the only thing that tells them apart.
+	// Anything that acts on a PreserveMergeInterrupted record rather than only
+	// reporting it must first check that this pid is not live. Beyond that it
+	// is triage only: the process may be long gone and its pid reused.
+	PID uint32
 }

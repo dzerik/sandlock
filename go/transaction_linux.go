@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"time"
 	"unicode/utf8"
+	"unsafe"
 )
 
 // takeString consumes an owned C string from the ABI and releases it. Every
@@ -236,4 +237,101 @@ func (t *Transaction) execute(ctx context.Context, dry bool) (*TxnOutcome, error
 		})
 	}
 	return out, nil
+}
+
+// ListPreserved sweeps storageBase for change sets that were left in branch
+// storage instead of being reclaimed.
+//
+// Finding nothing is an empty result and not an error: a base that holds no
+// preserved work and a base that cannot be read both sweep to nothing. Entries
+// that cannot be parsed are skipped rather than failing the sweep, so one
+// broken branch directory cannot hide the rest.
+//
+// Which base to sweep is the caller's to know, and nothing here can answer it:
+// a failed commit names the preserved upper in its message and nowhere else,
+// and the default base is derived inside the core from the environment. A
+// caller that means to recover programmatically should set Sandbox.FSStorage on
+// its stage policies and sweep that same path, rather than parsing the message
+// or guessing the default.
+//
+// A merge that is STILL RUNNING looks exactly like one that was interrupted.
+// Anything that acts on an entry, rather than only reporting it, must first
+// check that PreservedBranch.PID is not a live process.
+//
+// This only reads: a sweep never removes anything, and neither does a retry of
+// the transaction that left an entry behind. Removing BranchDir is what closes
+// a recovery, and until something does it the base keeps every change set it
+// was given.
+func ListPreserved(storageBase string) ([]PreservedBranch, error) {
+	if hasNUL(storageBase) {
+		return nil, ErrInvalidString
+	}
+	cBase := C.CString(storageBase)
+	defer C.free(unsafe.Pointer(cBase))
+
+	list := C.sandlock_preserved_list(cBase)
+	if list == nil {
+		return nil, fmt.Errorf("sandlock: could not sweep %q for preserved change sets", storageBase)
+	}
+	defer C.sandlock_preserved_list_free(list)
+
+	n := C.sandlock_preserved_list_len(list)
+	out := make([]PreservedBranch, 0, int(n))
+	for i := C.uintptr_t(0); i < n; i++ {
+		// Borrowed from the list, so it must never be freed on its own:
+		// sandlock_preserved_list_free releases every entry with the list.
+		p := C.sandlock_preserved_list_at(list, i)
+		if p == nil {
+			continue
+		}
+		out = append(out, preservedFromPtr(p))
+	}
+	return out, nil
+}
+
+// ReadPreserved reads one preserved change set from its branch directory,
+// which is what ListPreserved reports as BranchDir.
+//
+// An error means the directory is not a usable preserved branch: it is
+// unreadable, it holds no marker, it is the live storage of a running process,
+// or its marker was cut short by a crash. Those cases are not distinguishable
+// on purpose, because a half-read record is worse than none at all: acting on
+// one would target the wrong workdir.
+func ReadPreserved(branchDir string) (*PreservedBranch, error) {
+	if hasNUL(branchDir) {
+		return nil, ErrInvalidString
+	}
+	cDir := C.CString(branchDir)
+	defer C.free(unsafe.Pointer(cDir))
+
+	p := C.sandlock_preserved_read(cDir)
+	if p == nil {
+		return nil, fmt.Errorf("sandlock: %q is not a usable preserved change set", branchDir)
+	}
+	// Owned by this call, unlike a list entry, and the one handle that is
+	// released this way.
+	defer C.sandlock_preserved_free(p)
+
+	b := preservedFromPtr(p)
+	return &b, nil
+}
+
+// preservedFromPtr reads a record, borrowed or owned alike: it frees nothing
+// but the strings the getters hand out, which belong to the caller in both
+// cases. cgo drops the const from the borrowed pointer type, so one function
+// serves both producers.
+func preservedFromPtr(p *C.sandlock_preserved_t) PreservedBranch {
+	b := PreservedBranch{
+		BranchDir: takeString(C.sandlock_preserved_branch_dir(p)),
+		Upper:     takeString(C.sandlock_preserved_upper(p)),
+		Workdir:   takeString(C.sandlock_preserved_workdir(p)),
+		Reason:    PreserveReason(C.sandlock_preserved_reason(p)),
+		PID:       uint32(C.sandlock_preserved_pid(p)),
+	}
+	n := C.sandlock_preserved_deleted_len(p)
+	b.Deleted = make([]string, 0, int(n))
+	for i := C.uintptr_t(0); i < n; i++ {
+		b.Deleted = append(b.Deleted, takeString(C.sandlock_preserved_deleted_at(p, i)))
+	}
+	return b
 }
